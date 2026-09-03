@@ -95,6 +95,12 @@ pub mod schema {
         /// How many delta tokens `delta_nll_nats` sums over.
         /// Minted 2026-09-03: F7157BAA97382DCCB5D75AF8D3263B2F.
         "F7157BAA97382DCCB5D75AF8D3263B2F" as pub delta_scored_tokens: U256BE;
+        /// The CONTROL beside `delta_nll_nats`: the same delta tokens scored
+        /// by the checkpoint's experts on the learned layer, in the same pass
+        /// (`TurnEnd::delta_nll_frozen`). Sums over the same
+        /// `delta_scored_tokens`. Present only while a layer is frozen.
+        /// Minted 2026-09-03: 64084D7D95B797DC90A24A7FB593CF48.
+        "64084D7D95B797DC90A24A7FB593CF48" as pub delta_nll_frozen_nats: F64;
         /// Seconds for the complete logical turn, around the Session calls.
         /// Minted 2026-08-28: 379776AE923C962A7DE2A6DBC03DA77F.
         "379776AE923C962A7DE2A6DBC03DA77F" as pub turn_seconds: F64;
@@ -205,6 +211,8 @@ pub fn turn_end_fragment(end: &TurnEnd) -> Fragment {
         let nats: f64 = end.delta_nll.iter().map(|&x| x as f64).sum();
         (nats, end.delta_nll.len() as u128)
     });
+    let frozen = (end.delta_nll_frozen.len() == end.delta_nll.len() && !end.delta_nll.is_empty())
+        .then(|| end.delta_nll_frozen.iter().map(|&x| x as f64).sum::<f64>());
     fragment += entity! { _ @
         metadata::tag: schema::kind_turn_end,
         schema::turn: end.turn as u128,
@@ -217,6 +225,7 @@ pub fn turn_end_fragment(end: &TurnEnd) -> Fragment {
         schema::position: end.position as u128,
         schema::delta_nll_nats?: scored.map(|(nats, _)| nats),
         schema::delta_scored_tokens?: scored.map(|(_, count)| count),
+        schema::delta_nll_frozen_nats?: frozen,
     };
     fragment
 }
