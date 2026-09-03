@@ -29,7 +29,7 @@ use triblespace::core::collection::{
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;
@@ -171,41 +171,11 @@ fn named_collections_in(
     Ok(collections)
 }
 
-fn registered_named_collections_in(
-    store: &PileSnapshot,
-    wanted: &str,
-) -> anyhow::Result<Vec<ModelCollection>> {
-    let mut handles = BTreeSet::new();
-    for info in store
-        .blobs()
-        .map(|info| info.context("list registered model collection descriptors"))
-    {
-        handles.insert(info?.handle.transmute());
-    }
-
-    let (collections, retired) = named_collections_from_handles(store, wanted, handles);
-    if collections.is_empty() && !retired.is_empty() {
-        bail!(
-            "found only retired descriptors named '{wanted}' ({retired:?}); \
-             run the additive model collection migration"
-        );
-    }
-    Ok(collections)
-}
-
 fn sole_named_collection_in(
     store: &PileSnapshot,
     wanted: &'static str,
 ) -> anyhow::Result<ModelCollection> {
-    let mut collections = named_collections_in(store, wanted)?;
-    if collections.is_empty() {
-        // A descriptor is an ordinary blob, not a collection record. Failed
-        // commit-last imports can therefore leave a registered empty
-        // collection with no COMMIT from which to seed the usual indexed
-        // lookup. Only that rare empty case pays for resident-blob discovery;
-        // populated collections stay on the record-indexed path above.
-        collections = registered_named_collections_in(store, wanted)?;
-    }
+    let collections = named_collections_in(store, wanted)?;
     match collections.as_slice() {
         [collection] => Ok(*collection),
         [] => bail!("no collection named '{wanted}' in this pile"),

@@ -13,6 +13,7 @@ use mary::selection::ModelSelector;
 use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 use triblespace::core::blob::MemoryBlobStore;
 use triblespace::core::collection::CollectionRead;
+use triblespace::core::repo::SnapshotSource;
 use triblespace::core::repo::pile::Pile;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -210,13 +211,18 @@ fn duplicate_tensor_names_across_files_publish_no_collection_commit() {
         "{error:#}"
     );
 
-    let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
-        .expect("failed import must leave the native collection readable");
-    assert!(snapshot.support().is_empty());
+    let snapshot = pile.snapshot().unwrap();
     assert_eq!(
-        snapshot.store().records().unwrap().count(),
+        snapshot.records().unwrap().count(),
         0,
         "failed import must publish no model data COMMIT"
+    );
+    drop(snapshot);
+    let error = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
+        .expect_err("an unreferenced descriptor blob is not a discoverable collection");
+    assert!(
+        error.to_string().contains("no collection named"),
+        "{error:#}"
     );
     pile.close().unwrap();
 }
