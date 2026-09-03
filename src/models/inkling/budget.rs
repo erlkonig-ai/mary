@@ -791,14 +791,17 @@ pub fn chunked_prefill_activation_bytes(
 /// `super::burn::trim` really drops them rather than masking -- so charging
 /// `layers * tokens` over-counts this model by 5.98x at a million tokens.
 ///
-/// Priced at `policy.cache`, which is the width the DENSE cache holds. The
-/// NVFP4 arm stores the same rows at 4.5 bits a value (`width / 8` code words
-/// plus `width / 64` scale words, 576 bytes for a 1024-wide row), i.e. 3.56x
-/// less than the BF16 charged here -- so this is deliberately the permissive
-/// direction for the arm that actually runs. [`super::kvpages::KvPlan::bytes`]
-/// is the exact figure for a RESERVED pool, and
-/// [`super::kvpages::KvPlan::report`] prints it beside this one rather than on
-/// top of it.
+/// Priced at the width the cache STORES: the session's [`super::burn::AttnCache`]
+/// holds keys and values in [`super::kvpages::KvStore`], which is NVFP4 -- 4.5
+/// bits a value (`width / 8` code words plus `width / 64` scale words, 576
+/// bytes for a 1024-wide row). This used to charge `policy.cache`'s BF16
+/// width, 3.56x more, as "the permissive direction"; at a million positions
+/// that permission was 14.7 GiB a rank on a box with 34 GiB beside the arena,
+/// and it refused the window the resident is built for. A charge is a claim
+/// about what will be allocated, and this is what will be allocated.
+/// [`super::kvpages::KvPlan::bytes`] is the exact figure for a RESERVED pool,
+/// and [`super::kvpages::KvPlan::report`] prints it beside this one rather
+/// than on top of it.
 pub fn kv_cache_bytes(
     t: &InklingTextConfig,
     layers: core::ops::Range<usize>,
@@ -810,7 +813,7 @@ pub fn kv_cache_bytes(
     // split gives each node fewer layers of a full-width cache, a within-layer
     // split gives every node every layer at half width, and the two are the
     // same total only because 42/2 == 42 * (1/2).
-    let elem = policy.cache.bytes();
+    const NVFP4_BITS_PER_VALUE: u64 = 9; // of 16: 4 code bits + 8 scale bits per 16 values
     layers
         .map(|l| {
             let kind = t.attn_kind(l);
@@ -820,7 +823,7 @@ pub fn kv_cache_bytes(
                 AttnKind::Local => t.sliding_window_size.min(tokens),
                 AttnKind::Global => tokens,
             } as u64;
-            2 * keep * kv_heads * head_dim as u64 * elem
+            2 * keep * kv_heads * head_dim as u64 * NVFP4_BITS_PER_VALUE / 16
         })
         .sum()
 }

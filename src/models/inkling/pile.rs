@@ -1928,6 +1928,9 @@ impl PileSource {
                  of swap, which cost it 45.0 s of forward against 12.5 s at 0:28. Nothing here \
                  is reclaimable -- the arena is anonymous on purpose, so the GPU can alias it -- \
                  so the kernel pages the weights themselves.\n  \
+                 Terms: {:.2} GiB weights + {:.2} GiB device weights + {:.2} GiB overhead, of \
+                 which {:.2} GiB is one pass's activations with the context's KV and {:.2} GiB \
+                 the allocator's slack on them.\n  \
                  {advice}",
                 layers.start,
                 layers.end,
@@ -1935,6 +1938,11 @@ impl PileSource {
                 gib(need),
                 gib(machine),
                 gib(available),
+                gib(total as u64),
+                gib(device_weights),
+                gib(overhead),
+                gib(attention_bytes),
+                gib(super::budget::allocator_overhead_bytes(policy, machine, attention_bytes)),
             );
         }
         println!(
