@@ -22,12 +22,16 @@
 //! rows, 1/√d and q/k-norm weights in the `w`/`w_rot` chain, rotate_half
 //! pre-applied to weight rows) are inherited, not reimplemented.
 //!
-//! Backend: the **raw** (non-fusion) f32 wgpu/Metal backend `nn::backend::B`.
-//! The fusion wrapper adds nothing here — this module *is* the fusion, done
-//! once at compile time instead of per-frame at graph-capture time.
+//! Backend: the **raw** (non-fusion) f32 backend the voice runs on —
+//! `nn::backend::speak::Raw`: wgpu/Metal on the Mac, CUDA on the Linux (Spark)
+//! build, the same selection `nn::q4::Rt` makes. The fusion wrapper adds
+//! nothing here — this module *is* the fusion, done once at compile time
+//! instead of per-frame at graph-capture time. On CUDA this is also what
+//! removes the Burn loop's per-frame recompiles: every buffer here is
+//! preallocated, so no kernel ever sees a new shape.
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
 use burn::tensor::{DType, Tensor as BurnTensor, TensorPrimitive};
+use burn_cubecl::tensor::CubeTensor;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 
@@ -36,9 +40,16 @@ use super::layers::KvCache;
 use super::talker::Talker;
 
 /// The raw (non-fusion) f32 backend whose tensors the engine aliases.
-pub type Raw = crate::nn::backend::B;
+pub type Raw = crate::nn::backend::speak::Raw;
 
-type Client = cubecl::client::ComputeClient<WgpuRuntime>;
+/// The cubecl runtime behind [`Raw`] — mirrors the `nn::q4::Rt` selection so
+/// the engine's kernels launch on the same device the talker's tensors live on.
+#[cfg(any(feature = "cuda-backend", all(target_os = "linux", feature = "qwen3tts")))]
+pub use cubecl::cuda::CudaRuntime as Rt;
+#[cfg(not(any(feature = "cuda-backend", all(target_os = "linux", feature = "qwen3tts"))))]
+pub use cubecl::wgpu::WgpuRuntime as Rt;
+
+type Client = cubecl::client::ComputeClient<Rt>;
 
 const HIDDEN: u32 = TALKER_HIDDEN as u32; // 2048
 const HEADS: u32 = TALKER_HEADS as u32; // 16
@@ -416,7 +427,7 @@ pub struct TalkerEngine {
 fn cube_handle<const DIM: usize>(t: &BurnTensor<Raw, DIM>) -> Handle {
     match t.clone().into_primitive() {
         TensorPrimitive::Float(c) => {
-            let mut c: CubeTensor<WgpuRuntime> = c;
+            let mut c: CubeTensor<Rt> = c;
             if !c.is_contiguous() {
                 // e.g. stride bookkeeping on size-1 dims after transpose+mul
                 c = burn_cubecl::kernel::into_contiguous(c);
@@ -521,7 +532,7 @@ impl TalkerEngine {
                 let n = (seq * KV_DIM as usize) as u32;
                 let src_h = self.client.create_from_slice(as_bytes(&host));
                 unsafe {
-                    copy_offset_kernel::launch_unchecked::<WgpuRuntime>(
+                    copy_offset_kernel::launch_unchecked::<Rt>(
                         &self.client,
                         CubeCount::new_1d(n.div_ceil(256)),
                         CubeDim::new_1d(256),
@@ -555,7 +566,7 @@ impl TalkerEngine {
 
         for l in &self.layers {
             unsafe {
-                qkv_rope_cache_kernel::launch_unchecked::<WgpuRuntime>(
+                qkv_rope_cache_kernel::launch_unchecked::<Rt>(
                     &self.client,
                     CubeCount::new_1d(HH + KV_HEADS),
                     CubeDim::new_1d(D),
@@ -573,7 +584,7 @@ impl TalkerEngine {
                     KV_HEADS,
                     D,
                 );
-                attn_decode_kernel::launch_unchecked::<WgpuRuntime>(
+                attn_decode_kernel::launch_unchecked::<Rt>(
                     &self.client,
                     CubeCount::new_1d(HEADS),
                     CubeDim::new_1d(D),
@@ -587,7 +598,7 @@ impl TalkerEngine {
                     D,
                     MAX_SCORES,
                 );
-                matvec_kernel::launch_unchecked::<WgpuRuntime>(
+                matvec_kernel::launch_unchecked::<Rt>(
                     &self.client,
                     CubeCount::new_1d(HIDDEN / 128),
                     CubeDim::new_1d(128),
@@ -598,7 +609,7 @@ impl TalkerEngine {
                     HIDDEN,
                     true,
                 );
-                mlp_gateup_kernel::launch_unchecked::<WgpuRuntime>(
+                mlp_gateup_kernel::launch_unchecked::<Rt>(
                     &self.client,
                     CubeCount::new_1d(INTER / 128),
                     CubeDim::new_1d(128),
@@ -610,7 +621,7 @@ impl TalkerEngine {
                     INTER,
                     128,
                 );
-                matvec_kernel::launch_unchecked::<WgpuRuntime>(
+                matvec_kernel::launch_unchecked::<Rt>(
                     &self.client,
                     CubeCount::new_1d(HIDDEN / 128),
                     CubeDim::new_1d(128),
@@ -624,7 +635,7 @@ impl TalkerEngine {
             }
         }
         unsafe {
-            rmsnorm_kernel::launch_unchecked::<WgpuRuntime>(
+            rmsnorm_kernel::launch_unchecked::<Rt>(
                 &self.client,
                 CubeCount::new_single(),
                 CubeDim::new_1d(256),
@@ -729,6 +740,5 @@ pub fn touch_kernel(buf: &mut Array<f32>) {
 /// Handle + client access for the probe's microbenchmarks.
 pub fn client_for_device() -> Client {
     use cubecl::Runtime;
-    let device: burn::backend::wgpu::WgpuDevice = Default::default();
-    WgpuRuntime::client(&device)
+    Rt::client(&Default::default())
 }
