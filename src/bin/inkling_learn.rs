@@ -114,8 +114,13 @@ fn main() -> Result<()> {
         tokenizer: tokenizer.into(),
         layers,
         prefill_budget: None,
-        // The engine's default is the window the resident is built for.
-        context_budget: None,
+        // The engine's default is the million-position window the resident is
+        // built for. This is the replay bench: a few hundred of his turns at
+        // about 53 tokens each, on a pair whose gate (2026-09-03 17:06Z) prices
+        // the million at 116.48 GiB against 112.03 available once the rank's
+        // own footprint is in place -- it fits the machine by 5.15 GiB and
+        // misses the moment by 4.45. The bench asks for what it uses.
+        context_budget: Some(16384),
         tensor_parallel,
         sealed: false,
     })?;
