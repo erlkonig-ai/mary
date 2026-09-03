@@ -139,6 +139,8 @@ pub mod assembly;
 #[cfg(feature = "inkling-cuda")]
 pub mod train;
 #[cfg(feature = "inkling-cuda")]
+pub mod learn;
+#[cfg(feature = "inkling-cuda")]
 pub mod train_online;
 pub mod session;
 
