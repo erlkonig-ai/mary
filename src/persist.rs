@@ -227,6 +227,10 @@ pub fn import_model_to_collection(
     source: &str,
     quantization: &str,
 ) -> anyhow::Result<(Id, CollectionCommit)> {
+    pile.refresh()
+        .context("refresh before model import preflight")?;
+    let _collection = crate::model_collection::model_graph_collection_or_create(pile, signing_key)
+        .context("preflight model collection writer")?;
     let root = ingest_model_fragment(pile, model_dir, dtype, source, quantization)?;
     let root_id = root.root().expect("model root id");
     let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)

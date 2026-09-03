@@ -12,6 +12,7 @@ use ed25519_dalek::SigningKey;
 use mary::selection::ModelSelector;
 use safetensors::tensor::{Dtype, TensorView, serialize_to_file};
 use triblespace::core::blob::MemoryBlobStore;
+use triblespace::core::collection::CollectionRead;
 use triblespace::core::repo::pile::Pile;
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -212,6 +213,11 @@ fn duplicate_tensor_names_across_files_publish_no_collection_commit() {
     let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
         .expect("failed import must leave the native collection readable");
     assert!(snapshot.support().is_empty());
+    assert_eq!(
+        snapshot.store().records().unwrap().count(),
+        0,
+        "failed import must publish no model data COMMIT"
+    );
     pile.close().unwrap();
 }
 

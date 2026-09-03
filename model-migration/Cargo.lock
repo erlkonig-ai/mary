@@ -3122,6 +3122,7 @@ version = "0.1.0"
 dependencies = [
  "anybytes",
  "anyhow",
+ "blake3",
  "burn",
  "burn-cubecl",
  "burn-fusion",

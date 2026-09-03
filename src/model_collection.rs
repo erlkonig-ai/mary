@@ -23,13 +23,13 @@ use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionSnapshotExt, CollectionStoreExt, Support,
+    AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
+    CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, BlobStoreList, SnapshotSource};
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;
@@ -113,19 +113,11 @@ pub fn prepare_model_fragment(fragment: Fragment) -> PreparedCollectionCommit {
     PreparedCollectionCommit::from_fragment(fragment)
 }
 
-fn named_collections_in(
+fn named_collections_from_handles(
     store: &PileSnapshot,
     wanted: &str,
-) -> anyhow::Result<Vec<ModelCollection>> {
-    let mut handles = BTreeSet::new();
-    for record in store.records().context("read model collection records")? {
-        if let CollectionRecord::Commit(commit) =
-            record.context("decode model collection record")?
-        {
-            handles.insert(commit.collection());
-        }
-    }
-
+    handles: impl IntoIterator<Item = CollectionHandle>,
+) -> (Vec<ModelCollection>, Vec<CollectionHandle>) {
     let mut collections = Vec::new();
     let mut retired = Vec::new();
     for handle in handles {
@@ -151,6 +143,47 @@ fn named_collections_in(
     }
     collections.sort_unstable();
     collections.dedup();
+    retired.sort_unstable();
+    retired.dedup();
+    (collections, retired)
+}
+
+fn named_collections_in(
+    store: &PileSnapshot,
+    wanted: &str,
+) -> anyhow::Result<Vec<ModelCollection>> {
+    let mut handles = BTreeSet::new();
+    for record in store.records().context("read model collection records")? {
+        if let CollectionRecord::Commit(commit) =
+            record.context("decode model collection record")?
+        {
+            handles.insert(commit.collection());
+        }
+    }
+
+    let (collections, retired) = named_collections_from_handles(store, wanted, handles);
+    if collections.is_empty() && !retired.is_empty() {
+        bail!(
+            "found only retired descriptors named '{wanted}' ({retired:?}); \
+             run the additive model collection migration"
+        );
+    }
+    Ok(collections)
+}
+
+fn registered_named_collections_in(
+    store: &PileSnapshot,
+    wanted: &str,
+) -> anyhow::Result<Vec<ModelCollection>> {
+    let mut handles = BTreeSet::new();
+    for info in store
+        .blobs()
+        .map(|info| info.context("list registered model collection descriptors"))
+    {
+        handles.insert(info?.handle.transmute());
+    }
+
+    let (collections, retired) = named_collections_from_handles(store, wanted, handles);
     if collections.is_empty() && !retired.is_empty() {
         bail!(
             "found only retired descriptors named '{wanted}' ({retired:?}); \
@@ -164,7 +197,15 @@ fn sole_named_collection_in(
     store: &PileSnapshot,
     wanted: &'static str,
 ) -> anyhow::Result<ModelCollection> {
-    let collections = named_collections_in(store, wanted)?;
+    let mut collections = named_collections_in(store, wanted)?;
+    if collections.is_empty() {
+        // A descriptor is an ordinary blob, not a collection record. Failed
+        // commit-last imports can therefore leave a registered empty
+        // collection with no COMMIT from which to seed the usual indexed
+        // lookup. Only that rare empty case pays for resident-blob discovery;
+        // populated collections stay on the record-indexed path above.
+        collections = registered_named_collections_in(store, wanted)?;
+    }
     match collections.as_slice() {
         [collection] => Ok(*collection),
         [] => bail!("no collection named '{wanted}' in this pile"),
