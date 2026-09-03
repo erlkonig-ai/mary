@@ -683,12 +683,12 @@ mod filtered_native_import_tests {
         .unwrap();
 
         let store = pile.snapshot().expect("freeze test observation");
-        let cover = crate::model_collection::snapshot_model_collection_in(&store)
+        let support = crate::model_collection::snapshot_model_collection_in(&store)
             .unwrap()
-            .cover()
+            .support()
             .clone();
         let snapshot =
-            crate::model_collection::snapshot_model_collection_exact(&store, &cover).unwrap();
+            crate::model_collection::snapshot_model_collection_exact(&store, &support).unwrap();
         let keymap = crate::selection::load_keymap_from_graph(
             snapshot.facts(),
             snapshot.store(),
@@ -718,7 +718,7 @@ mod filtered_native_import_tests {
 
         let latest =
             crate::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
-        assert_eq!(latest.cover(), &cover);
+        assert_eq!(latest.support(), &support);
     }
 
     #[test]
@@ -827,7 +827,7 @@ fn open_preflighted_model_graph_snapshot(
     };
     let snapshot = match crate::model_collection::snapshot_model_collection_for(&store, collection)
     {
-        Ok(snapshot) if snapshot.cover().is_empty() => None,
+        Ok(snapshot) if snapshot.support().is_empty() => None,
         Ok(snapshot) => Some(snapshot),
         Err(error) => {
             let error =
@@ -1736,10 +1736,10 @@ fn read_model_collections_in(
                 crate::model_collection::snapshot_model_collection_for(store, *collection)
                     .with_context(|| format!("{path:?}: resolve model graph collection"))?;
             facts += pre_epoch_aliased(snapshot.facts());
-            let (_, cover, _) = snapshot.into_parts();
+            let (_, support, _) = snapshot.into_parts();
             collections.push(ModelPileCollection {
                 shape: ModelPileCollectionShape::Graph,
-                collection: cover.collection(),
+                collection: support.collection(),
             });
         }
         many => anyhow::bail!(
@@ -1756,12 +1756,12 @@ fn read_model_collections_in(
             let snapshot =
                 crate::model_collection::snapshot_model_collection_for(store, *collection)
                     .with_context(|| format!("{path:?}: resolve model bundle collection"))?;
-            let (_, cover, bundle_reader) = snapshot.into_parts();
-            facts += model_bundle_archive_facts(&cover, &bundle_reader)
+            let (_, support, bundle_reader) = snapshot.into_parts();
+            facts += model_bundle_archive_facts(&support, &bundle_reader)
                 .map_err(|e| anyhow::anyhow!("{path:?}: read model bundle archives: {e}"))?;
             collections.push(ModelPileCollection {
                 shape: ModelPileCollectionShape::Bundle,
-                collection: cover.collection(),
+                collection: support.collection(),
             });
         }
         many => anyhow::bail!(
@@ -1791,13 +1791,13 @@ fn read_model_collections_in(
     })
 }
 
-/// The complete model facts every bundle token in an admitted cover points at.
+/// The complete model facts every bundle token in admitted support points at.
 ///
 /// A bundle COMMIT carries exactly one `(root, metadata::archive, H)` row; `H`
 /// is the canonical archive of the model's whole fact set. Resolving it is what
 /// turns the tiny signed union into the facts a loader can query.
 fn model_bundle_archive_facts(
-    cover: &triblespace::core::collection::FactCover,
+    support: &triblespace::core::collection::Support,
     reader: &triblespace::core::repo::pile::PileSnapshot,
 ) -> anyhow::Result<TribleSet> {
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
@@ -1805,7 +1805,7 @@ fn model_bundle_archive_facts(
     use triblespace::core::metadata;
 
     let mut facts = TribleSet::new();
-    for member in cover.members() {
+    for member in support.members() {
         let token_blob: Blob<SimpleArchive> = reader
             .get(member)
             .map_err(|error| anyhow::anyhow!("read bundle token {member:?}: {error}"))?;

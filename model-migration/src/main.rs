@@ -265,7 +265,7 @@ fn main() -> anyhow::Result<()> {
     let commits = match migration {
         MigrationOutput::Model(result) => {
             eprintln!(
-                "migrated legacy main branch {} head {:?}: model {}, tokenizer {:?}, {} legacy facts + {} aliases + {} selector facts; collection {}, native commit {}",
+                "migrated legacy main branch {} head {:?}: model {}, tokenizer {:?}, {} legacy facts + {} aliases + {} selector facts; collection {}, native commit fingerprint {}",
                 result.legacy_branch,
                 result.legacy_head,
                 result.model_root,
@@ -274,13 +274,14 @@ fn main() -> anyhow::Result<()> {
                 result.aliases_added,
                 result.selector_facts_added,
                 lowercase_hex(&result.collection.handle().raw),
-                result.commit.id(),
+                triblespace::core::collection::CollectionRecord::Commit(result.commit)
+                    .fingerprint(),
             );
             vec![result.commit]
         }
         MigrationOutput::PersonaPlex(result) => {
             eprintln!(
-                "{} exact legacy PersonaPlex commit {:?}: LM {}, Mimi {}, unified root {}, H {:?}, {} legacy facts + {} aliases; collection {}, bundle commit {}",
+                "{} exact legacy PersonaPlex commit {:?}: LM {}, Mimi {}, unified root {}, H {:?}, {} legacy facts + {} aliases; collection {}, bundle commit fingerprint {}",
                 if result.published {
                     "adopted"
                 } else {
@@ -294,7 +295,8 @@ fn main() -> anyhow::Result<()> {
                 result.legacy_facts,
                 result.aliases_added,
                 lowercase_hex(&result.collection.handle().raw),
-                result.commit.id(),
+                triblespace::core::collection::CollectionRecord::Commit(result.commit)
+                    .fingerprint(),
             );
             vec![result.commit]
         }

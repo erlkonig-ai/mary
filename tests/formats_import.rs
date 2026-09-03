@@ -136,10 +136,10 @@ fn native_import_is_exact_selectable_and_byte_idempotent() {
     assert_eq!(expected.root(), Some(first.0));
 
     let snapshot = mary::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
-    assert_eq!(snapshot.cover().len(), 1);
+    assert_eq!(snapshot.support().len(), 1);
     assert!(
         snapshot
-            .cover()
+            .support()
             .contains(triblespace::prelude::inlineencodings::Handle::<
                 triblespace::prelude::blobencodings::SimpleArchive,
             >::from_hash(first.1.data()))
@@ -211,7 +211,7 @@ fn duplicate_tensor_names_across_files_publish_no_collection_commit() {
 
     let snapshot = mary::model_collection::snapshot_model_collection_local_latest(&mut pile)
         .expect("failed import must leave the native collection readable");
-    assert!(snapshot.cover().is_empty());
+    assert!(snapshot.support().is_empty());
     pile.close().unwrap();
 }
 

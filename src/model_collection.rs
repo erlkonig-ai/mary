@@ -4,7 +4,7 @@
 //! independent direct READ and WRITE policies rooted at their founding signer;
 //! an existing descriptor keeps its own policy. Callers never reconstruct a
 //! collection from a separate group coordinate. Reads discover the sole
-//! matching descriptor in one frozen pile snapshot, admit its exact cover, and
+//! matching descriptor in one frozen pile snapshot, admit its exact support, and
 //! materialize that same observation. Writes either join that descriptor after
 //! checking its WRITE policy or found the deterministic direct-policy default.
 //!
@@ -24,7 +24,7 @@ use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionStoreExt, FactCover,
+    CollectionRecord, CollectionSnapshotExt, CollectionStoreExt, Support,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
@@ -52,15 +52,15 @@ fn direct_model_policy(root: VerifyingKey) -> CollectionPolicy {
 #[derive(Clone, Debug)]
 pub struct ModelSnapshot<S> {
     facts: TribleSet,
-    cover: FactCover,
+    support: Support,
     store: S,
 }
 
 impl<S> ModelSnapshot<S> {
-    pub fn new(facts: TribleSet, cover: FactCover, store: S) -> Self {
+    pub fn new(facts: TribleSet, support: Support, store: S) -> Self {
         Self {
             facts,
-            cover,
+            support,
             store,
         }
     }
@@ -69,8 +69,8 @@ impl<S> ModelSnapshot<S> {
         &self.facts
     }
 
-    pub fn cover(&self) -> &FactCover {
-        &self.cover
+    pub fn support(&self) -> &Support {
+        &self.support
     }
 
     pub fn store(&self) -> &S {
@@ -81,8 +81,8 @@ impl<S> ModelSnapshot<S> {
         self.facts
     }
 
-    pub fn into_parts(self) -> (TribleSet, FactCover, S) {
-        (self.facts, self.cover, self.store)
+    pub fn into_parts(self) -> (TribleSet, Support, S) {
+        (self.facts, self.support, self.store)
     }
 }
 
@@ -289,28 +289,30 @@ pub fn publish_model_bundle_fragment(
 
 pub fn snapshot_model_collection_exact(
     store: &PileSnapshot,
-    cover: &FactCover,
+    support: &Support,
 ) -> anyhow::Result<ModelPileSnapshot> {
-    let facts = cover
-        .materialize::<TribleSet, _>(store)
-        .context("materialize exact model cover")?;
-    Ok(ModelSnapshot::new(facts, cover.clone(), store.clone()))
+    let facts = store
+        .collection_exact(support.collection(), support)
+        .context("attach exact model support")?
+        .view::<TribleSet>()
+        .context("materialize exact model support")?;
+    Ok(ModelSnapshot::new(facts, support.clone(), store.clone()))
 }
 
 pub fn snapshot_model_bundle_collection_exact(
     store: &PileSnapshot,
-    cover: &FactCover,
+    support: &Support,
 ) -> anyhow::Result<ModelPileSnapshot> {
-    snapshot_model_collection_exact(store, cover)
+    snapshot_model_collection_exact(store, support)
 }
 
-pub fn local_model_cover(
+pub fn local_model_support(
     store: &PileSnapshot,
     collection: ModelCollection,
-) -> anyhow::Result<FactCover> {
+) -> anyhow::Result<Support> {
     collection
         .admitted(store)
-        .context("admit local model collection cover")
+        .context("admit local model collection support")
 }
 
 fn open_and_refresh_model_pile(path: &Path) -> anyhow::Result<Pile> {
@@ -322,9 +324,9 @@ fn open_and_refresh_model_pile(path: &Path) -> anyhow::Result<Pile> {
     Ok(pile)
 }
 
-pub fn load_model_collection_from_cover(
+pub fn load_model_collection_from_support(
     path: impl AsRef<Path>,
-    cover: &FactCover,
+    support: &Support,
 ) -> anyhow::Result<ModelPileSnapshot> {
     let mut pile = open_and_refresh_model_pile(path.as_ref())?;
     let store = match pile.snapshot().context("freeze model pile") {
@@ -334,7 +336,7 @@ pub fn load_model_collection_from_cover(
             return Err(error);
         }
     };
-    let materialized = snapshot_model_collection_exact(&store, cover);
+    let materialized = snapshot_model_collection_exact(&store, support);
     let close = pile.close().context("close model pile after snapshot");
     match (materialized, close) {
         (Ok(snapshot), Ok(())) => Ok(snapshot),
@@ -360,8 +362,8 @@ pub fn snapshot_model_collection_for(
     store: &PileSnapshot,
     collection: ModelCollection,
 ) -> anyhow::Result<ModelPileSnapshot> {
-    let cover = local_model_cover(store, collection)?;
-    snapshot_model_collection_exact(store, &cover)
+    let support = local_model_support(store, collection)?;
+    snapshot_model_collection_exact(store, &support)
 }
 
 pub fn snapshot_model_bundle_collection_local_latest(
@@ -383,10 +385,10 @@ pub fn snapshot_model_bundle_collection_local_latest_with_admission(
 ) -> anyhow::Result<(ModelPileSnapshot, Vec<CollectionCommit>)> {
     let store = pile.snapshot().context("freeze model bundle observation")?;
     let collection = sole_named_collection_in(&store, mary_model_bundle_name())?;
-    let (cover, commits) = collection
+    let (support, commits) = collection
         .admitted_with_commits(&store)
         .context("admit model bundle commits")?;
-    let snapshot = snapshot_model_bundle_collection_exact(&store, &cover)?;
+    let snapshot = snapshot_model_bundle_collection_exact(&store, &support)?;
     Ok((snapshot, commits))
 }
 

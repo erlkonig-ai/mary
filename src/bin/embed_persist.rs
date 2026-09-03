@@ -128,9 +128,9 @@ fn import_one(out_dir: &Path, signing_key: &SigningKey, spec: ModelSpec) -> anyh
 
     let size = std::fs::metadata(&pile_path)?.len();
     println!(
-        "{}: root {root}, commit {}, {tensors} f32 tensors, {:.2} GiB in {:.1}s",
+        "{}: root {root}, commit fingerprint {}, {tensors} f32 tensors, {:.2} GiB in {:.1}s",
         spec.stem,
-        commit.id(),
+        triblespace::core::collection::CollectionRecord::Commit(commit).fingerprint(),
         size as f64 / (1_u64 << 30) as f64,
         started.elapsed().as_secs_f64(),
     );
@@ -283,10 +283,10 @@ mod tests {
 
         let snapshot =
             mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
-        assert_eq!(snapshot.cover().len(), 1);
+        assert_eq!(snapshot.support().len(), 1);
         assert!(
             snapshot
-                .cover()
+                .support()
                 .contains(triblespace::prelude::inlineencodings::Handle::<
                     triblespace::prelude::blobencodings::SimpleArchive,
                 >::from_hash(first.data()))
@@ -336,7 +336,7 @@ mod tests {
         .unwrap_err();
         let snapshot =
             mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
-        assert!(snapshot.cover().is_empty());
+        assert!(snapshot.support().is_empty());
         pile.close().unwrap();
     }
 
@@ -382,7 +382,7 @@ mod tests {
 
         let snapshot =
             mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
-        assert!(snapshot.cover().is_empty());
+        assert!(snapshot.support().is_empty());
         pile.close().unwrap();
     }
 
@@ -429,7 +429,7 @@ mod tests {
 
         let snapshot =
             mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
-        assert!(snapshot.cover().is_empty());
+        assert!(snapshot.support().is_empty());
         pile.close().unwrap();
     }
 }

@@ -227,8 +227,8 @@ fn import(a: ImportArgs) -> anyhow::Result<()> {
         }
     };
     eprintln!(
-        "mary import: done — model root {root:X}, native commit {} in pile {}",
-        commit.id(),
+        "mary import: done — model root {root:X}, native commit fingerprint {} in pile {}",
+        triblespace::core::collection::CollectionRecord::Commit(commit).fingerprint(),
         a.pile.display(),
     );
     println!("{}", lowercase_hex(&commit.to_bytes()));

@@ -22,8 +22,8 @@ fn main() -> Result<()> {
         .context("load locally admitted native collection")?;
     println!("pile {}", pile.display());
     println!(
-        "{} member(s) in cover, {} facts",
-        snapshot.cover().len(),
+        "{} member(s) in support, {} facts",
+        snapshot.support().len(),
         snapshot.facts().len()
     );
 

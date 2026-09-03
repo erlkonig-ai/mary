@@ -19,7 +19,7 @@
 //! old piles. Keeping the bridge in a standalone package prevents those
 //! migration-only concepts from becoming runtime dependencies again.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use anyhow::{anyhow, bail, Context};
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -395,8 +395,8 @@ fn prepare_policy_transfer(
 ) -> anyhow::Result<PreparedPolicyTransfer> {
     let source_authority = decode_exact_retired_collection(snapshot, source, kind)?;
     let collection = current_collection_in_memory(kind, signing_key.verifying_key())?;
-    let mut target_records = BTreeMap::new();
-    let mut commits = BTreeMap::new();
+    let mut target_commits = BTreeSet::new();
+    let mut commits = BTreeSet::new();
     let mut skipped_merges = 0usize;
     let mut skipped_derives = 0usize;
 
@@ -411,23 +411,24 @@ fn prepare_policy_transfer(
             CollectionRecord::Derive(derive) => derive.collection(),
         };
         if record_collection == collection.handle() {
-            target_records.insert(record.id(), record);
+            if let CollectionRecord::Commit(commit) = record {
+                target_commits.insert(commit);
+            }
         }
         if record_collection != source {
             continue;
         }
         match record {
             CollectionRecord::Commit(commit) => {
+                let fingerprint = CollectionRecord::Commit(commit).fingerprint();
                 commit.verify_strict().map_err(|error| {
                     anyhow!(
-                        "retired model COMMIT {} has an invalid signature: {error}",
-                        commit.id()
+                        "retired model COMMIT fingerprint {fingerprint} has an invalid signature: {error}",
                     )
                 })?;
                 anyhow::ensure!(
                     commit.public_key().raw == source_authority.to_bytes(),
-                    "retired model COMMIT {} was authored by a non-root writer; refusing to silently adopt delegated data",
-                    commit.id(),
+                    "retired model COMMIT fingerprint {fingerprint} was authored by a non-root writer; refusing to silently adopt delegated data",
                 );
                 let successor = CollectionCommit::sign(
                     signing_key,
@@ -435,7 +436,7 @@ fn prepare_policy_transfer(
                     commit.data(),
                     commit.metadata(),
                 );
-                commits.insert(successor.id(), successor);
+                commits.insert(successor);
             }
             CollectionRecord::Merge(_) => skipped_merges += 1,
             CollectionRecord::Derive(_) => skipped_derives += 1,
@@ -443,21 +444,16 @@ fn prepare_policy_transfer(
     }
 
     let mut missing = Vec::new();
-    for commit in commits.values() {
-        match target_records.get(&commit.id()) {
-            Some(CollectionRecord::Commit(existing)) if existing == commit => {}
-            Some(_) => bail!(
-                "collection-record id {} collides during model policy transfer",
-                commit.id(),
-            ),
-            None => missing.push(*commit),
+    for commit in &commits {
+        if !target_commits.contains(commit) {
+            missing.push(*commit);
         }
     }
     Ok(PreparedPolicyTransfer {
         source,
         source_authority,
         collection,
-        commits: commits.into_values().collect(),
+        commits: commits.into_iter().collect(),
         missing,
         skipped_merges,
         skipped_derives,
@@ -471,7 +467,7 @@ fn prepare_policy_transfer(
 /// old COMMIT's exact data and metadata handles; no member blob is read or
 /// copied. A source with no COMMITs still registers its current descriptor.
 /// MERGE and DERIVE records are deliberately left as rebuildable cache
-/// exhaust. Replay is idempotent because successor record ids are intrinsic.
+/// exhaust. Replay is idempotent because exact successor records form a set.
 pub fn transfer_retired_model_collection(
     pile: &mut Pile,
     signing_key: &SigningKey,
@@ -823,17 +819,17 @@ fn adopt_legacy_personaplex_bundle_with_policy(
         .context("prepare canonical PersonaPlex bundle token")?;
     let model_archive_data = prepared.model_archive_data();
 
-    // Freeze exactly the current collection's admitted cover before staging any
+    // Freeze exactly the current collection's admitted support before staging any
     // dependency. A matching `(root, H)` makes the operation a strict no-op;
     // a different PersonaPlex identity fails before a COMMIT can be exposed.
     let observation = pile
         .snapshot()
         .context("freeze existing PersonaPlex bundle collection")?;
-    let (cover, admitted_commits) = collection
+    let (support, admitted_commits) = collection
         .admitted_with_commits(&observation)
         .context("admit existing PersonaPlex bundle commits")?;
-    let snapshot = snapshot_model_bundle_collection_exact(&observation, &cover)
-        .context("materialize existing PersonaPlex bundle cover")?;
+    let snapshot = snapshot_model_bundle_collection_exact(&observation, &support)
+        .context("materialize existing PersonaPlex bundle support")?;
     if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(snapshot)
         .context("inspect existing PersonaPlex bundle")?
     {
@@ -1113,7 +1109,7 @@ mod tests {
     use super::*;
     use mary::format::{F32Array, U64Array};
     use mary::model_collection::{
-        local_model_cover, model_bundle_collections_in, publish_model_bundle_fragment,
+        local_model_support, model_bundle_collections_in, publish_model_bundle_fragment,
         snapshot_model_bundle_collection_exact, snapshot_model_collection_for,
     };
 
@@ -1607,8 +1603,8 @@ mod tests {
         // The typed descriptor is the exact value returned by publication; do
         // not replace it with a second ambient name-discovery pass.
         let snapshot = snapshot_model_collection_for(&store, collection)
-            .expect("materialize admitted migration cover");
-        assert!(snapshot.cover().contains(
+            .expect("materialize admitted migration support");
+        assert!(snapshot.support().contains(
             inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(commit.data())
         ));
         pile.close().expect("close exact-read pile");
@@ -1623,8 +1619,8 @@ mod tests {
         let mut pile = Pile::open(path).expect("open pile for exact bundle read");
         let store = pile.snapshot().expect("freeze exact bundle read");
         let snapshot = snapshot_model_collection_for(&store, collection)
-            .expect("materialize admitted model-bundle cover");
-        assert!(snapshot.cover().contains(
+            .expect("materialize admitted model-bundle support");
+        assert!(snapshot.support().contains(
             inlineencodings::Handle::<blobencodings::SimpleArchive>::from_hash(commit.data())
         ));
         pile.close().expect("close exact bundle-read pile");
@@ -2565,7 +2561,7 @@ mod tests {
 
         let mut retained = Pile::open(destination.path()).unwrap();
         let source_store = source.snapshot().unwrap();
-        let cover = local_model_cover(&source_store, adopted.collection).unwrap();
+        let support = local_model_support(&source_store, adopted.collection).unwrap();
         drop(source_store);
         source
             .rewrite_retained_into(
@@ -2577,7 +2573,7 @@ mod tests {
         source.close().unwrap();
 
         let retained_store = retained.snapshot().unwrap();
-        let snapshot = snapshot_model_bundle_collection_exact(&retained_store, &cover)
+        let snapshot = snapshot_model_bundle_collection_exact(&retained_store, &support)
             .expect("materialize retained exact bundle");
         let token_archive: Blob<blobencodings::SimpleArchive> = snapshot
             .store()

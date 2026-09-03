@@ -153,7 +153,7 @@ fn run() -> anyhow::Result<()> {
         // Freeze before deriving: later appends cannot move the source root or
         // the bytes under the conversion. This line previously tried to say it
         // by naming the just-published commit — `&[exact_commit]` — which never
-        // typechecked, because `FactCover` is not a slice of commits and
+        // typechecked, because `Support` is not a slice of commits and
         // TribleSpace exposes NO public constructor for one (every
         // `Cover::from_data`/`from_members`/`from_patch` is `pub(crate)`, see
         // triblespace-core/src/collection/api.rs:277-303). Freezing the

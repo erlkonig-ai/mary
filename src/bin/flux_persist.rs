@@ -57,8 +57,8 @@ fn main() -> anyhow::Result<()> {
                 mary::persist::QUANTIZATION_NATIVE,
             )?;
             eprintln!(
-                "flux_persist: {component} root {root:X}, native commit {}",
-                commit.id()
+                "flux_persist: {component} root {root:X}, native commit fingerprint {}",
+                triblespace::core::collection::CollectionRecord::Commit(commit).fingerprint()
             );
         }
         Ok(())

@@ -29,7 +29,7 @@ use crate::nn::weight_loader::WeightLoader;
 use crate::selection::{ModelSelector, SelectedModelIndex};
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, TryFromBlob};
-use triblespace::core::collection::{CollectionData, FactCover};
+use triblespace::core::collection::{CollectionData, Support};
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
 use triblespace::prelude::{BlobStoreGet, Id, Inline, TribleSet, blobencodings, inlineencodings};
@@ -54,12 +54,12 @@ pub struct PersonaPlexAuthority {
     model_root: Id,
     model_archive_data: CollectionData,
     bundle_token_data: CollectionData,
-    cover: FactCover,
+    support: Support,
 }
 
 impl PersonaPlexAuthority {
     pub fn collection(&self) -> crate::model_collection::ModelCollection {
-        self.cover.collection()
+        self.support.collection()
     }
 
     pub fn model_root(&self) -> Id {
@@ -76,9 +76,9 @@ impl PersonaPlexAuthority {
         self.bundle_token_data
     }
 
-    /// Exact admitted source cover frozen with this loader.
-    pub fn cover(&self) -> &FactCover {
-        &self.cover
+    /// Exact admitted foundational support frozen with this loader.
+    pub fn support(&self) -> &Support {
+        &self.support
     }
 }
 
@@ -150,7 +150,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
     }
 
     /// Select PersonaPlex from individually self-contained signed bundle
-    /// tokens, retaining the frozen cover and exact `(root, H, τ)` identity.
+    /// tokens, retaining the frozen support and exact `(root, H, τ)` identity.
     pub fn find_in_bundle_snapshot(
         snapshot: ModelSnapshot<R>,
     ) -> anyhow::Result<Option<PersonaPlexBundle<R>>>
@@ -158,9 +158,9 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
         R: Clone,
     {
         use anyhow::{Context, anyhow};
-        let (_, cover, reader) = snapshot.into_parts();
+        let (_, support, reader) = snapshot.into_parts();
         let mut selected: Option<(Self, Id, CollectionData, CollectionData)> = None;
-        for token_handle in cover.members() {
+        for token_handle in support.members() {
             let token_data = inlineencodings::Handle::<SimpleArchive>::to_hash(token_handle);
             let token_blob: Blob<SimpleArchive> = reader
                 .get(token_handle)
@@ -268,7 +268,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 model_root,
                 model_archive_data,
                 bundle_token_data,
-                cover,
+                support,
             },
         }))
     }
@@ -279,7 +279,7 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
         R: Clone,
     {
         Self::find_in_bundle_snapshot(snapshot)?
-            .ok_or_else(|| anyhow::anyhow!("no admitted PersonaPlex bundle in exact cover"))
+            .ok_or_else(|| anyhow::anyhow!("no admitted PersonaPlex bundle in exact support"))
     }
 
     /// Content-addressed root of the complete exact model.
@@ -484,10 +484,10 @@ mod native_authority_tests {
         let authority = bundle.authority();
         assert_eq!(authority.model_root(), root);
         assert_eq!(authority.bundle_token_data(), first.data());
-        assert_eq!(authority.cover().len(), 1);
+        assert_eq!(authority.support().len(), 1);
         assert!(
             authority
-                .cover()
+                .support()
                 .contains(inlineencodings::Handle::<SimpleArchive>::from_hash(
                     first.data()
                 ))
@@ -562,7 +562,7 @@ mod native_authority_tests {
         let snapshot =
             crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
                 .expect("freeze PersonaPlex bundle");
-        let collection = snapshot.cover().collection();
+        let collection = snapshot.support().collection();
         let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
             .expect("select exact PersonaPlex bundle");
         assert_eq!(bundle.authority().collection(), collection);
