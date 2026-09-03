@@ -133,6 +133,9 @@ pub struct Engine {
     /// Set once the run has ended or failed. A terminated engine must not enter
     /// another collective, because its peer is no longer in one.
     terminated: bool,
+    /// Score every delta as it is attended to (see [`TurnEnd::delta_nll`]).
+    /// On by default; `INK_SCORE=0` turns it off.
+    score: bool,
 }
 
 /// A rank-1 model: a `Session` and nothing else.
@@ -341,6 +344,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         turn: 0,
         digest: blake3::Hasher::new(),
         terminated: false,
+        score: std::env::var("INK_SCORE").map(|v| v != "0").unwrap_or(true),
     }))
 }
 
@@ -469,19 +473,7 @@ impl Engine {
     /// pass is the synchronisation, and the kernel's socket buffer absorbs the
     /// skew.
     fn pass(&mut self, pass: Pass) -> Result<usize> {
-        anyhow::ensure!(
-            !self.terminated,
-            "this engine is terminated and must not enter another collective"
-        );
-        if let Some(group) = self.session.group_mut() {
-            anyhow::ensure!(
-                group.peer_alive(),
-                "the peer rank's end of the rank link is closed: its process is gone. \
-                 Refusing to enter a collective that would block forever. {}",
-                transport_note()
-            );
-            group.lead(&pass)?;
-        }
+        self.lead(&pass)?;
         let token = match &pass {
             Pass::Prefill(ids) => self
                 .session
@@ -493,6 +485,49 @@ impl Engine {
         };
         fold_pass(&mut self.digest, token, self.session.position());
         Ok(token)
+    }
+
+    /// [`Engine::pass`] for a `Prefill` or `Extend` that also SCORES what it
+    /// appends: the second element is the negative log-likelihood, in nats, of
+    /// every appended id after the first, under the model that had seen
+    /// everything before it. The wire is unchanged — the peer makes the same
+    /// pass unscored, because the head is rank-local and scoring changes no
+    /// collective — so a scored rank and a plain one stay in step.
+    fn pass_scored(&mut self, pass: Pass) -> Result<(usize, Vec<f32>)> {
+        self.lead(&pass)?;
+        let (token, nll) = match &pass {
+            Pass::Prefill(ids) => self
+                .session
+                .prefill_scored(ids)
+                .context("prefill and score the first sequence")?,
+            Pass::Extend(ids) => self
+                .session
+                .extend_scored(ids)
+                .context("extend and score the sequence")?,
+            other => anyhow::bail!("{other:?} is not a pass that appends ids to score"),
+        };
+        fold_pass(&mut self.digest, token, self.session.position());
+        Ok((token, nll))
+    }
+
+    /// Name the pass to every other rank before making it — the lockstep
+    /// contract [`Engine::pass`] describes — and refuse if this rank or its
+    /// peer can no longer enter a collective.
+    fn lead(&mut self, pass: &Pass) -> Result<()> {
+        anyhow::ensure!(
+            !self.terminated,
+            "this engine is terminated and must not enter another collective"
+        );
+        if let Some(group) = self.session.group_mut() {
+            anyhow::ensure!(
+                group.peer_alive(),
+                "the peer rank's end of the rank link is closed: its process is gone. \
+                 Refusing to enter a collective that would block forever. {}",
+                transport_note()
+            );
+            group.lead(pass)?;
+        }
+        Ok(())
     }
 
     /// Tell every other rank to do something that is not a pass.
@@ -574,13 +609,25 @@ impl Engine {
         let carried = ids.len() - delta_ids.len();
 
         let started = std::time::Instant::now();
-        let first = match self.carry.is_some() {
-            false => self.pass(Pass::Prefill(ids))?,
+        let pass = match self.carry.is_some() {
+            false => Pass::Prefill(ids),
             // Never empty on a primed session: the carry alone is a token, so a
             // consult with no new context is still a one-row `extend` rather
             // than a bare `step`. Same pass, and it is the pass that closes the
             // gap.
-            true => self.pass(Pass::Extend(ids))?,
+            true => Pass::Extend(ids),
+        };
+        // The delta is scored as it is attended to: every appended id after the
+        // first gets the model's negative log-likelihood for it, BEFORE the
+        // model has seen it. On a primed session the first appended id is the
+        // carry, so the scores are exactly one per delta token; on turn 0 the
+        // first delta token has no predecessor and goes unscored. This is the
+        // live loss data the online-learning path exists for, and it is what
+        // makes a learning change measurable at all: `INK_SCORE=0` turns it
+        // off for a run that wants the head's last row only.
+        let (first, delta_nll) = match self.score {
+            true => self.pass_scored(pass)?,
+            false => (self.pass(pass)?, Vec::new()),
         };
         let first_token_secs = started.elapsed().as_secs_f64();
 
@@ -633,6 +680,7 @@ impl Engine {
             tokens,
             token_ids: generated,
             delta_tokens: delta_ids.len(),
+            delta_nll,
             carried,
             // The engine generated exactly what it was asked for. Whether the
             // model's response is FINISHED is a structural question about the

@@ -101,6 +101,24 @@ pub type T2 = burn::tensor::Tensor<Bk, 2>;
 /// Bit-identical to the loop it replaces, ties included: `cubek`'s `ArgMax`
 /// documents "the smallest coordinate in case of equality", which is what
 /// `val > dl[b]` selected as well.
+/// Negative log-likelihood, in nats, that each row of `logits` assigns to its
+/// target id. The log-softmax and the gather run on the device; only the
+/// `rows` floats come back. This is the prequential score of a served turn:
+/// each row is the model's prediction BEFORE it has learned from the target.
+pub fn row_nll_dev(logits: T2, targets: &[usize]) -> Vec<f32> {
+    let [rows, _] = logits.dims();
+    debug_assert_eq!(rows, targets.len(), "one target per scored row");
+    let dev = logits.device();
+    let idx: Vec<i64> = targets.iter().map(|&t| t as i64).collect();
+    let idx: BT<Bk, 2, burn::tensor::Int> = BT::from_data(BTD::new(idx, [rows, 1]), &dev);
+    burn::tensor::activation::log_softmax(logits, 1)
+        .gather(1, idx)
+        .neg()
+        .into_data()
+        .iter::<f32>()
+        .collect()
+}
+
 pub fn argmax_row_dev(row: T2) -> usize {
     let [rows, _] = row.dims();
     debug_assert_eq!(rows, 1, "argmax_row_dev reads exactly one row");

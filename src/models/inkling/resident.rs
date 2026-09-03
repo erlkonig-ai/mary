@@ -944,6 +944,16 @@ pub struct TurnEnd {
     /// context, never a re-rendered transcript. Zero on a turn whose only input
     /// is the model's own previous output.
     pub delta_tokens: usize,
+    /// The prequential score of the delta: for the LAST `delta_nll.len()` delta
+    /// tokens, the negative log-likelihood in nats the model assigned each one
+    /// given everything before it, measured before the model had seen it. One
+    /// per delta token on every turn after turn 0 (the carry precedes the
+    /// first); on turn 0 the first delta token has no predecessor and is not
+    /// scored. Empty when scoring is off. THE framing rule: nats per token of
+    /// DELTA, under the weights in force during this turn's first pass — not
+    /// per generated token, and never the model's own words.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delta_nll: Vec<f32>,
     /// Tokens of the model's OWN previous turn this pass appended BEFORE the
     /// delta: `0` on turn 0 and `1` on every turn after it.
     ///
@@ -975,11 +985,22 @@ pub struct TurnEnd {
 }
 
 impl TurnEnd {
+    /// Mean of [`TurnEnd::delta_nll`] in nats per scored delta token, `None`
+    /// when nothing was scored.
+    pub fn delta_mean_nll(&self) -> Option<f64> {
+        (!self.delta_nll.is_empty())
+            .then(|| self.delta_nll.iter().map(|&x| x as f64).sum::<f64>() / self.delta_nll.len() as f64)
+    }
+
     /// One line for a report, carrying its own framing rule.
     pub fn summary(&self) -> String {
+        let score = match self.delta_mean_nll() {
+            Some(mean) => format!(", delta nll {mean:.3} nats/token over {}", self.delta_nll.len()),
+            None => String::new(),
+        };
         format!(
             "turn {}: {} token(s) after a {}-token delta (+{} carried), first token {:.3}s, \
-             turn {:.3}s, position {} ({})",
+             turn {:.3}s, position {} ({}){}",
             self.turn,
             self.tokens,
             self.delta_tokens,
@@ -988,6 +1009,7 @@ impl TurnEnd {
             self.turn_secs,
             self.position,
             self.stopped,
+            score,
         )
     }
 }

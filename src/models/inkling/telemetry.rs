@@ -86,6 +86,15 @@ pub mod schema {
         /// Seconds to the first token of this turn, around the Session calls.
         /// Minted 2026-08-28: F8CF2A5C82EA89682E45F85BCA08E2A1.
         "F8CF2A5C82EA89682E45F85BCA08E2A1" as pub first_token_seconds: F64;
+        /// Sum, in nats, of the negative log-likelihood the model assigned the
+        /// scored delta tokens of a turn before it had seen them (the
+        /// prequential score); with `delta_scored_tokens` it totals across
+        /// turns and sessions, which a mean would not.
+        /// Minted 2026-09-03: 52A8E8632A14B913CA2B11875B20DDD9.
+        "52A8E8632A14B913CA2B11875B20DDD9" as pub delta_nll_nats: F64;
+        /// How many delta tokens `delta_nll_nats` sums over.
+        /// Minted 2026-09-03: F7157BAA97382DCCB5D75AF8D3263B2F.
+        "F7157BAA97382DCCB5D75AF8D3263B2F" as pub delta_scored_tokens: U256BE;
         /// Seconds for the complete logical turn, around the Session calls.
         /// Minted 2026-08-28: 379776AE923C962A7DE2A6DBC03DA77F.
         "379776AE923C962A7DE2A6DBC03DA77F" as pub turn_seconds: F64;
@@ -192,6 +201,10 @@ pub fn ready_fragment(ready: &Ready) -> Result<Fragment> {
 pub fn turn_end_fragment(end: &TurnEnd) -> Fragment {
     let mut fragment = Fragment::empty();
     let stop_reason = fragment.put::<UTF8String, _>(end.stopped.to_owned());
+    let scored = (!end.delta_nll.is_empty()).then(|| {
+        let nats: f64 = end.delta_nll.iter().map(|&x| x as f64).sum();
+        (nats, end.delta_nll.len() as u128)
+    });
     fragment += entity! { _ @
         metadata::tag: schema::kind_turn_end,
         schema::turn: end.turn as u128,
@@ -202,6 +215,8 @@ pub fn turn_end_fragment(end: &TurnEnd) -> Fragment {
         schema::first_token_seconds: end.first_token_secs,
         schema::turn_seconds: end.turn_secs,
         schema::position: end.position as u128,
+        schema::delta_nll_nats?: scored.map(|(nats, _)| nats),
+        schema::delta_scored_tokens?: scored.map(|(_, count)| count),
     };
     fragment
 }
@@ -307,6 +322,7 @@ mod tests {
             tokens: 11,
             token_ids: vec![42; 11],
             delta_tokens: 13,
+            delta_nll: vec![2.5, 0.5, 3.0],
             carried: 1,
             stopped: "stop_token".to_string(),
             first_token_secs: 0.25,

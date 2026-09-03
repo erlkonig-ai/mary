@@ -110,7 +110,7 @@ use anyhow::{Context, Result};
 use super::assembly::{
     BT, Bk, DeviceDense, LayerCache, LayerDev, MoeState, RouterArm, T2, argmax_row_dev,
     argmax_rows_dev, bind_layer, dense_mlp_bf16, dev_lane, dev_lane_resid, moe_layer,
-    quantized_bf16, up1r, up2, w4a16_bind,
+    quantized_bf16, row_nll_dev, up1r, up2, w4a16_bind,
 };
 use super::attn::{AttnDims, LogScaling};
 use super::config::{AttnKind, InklingConfig};
@@ -623,13 +623,25 @@ impl Drop for TargetExtension<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassMode {
     Commit,
+    /// Commit, and also score every row against the id that followed it:
+    /// `ids[1..]` inside the pass and `next` after it, when the caller knows
+    /// what came next. See [`Session::extend_scored`].
+    Scored { next: Option<usize> },
     Target,
 }
 
 enum PassOutput {
     Committed(usize),
+    /// The committed token and the per-row negative log-likelihoods, in nats.
+    Scored { best: usize, nll: Vec<f32> },
     Target(Vec<usize>),
 }
+
+/// Rows per head slice on a scored pass. A scored pass needs one prediction per
+/// row, and this bounds the widest transient to `SCORE_ROWS x vocab` logits
+/// rather than `n x vocab`, so a long delta scores in the memory a short one
+/// does.
+const SCORE_ROWS: usize = 64;
 
 /// One device layer viewed through the backend-free target settlement trait.
 struct PendingTargetLayer<'a> {
@@ -1180,7 +1192,7 @@ impl Session {
         let boundary = TargetBoundary::new(self.pos, self.last, width.rows())?;
         let predictions = match self.forward_pass(proposed, PassMode::Target) {
             Ok(PassOutput::Target(predictions)) => predictions,
-            Ok(PassOutput::Committed(_)) => {
+            Ok(PassOutput::Committed(_) | PassOutput::Scored { .. }) => {
                 unreachable!("a target pass returned a committed prediction")
             }
             Err(source) => {
@@ -1473,6 +1485,53 @@ impl Session {
         Ok(out)
     }
 
+    /// [`Session::prefill`] that also SCORES the prompt: returns the token that
+    /// follows it and, for every id after the first, the negative
+    /// log-likelihood the model assigned that id given its predecessors, in
+    /// nats. The score is prequential — each id is scored by a model that has
+    /// not yet seen it — which is what makes it comparable across time and
+    /// across learning: it is the only score the online-learning path keeps.
+    pub fn prefill_scored(&mut self, ids: &[usize]) -> Result<(usize, Vec<f32>)> {
+        anyhow::ensure!(
+            self.pos == 0,
+            "this Session already holds {} positions. Use `extend_scored` to continue the \
+             sequence, or `reset` to start a new one.",
+            self.pos
+        );
+        anyhow::ensure!(!ids.is_empty(), "a prefill with no tokens would be vacuous");
+        self.chunked_scored(ids, self.prefill_budget)
+    }
+
+    /// [`Session::extend`] that also scores the delta: the second element has
+    /// one entry per id after the first, the negative log-likelihood of that id
+    /// under the model that had seen everything before it. A chunk boundary is
+    /// no gap in the score: the last row of a chunk is scored against the first
+    /// id of the next.
+    pub fn extend_scored(&mut self, ids: &[usize]) -> Result<(usize, Vec<f32>)> {
+        if ids.is_empty() {
+            return self.step().map(|t| (t, Vec::new()));
+        }
+        if self.caches.is_empty() {
+            return self.chunked_scored(ids, self.prefill_budget);
+        }
+        self.chunked_scored(ids, self.extend_batch)
+    }
+
+    fn chunked_scored(&mut self, ids: &[usize], width: usize) -> Result<(usize, Vec<f32>)> {
+        let mut out = 0;
+        let mut nll = Vec::with_capacity(ids.len());
+        let mut start = 0;
+        for chunk in ids.chunks(width) {
+            let next = ids.get(start + chunk.len()).copied();
+            let (best, scored) = self.forward_committed(chunk, PassMode::Scored { next })?;
+            nll.extend(scored);
+            out = best;
+            start += chunk.len();
+        }
+        debug_assert_eq!(nll.len(), ids.len() - 1, "every id after the first is scored");
+        Ok((out, nll))
+    }
+
     /// Attend to tokens that are NEW since the last call, continuing the
     /// sequence, and return the token that follows them.
     ///
@@ -1589,6 +1648,14 @@ impl Session {
     ///
     /// Refuses a session a previous pass tore. See [`Session::torn`].
     fn forward(&mut self, ids: &[usize]) -> Result<usize> {
+        self.forward_committed(ids, PassMode::Commit)
+            .map(|(best, _)| best)
+    }
+
+    /// [`Session::forward`] in either committing mode. `PassMode::Scored` also
+    /// returns the per-row score; `PassMode::Commit` returns an empty one.
+    fn forward_committed(&mut self, ids: &[usize], mode: PassMode) -> Result<(usize, Vec<f32>)> {
+        debug_assert!(mode != PassMode::Target, "a target pass is a transaction, not a commit");
         anyhow::ensure!(!ids.is_empty(), "a pass with no tokens would be vacuous");
         let end = self
             .pos
@@ -1613,8 +1680,13 @@ impl Session {
         // out of the loop below leaves the stack half advanced, which no
         // caller can detect and none should have to; poison the session and
         // name the two ways out.
-        let out = match self.forward_pass(ids, PassMode::Commit) {
-            Ok(PassOutput::Committed(best)) => self.validate_cache_completeness().map(|_| best),
+        let out = match self.forward_pass(ids, mode) {
+            Ok(PassOutput::Committed(best)) => self
+                .validate_cache_completeness()
+                .map(|_| (best, Vec::new())),
+            Ok(PassOutput::Scored { best, nll }) => {
+                self.validate_cache_completeness().map(|_| (best, nll))
+            }
             Ok(PassOutput::Target(_)) => {
                 unreachable!("an ordinary pass returned target predictions")
             }
@@ -1650,7 +1722,7 @@ impl Session {
         // A pass with a cache behind it is a decode step; the first one is the
         // prefill that establishes the cache.
         let cached = !self.caches.is_empty();
-        debug_assert!(cached || mode == PassMode::Commit);
+        debug_assert!(cached || mode != PassMode::Target);
         super::fatal::note_pass(n, pos0 + n);
         self.cleanup_gate.begin_pass();
 
@@ -1772,7 +1844,7 @@ impl Session {
                 // builds from absolute positions is what makes the untrimmed
                 // rows harmless, and `commit` below is what makes the store
                 // bounded again.
-                (true, PassMode::Commit, true) => {
+                (true, PassMode::Commit | PassMode::Scored { .. }, true) => {
                     let y = dev_lane::attention_steps(
                         hn,
                         &ld.attn,
@@ -1805,7 +1877,7 @@ impl Session {
                     self.caches[slot].attn_sconv = dev_lane::conv_history(all, t.sconv_kernel_size);
                     out
                 }
-                (true, PassMode::Commit, false) => {
+                (true, PassMode::Commit | PassMode::Scored { .. }, false) => {
                     let y = dev_lane::attention_step(
                         hn,
                         &ld.attn,
@@ -1824,7 +1896,7 @@ impl Session {
                     self.caches[slot].attn_sconv = hist;
                     out
                 }
-                (false, PassMode::Commit, _) => {
+                (false, PassMode::Commit | PassMode::Scored { .. }, _) => {
                     let (y, attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
                     let y = tp_reduce(y, &mut tp_calls);
@@ -1907,7 +1979,7 @@ impl Session {
                 // need the batched form, and a widened pass that left one of
                 // them on the single-row kernel would convolve `n` positions
                 // out of one position's history with no error at all.
-                (true, PassMode::Commit, true) => {
+                (true, PassMode::Commit | PassMode::Scored { .. }, true) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
@@ -1917,7 +1989,7 @@ impl Session {
                         Some(dev_lane::conv_history(all, t.sconv_kernel_size));
                     o
                 }
-                (true, PassMode::Commit, false) => {
+                (true, PassMode::Commit | PassMode::Scored { .. }, false) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
@@ -1926,7 +1998,7 @@ impl Session {
                     self.caches[slot].mlp_sconv = Some(hi);
                     o
                 }
-                (false, PassMode::Commit, _) => {
+                (false, PassMode::Commit | PassMode::Scored { .. }, _) => {
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
                     self.caches[slot].mlp_sconv = Some(hist);
                     dev_lane::short_conv(y, ld.mlp_sconv.clone())
@@ -1978,22 +2050,56 @@ impl Session {
         // to find its accepted prefix. The explicit target path pays that wider
         // head; the default path keeps slicing before the projection, where the
         // difference is a 16 KB GEMM versus an `n x 200058` one.
-        let (hx, head_rows) = match mode {
-            PassMode::Commit => (xd.slice([n - 1..n, 0..h]), 1),
-            PassMode::Target => (xd, n),
-        };
-        let hs = dev_lane_resid::rms_norm(hx, self.final_norm.clone(), t.rms_norm_eps)
-            .div_scalar(t.logits_mup_width_multiplier as f32);
+        let eps = t.rms_norm_eps;
+        let mup = t.logits_mup_width_multiplier as f32;
+        let vocab = t.effective_vocab();
         let uw = &self.unembed;
-        let logits = dev_lane::linear_w(hs, uw).slice([0..head_rows, 0..t.effective_vocab()]);
+        let final_norm = &self.final_norm;
+        let head = |hx: T2| -> T2 {
+            let hs = dev_lane_resid::rms_norm(hx, final_norm.clone(), eps).div_scalar(mup);
+            let rows = hs.dims()[0];
+            dev_lane::linear_w(hs, uw).slice([0..rows, 0..vocab])
+        };
         match mode {
             PassMode::Commit => {
-                let best = argmax_row_dev(logits);
+                let best = argmax_row_dev(head(xd.slice([n - 1..n, 0..h])));
                 self.pos += n;
                 self.last = Some(best);
                 Ok(PassOutput::Committed(best))
             }
-            PassMode::Target => Ok(PassOutput::Target(argmax_rows_dev(logits))),
+            PassMode::Scored { next } => {
+                // Every row's prediction against the id that actually followed
+                // it: rows `0..n-1` against `ids[1..]`, the last row against
+                // `next` when the caller knows it. Head slices of `SCORE_ROWS`
+                // keep the logit transient bounded whatever `n` is; the last
+                // slice also yields the committed token.
+                let mut targets: Vec<usize> = ids[1..].to_vec();
+                targets.extend(next);
+                let mut nll = Vec::with_capacity(targets.len());
+                let mut best = None;
+                let mut lo = 0;
+                while lo < n {
+                    let hi = (lo + SCORE_ROWS).min(n);
+                    let logits = head(xd.clone().slice([lo..hi, 0..h]));
+                    let scored = targets.len().min(hi) - lo;
+                    if scored > 0 {
+                        nll.extend(row_nll_dev(
+                            logits.clone().slice([0..scored, 0..vocab]),
+                            &targets[lo..lo + scored],
+                        ));
+                    }
+                    if hi == n {
+                        let last = hi - lo - 1;
+                        best = Some(argmax_row_dev(logits.slice([last..last + 1, 0..vocab])));
+                    }
+                    lo = hi;
+                }
+                let best = best.expect("a pass has at least one row");
+                self.pos += n;
+                self.last = Some(best);
+                Ok(PassOutput::Scored { best, nll })
+            }
+            PassMode::Target => Ok(PassOutput::Target(argmax_rows_dev(head(xd)))),
         }
     }
 }

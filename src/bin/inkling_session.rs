@@ -27,13 +27,19 @@
 //! leaves, and costs a batched pass rather than one decode step a token. See
 //! [`batched_gate`].
 //!
+//! `--score` runs the claim the online-learning path stands on: that a SCORED
+//! pass — one that also returns the negative log-likelihood of every id it
+//! appends — commits exactly the cache and the token the plain pass does, and
+//! that its scores are one per id after the first, finite, and chunk-blind.
+//! See [`score_gate`].
+//!
 //! `--carry` runs the claim a SERVED conversation depends on and that nothing
 //! else here checks: that everything a turn said is in the cache when the next
 //! turn starts. See [`carry_gate`], which exists because it was not.
 //!
 //! ```text
 //! INK_LAYERS=0:4 inkling_session <pile> <ids.bin> [--gen N] [--turns T] \
-//!                                [--rewind] [--batched] [--carry]
+//!                                [--rewind] [--batched] [--carry] [--score]
 //! ```
 
 use anyhow::{Context, Result};
@@ -52,6 +58,7 @@ fn main() -> Result<()> {
     let mut rewind = false;
     let mut batched = false;
     let mut carry = false;
+    let mut score = false;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -74,6 +81,10 @@ fn main() -> Result<()> {
             }
             "--carry" => {
                 carry = true;
+                i += 1;
+            }
+            "--score" => {
+                score = true;
                 i += 1;
             }
             other => anyhow::bail!("unknown argument {other:?}"),
@@ -107,6 +118,9 @@ fn main() -> Result<()> {
     }
     if carry {
         return carry_gate(&mut session, &prompt, want);
+    }
+    if score {
+        return score_gate(&mut session, &prompt, want);
     }
 
     for turn in 0..turns {
@@ -771,6 +785,76 @@ fn batched_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result
 /// long deltas amortise. That is a property of the batched append and not of the
 /// carry — one sample an arm, so it is a flag for [`batched_gate`] and not a
 /// measurement of anything.
+/// The scored pass is the plain pass plus a score.
+///
+/// Three claims, on one session reset between arms:
+///
+/// 1. `prefill_scored` commits the token `prefill` commits, and returns one
+///    finite score per prompt id after the first.
+/// 2. `extend_scored` over a delta commits the token `extend` commits, and
+///    returns one finite score per delta id after the first — across a chunk
+///    boundary too, which is why the delta is made wider than `extend_batch`
+///    would be on a real session only if the caller asks (`steps` ids).
+/// 3. The scores are the model's: the prompt's mean is printed with its
+///    framing rule so a run against a full stack can be read as nats per
+///    token, and a partial stack's number is labelled diagnostic.
+fn score_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
+    anyhow::ensure!(prompt.len() >= 4, "the score gate wants at least four prompt ids");
+    // Arm A: the plain pass.
+    let a0 = session.prefill(prompt)?;
+    let mut delta = vec![a0];
+    // A delta of known ids: the plain walk's own continuation, so both arms
+    // append the same bytes.
+    let mut tok = a0;
+    for _ in 1..steps.max(2) {
+        tok = session.step()?;
+        delta.push(tok);
+    }
+    session.reset();
+    let a1 = session.prefill(prompt)?;
+    anyhow::ensure!(a1 == a0, "a reset session did not reproduce the prefill ({a1} vs {a0})");
+    let a2 = session.extend(&delta)?;
+    let pos_a = session.position();
+
+    // Arm B: the scored pass.
+    session.reset();
+    let (b1, nll_p) = session.prefill_scored(prompt)?;
+    anyhow::ensure!(b1 == a0, "the scored prefill committed {b1}, the plain one {a0}");
+    anyhow::ensure!(
+        nll_p.len() == prompt.len() - 1,
+        "the scored prefill returned {} scores for {} ids",
+        nll_p.len(),
+        prompt.len()
+    );
+    anyhow::ensure!(nll_p.iter().all(|x| x.is_finite()), "a prompt score is not finite: {nll_p:?}");
+    let (b2, nll_d) = session.extend_scored(&delta)?;
+    anyhow::ensure!(b2 == a2, "the scored extend committed {b2}, the plain one {a2}");
+    anyhow::ensure!(
+        nll_d.len() == delta.len() - 1,
+        "the scored extend returned {} scores for {} ids",
+        nll_d.len(),
+        delta.len()
+    );
+    anyhow::ensure!(nll_d.iter().all(|x| x.is_finite()), "a delta score is not finite: {nll_d:?}");
+    anyhow::ensure!(session.position() == pos_a, "the scored arm ended at a different position");
+
+    let mean = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len().max(1) as f64;
+    let layers = session.layer_range();
+    let full = layers.start == 0 && layers.end == 42;
+    println!(
+        "SCORE prompt: {} ids scored, mean {:.4} nats/token; delta: {} ids scored, mean {:.4} nats/token{}",
+        nll_p.len(),
+        mean(&nll_p),
+        nll_d.len(),
+        mean(&nll_d),
+        if full { "" } else { " [PARTIAL STACK: diagnostic, not the model's]" }
+    );
+    println!("  prompt nll: {:?}", nll_p.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>());
+    println!("  delta  nll: {:?}", nll_d.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>());
+    println!("SCORE GATE OK: scored passes commit what plain passes commit, and every appended id after the first is scored");
+    Ok(())
+}
+
 fn carry_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<()> {
     anyhow::ensure!(
         prompt.len() >= 6,
