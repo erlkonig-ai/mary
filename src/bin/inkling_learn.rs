@@ -34,7 +34,8 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         args.len() >= 4,
         "usage: inkling_learn <pile> <tokenizer.json> <turns.txt> [--from LINE] [--turns N] \
-         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--export]"
+         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--export] \
+         [--save | --save-commit --signing-key <path>]"
     );
     let (pile, tokenizer, corpus) = (&args[1], &args[2], &args[3]);
     let mut from = 100usize;
@@ -43,6 +44,8 @@ fn main() -> Result<()> {
     let mut rendezvous: Option<String> = None;
     let mut layers: Option<std::ops::Range<usize>> = None;
     let mut export = false;
+    let mut save = Save::No;
+    let mut signing_key: Option<String> = None;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -52,6 +55,25 @@ fn main() -> Result<()> {
             "--export" => {
                 export = true;
                 i += 1;
+            }
+            // After the export, assemble the learned snapshot -- the parent
+            // collection's facts with the learned leaves substituted -- as a
+            // model collection named after the parent, and say what it holds.
+            // `--save` stops there; `--save-commit` commits it, signed with
+            // `--signing-key`. See `inkling::learned`.
+            "--save" => {
+                export = true;
+                save = Save::Dry;
+                i += 1;
+            }
+            "--save-commit" => {
+                export = true;
+                save = Save::Commit;
+                i += 1;
+            }
+            "--signing-key" => {
+                signing_key = Some(args[i + 1].clone());
+                i += 2;
             }
             "--from" => {
                 from = args[i + 1].parse().context("--from wants a line number")?;
@@ -193,7 +215,52 @@ fn main() -> Result<()> {
         for (name, (count, (rows, logical))) in &per_name {
             println!("  {name}: {count} experts, each [{rows}, {logical}]");
         }
+        if save != Save::No && !learned.is_empty() {
+            use mary::models::inkling::learned::{learned_snapshot, publish_learned_snapshot};
+            use triblespace::prelude::Pile;
+            let parent = mary::model_collection::mary_model_graph_name();
+            let t = std::time::Instant::now();
+            let mut store = Pile::open(std::path::Path::new(pile))
+                .map_err(|e| anyhow::anyhow!("open {pile} to write: {e:?}"))?;
+            store
+                .refresh()
+                .map_err(|e| anyhow::anyhow!("refresh {pile}: {e:?}"))?;
+            let snapshot = learned_snapshot(&mut store, parent, &learned)?;
+            println!(
+                "=== snapshot '{}': {} leaves replaced, {} roots rebuilt, {} facts kept, {} facts in all, assembled in {:.1}s ===",
+                snapshot.name,
+                snapshot.replaced,
+                snapshot.roots,
+                snapshot.kept,
+                snapshot.facts.len(),
+                t.elapsed().as_secs_f64()
+            );
+            if save == Save::Commit {
+                let key_path = signing_key
+                    .as_deref()
+                    .context("--save-commit needs --signing-key <path>")?;
+                let key = triblespace::core::signing_key_file::load_existing(std::path::Path::new(
+                    key_path,
+                ))
+                .with_context(|| format!("load the signing key {key_path}"))?;
+                let name = snapshot.name;
+                publish_learned_snapshot(&mut store, &key, snapshot)?;
+                println!("=== committed '{name}' ===");
+            } else {
+                println!("  (not committed; --save-commit --signing-key <path> commits it)");
+            }
+            store
+                .close()
+                .map_err(|e| anyhow::anyhow!("close {pile}: {e:?}"))?;
+        }
     }
     engine.shutdown()?;
     Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Save {
+    No,
+    Dry,
+    Commit,
 }

@@ -998,8 +998,18 @@ impl PileSource {
 
         let t_open = std::time::Instant::now();
         let mut pile = Pile::open(path).map_err(|e| anyhow::anyhow!("open {path:?}: {e:?}"))?;
-        let snapshot = crate::model_collection::snapshot_model_collection_local_latest(&mut pile)
-            .map_err(|e| anyhow::anyhow!("{path:?}: model collection snapshot: {e}"))?;
+        // Which model collection. The checkpoint's is the default; a learned
+        // snapshot is a collection named after it (`super::learned`), and
+        // `INK_MODEL_COLLECTION=<name>` opens that one instead.
+        let collection_name: &'static str = match std::env::var("INK_MODEL_COLLECTION") {
+            Ok(name) if !name.is_empty() => Box::leak(name.into_boxed_str()),
+            _ => crate::model_collection::mary_model_graph_name(),
+        };
+        let snapshot = crate::model_collection::snapshot_model_collection_named_local_latest(
+            &mut pile,
+            collection_name,
+        )
+        .map_err(|e| anyhow::anyhow!("{path:?}: model collection '{collection_name}': {e}"))?;
         let facts =
             crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
         let model_identity = IntoBlob::<SimpleArchive>::to_blob(&facts).get_handle().raw;

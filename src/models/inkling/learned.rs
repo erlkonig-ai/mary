@@ -439,3 +439,171 @@ mod tests {
         assert!(err.contains("1 of 2 ranks"), "{err}");
     }
 }
+
+// ── the learned snapshot: a model collection named after its parent ─────────
+//
+// The loader takes THE COLLECTION as the model (the checkpoint's pile holds 41
+// roots, none of which is the model), and it keys leaves by name and index, so
+// learned leaves cannot share a collection with the leaves they replace. A
+// learned snapshot is therefore its own collection: the parent's facts with
+// the learned leaves substituted and the roots that named them rebuilt, under
+// a name that says whose child it is. Nothing reads a collection it was not
+// pointed at (`INK_MODEL_COLLECTION`), so the parent stays exactly what it
+// was for every other reader; and `cat` remains the merge, because a second
+// collection is only more records.
+
+/// The facts of a learned snapshot, before or after they are committed.
+pub struct LearnedSnapshot {
+    /// `<parent>@learned-<utc time>`.
+    pub name: &'static str,
+    pub facts: triblespace::core::trible::TribleSet,
+    /// Leaves whose bytes moved and were replaced by new leaf entities.
+    pub replaced: usize,
+    /// Roots that named a replaced leaf and were rebuilt over the new one.
+    pub roots: usize,
+    /// Facts carried from the parent unchanged.
+    pub kept: usize,
+}
+
+/// The name a snapshot taken now would carry: `<parent>@learned-<UTC stamp>`.
+pub fn snapshot_name(parent: &str) -> &'static str {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let (h, m, s) = (rem / 3_600, rem % 3_600 / 60, rem % 60);
+    // Civil date from days since the epoch (Hinnant), so this needs no crate.
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(mo <= 2);
+    Box::leak(format!("{parent}@learned-{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z").into_boxed_str())
+}
+
+/// Assemble the snapshot from the parent collection in `pile` and the
+/// learned experts. Writes the new leaves' blobs into the pile (content
+/// addressed, so a repeat is a no-op) and nothing else: no record is
+/// committed here.
+pub fn learned_snapshot(
+    pile: &mut triblespace::prelude::Pile,
+    parent: &'static str,
+    learned: &[LearnedExpert],
+) -> Result<LearnedSnapshot> {
+    use crate::format::attrs as model;
+    use std::collections::{BTreeSet, HashMap};
+    use super::pile::attrs;
+    use triblespace::core::inline::encodings::hash::Handle;
+    use triblespace::core::metadata;
+    use triblespace::core::trible::TribleSet;
+    use triblespace::macros::{entity, find, pattern};
+    use triblespace::prelude::*;
+
+    let snapshot = crate::model_collection::snapshot_model_collection_named_local_latest(pile, parent)
+        .with_context(|| format!("the parent collection '{parent}'"))?;
+    let facts = crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
+
+    // 1. New leaves, and the ids of the leaves they replace.
+    let mut added = TribleSet::new();
+    let mut subst: HashMap<Id, Id> = HashMap::new();
+    for x in learned {
+        let blob = super::pile::expert_blob(&x.packed)
+            .with_context(|| format!("{}[{}] as a pile leaf", x.name, x.expert))?;
+        let handle = pile
+            .put(blob)
+            .map_err(|e| anyhow::anyhow!("store {}[{}]: {e:?}", x.name, x.expert))?;
+        let name_h = pile
+            .put::<blobencodings::UTF8String, _>(x.name.clone())
+            .map_err(|e| anyhow::anyhow!("store the name of {}: {e:?}", x.name))?;
+        let old: Vec<Id> = find!(
+            (e: Id),
+            pattern!(&facts, [{ ?e @ metadata::name: (name_h), attrs::expert_index: (x.expert), attrs::layer: (x.layer) }])
+        )
+        .map(|(e,)| e)
+        .collect();
+        anyhow::ensure!(
+            old.len() == 1,
+            "{}[{}] (layer {}) names {} leaves in '{parent}', not one",
+            x.name,
+            x.expert,
+            x.layer,
+            old.len()
+        );
+        let leaf = entity! { _ @
+            attrs::weight_nvfp4_2: handle,
+            attrs::expert_index: x.expert,
+            metadata::name: name_h,
+            attrs::layer: x.layer,
+        };
+        let new_id = leaf.root().expect("a leaf has a root");
+        added += leaf;
+        subst.insert(old[0], new_id);
+    }
+
+    // 2. Every root that named a replaced leaf is rebuilt over the new one:
+    //    a root's id is its member set, so a changed set is a new root, and
+    //    its labels move with it.
+    let mut old_roots: BTreeSet<Id> = BTreeSet::new();
+    for old_leaf in subst.keys() {
+        for (r,) in find!((r: Id), pattern!(&facts, [{ ?r @ model::member: (*old_leaf) }])) {
+            old_roots.insert(r);
+        }
+    }
+    for r in &old_roots {
+        let members: Vec<Id> = find!((m: Id), pattern!(&facts, [{ (*r) @ model::member: ?m }]))
+            .map(|(m,)| subst.get(&m).copied().unwrap_or(m))
+            .collect();
+        let root = entity! { _ @ model::member*: members.iter() };
+        let new_root = root.root().expect("a root has a root");
+        added += root;
+        for (q,) in find!((q: String), pattern!(&facts, [{ (*r) @ model::quantization: ?q }])) {
+            added += entity! { ExclusiveId::force_ref(&new_root) @ model::quantization: q.as_str() };
+        }
+        for (s,) in find!(
+            (s: Inline<Handle<blobencodings::UTF8String>>),
+            pattern!(&facts, [{ (*r) @ model::source: ?s }])
+        ) {
+            added += entity! { ExclusiveId::force_ref(&new_root) @ model::source: s };
+        }
+        for (mn,) in find!(
+            (mn: Inline<Handle<blobencodings::UTF8String>>),
+            pattern!(&facts, [{ (*r) @ model::model_name: ?mn }])
+        ) {
+            added += entity! { ExclusiveId::force_ref(&new_root) @ model::model_name: mn };
+        }
+    }
+
+    // 3. Everything else is carried as it is.
+    let drop: BTreeSet<Id> = subst.keys().copied().chain(old_roots.iter().copied()).collect();
+    let mut out: TribleSet = facts.iter().filter(|t| !drop.contains(t.e())).cloned().collect();
+    let kept = out.len();
+    out.union(added);
+    Ok(LearnedSnapshot {
+        name: snapshot_name(parent),
+        facts: out,
+        replaced: subst.len(),
+        roots: old_roots.len(),
+        kept,
+    })
+}
+
+/// Commit the snapshot as its own collection, signed with `key`.
+pub fn publish_learned_snapshot(
+    pile: &mut triblespace::prelude::Pile,
+    key: &ed25519_dalek::SigningKey,
+    snapshot: LearnedSnapshot,
+) -> Result<()> {
+    use triblespace::prelude::*;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("refresh before publishing '{}': {e:?}", snapshot.name))?;
+    let collection = crate::model_collection::collection_or_create(pile, key, snapshot.name)?;
+    let fragment: Fragment = snapshot.facts.into();
+    pile.commit(collection, key, fragment)
+        .map_err(|e| anyhow::anyhow!("publish '{}': {e}", snapshot.name))?;
+    Ok(())
+}

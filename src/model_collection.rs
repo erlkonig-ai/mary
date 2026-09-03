@@ -195,7 +195,7 @@ pub fn model_bundle_collections_in(store: &PileSnapshot) -> anyhow::Result<Vec<M
     named_collections_in(store, mary_model_bundle_name())
 }
 
-fn collection_or_create(
+pub(crate) fn collection_or_create(
     pile: &mut Pile,
     signing_key: &SigningKey,
     name: &'static str,
@@ -364,7 +364,27 @@ pub fn snapshot_model_collection_local_latest(
 }
 
 pub fn snapshot_model_collection_in(store: &PileSnapshot) -> anyhow::Result<ModelPileSnapshot> {
-    let collection = sole_named_collection_in(store, mary_model_graph_name())?;
+    snapshot_model_collection_named_in(store, mary_model_graph_name())
+}
+
+/// The sole model collection of this NAME, frozen from the latest local
+/// observation. A learned snapshot lives in a collection named after its
+/// parent (`crate::models::inkling::learned`), and a reader that wants it
+/// asks for it by that name; nothing reads a collection it was not pointed
+/// at, so the parent stays exactly what it was for every other reader.
+pub fn snapshot_model_collection_named_local_latest(
+    pile: &mut Pile,
+    name: &'static str,
+) -> anyhow::Result<ModelPileSnapshot> {
+    let store = pile.snapshot().context("freeze model pile observation")?;
+    snapshot_model_collection_named_in(&store, name)
+}
+
+pub fn snapshot_model_collection_named_in(
+    store: &PileSnapshot,
+    name: &'static str,
+) -> anyhow::Result<ModelPileSnapshot> {
+    let collection = sole_named_collection_in(store, name)?;
     snapshot_model_collection_for(store, collection)
 }
 
