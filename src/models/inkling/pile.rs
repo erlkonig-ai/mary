@@ -1010,14 +1010,19 @@ impl PileSource {
         let t_experts = std::time::Instant::now();
 
         // ── which model ─────────────────────────────────────────────────────
-        // A collection can hold more than one model root -- a checkpoint and
-        // the model learned from it, say (`super::learned`). The sweeps below
-        // key leaves by NAME and index, so read over two roots they would
-        // return one model with whichever leaf the query yielded last. So the
-        // root is chosen first, and every leaf has to be a member of it.
-        // `INK_MODEL_ROOT=<hex>` names it; otherwise a sole root is it, and
-        // several without a name is an error rather than a guess. A pile with
-        // no root entity at all (older imports) is swept whole, as before.
+        // THE MODEL IS THE COLLECTION. The 42-layer checkpoint was imported in
+        // pieces and its policy pile holds 41 model roots, none of which is
+        // "the model": every leaf in the collection is. So the default is the
+        // whole collection, as it always was.
+        //
+        // `INK_MODEL_ROOT=<hex>` restricts the sweeps to ONE root's members
+        // instead. That is what a learned model needs (`super::learned`): its
+        // leaves carry the same names and indices as the checkpoint's, and the
+        // sweeps below key by name and index, so read over both they would
+        // return one model with whichever leaf the query yielded last. A root
+        // names exactly which. How a learned model is named and chosen by
+        // default is still an open decision; this is the mechanism under any
+        // answer to it.
         let mut roots: Vec<Id> = find!(
             (r: Id),
             pattern!(&facts, [{ ?r @ crate::format::attrs::member: _?m }])
@@ -1044,16 +1049,7 @@ impl PileSource {
                 );
                 Some(id)
             }
-            Err(_) => match roots.as_slice() {
-                [] => None,
-                [one] => Some(*one),
-                many => anyhow::bail!(
-                    "{path:?} holds {} model roots ({}); set INK_MODEL_ROOT=<id> to say which \
-                     one to run",
-                    many.len(),
-                    hex_list(many)
-                ),
-            },
+            Err(_) => None,
         };
 
         // ── the experts, as handles ─────────────────────────────────────────
