@@ -87,13 +87,25 @@ box_busy_local() {
     # pattern must match it from its first character; `python -m sglang.x`
     # still matches on its module word, `env PATH=...cargo/bin... claude` does
     # not.
-    local word matched=0
+    # The PROGRAM is the first word that is not an assignment (`env A=1 prog`
+    # execs prog, so the running process shows prog first anyway), plus the
+    # module after a `-m` when the program is python, which is how the
+    # sglang/vllm servers are named. Nothing else in argv names a workload: a
+    # runner whose argv says which cargo command it will launch later is not
+    # cargo yet, and this script's own `--remote` caller carries the whole
+    # alternation as one word.
+    local word program="" module="" prev="" matched=0
     for word in $cmd; do
-      # An assignment is not a program, and neither is a PATTERN: a word with
-      # a bar in it is somebody's alternation (this script's own `--remote`
-      # caller, when the remote box is this box), not a name.
-      case "$word" in *=*|*"|"*) continue ;; esac
-      word=${word##*/}
+      if [ -z "$program" ]; then
+        case "$word" in *=*) continue ;; esac
+        program=${word##*/}
+      elif [ "$prev" = "-m" ]; then
+        module=$word; break
+      fi
+      prev=$word
+    done
+    for word in "$program" "$module"; do
+      [ -n "$word" ] || continue
       if [[ $word =~ ^($pat)([^A-Za-z0-9_]|$) ]]; then matched=1; break; fi
     done
     [ "$matched" = 1 ] || continue
