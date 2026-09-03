@@ -120,6 +120,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use triblespace::core::blob::Blob;
 use triblespace::core::blob::encodings::UnknownBlob;
+use triblespace::core::clock::epoch_now;
 use triblespace::core::id::ExclusiveId;
 use triblespace::core::repo::{BlobStoreList, SnapshotSource};
 use triblespace::core::signing_key_file;
@@ -233,7 +234,7 @@ fn migrate(src: &Path, dst: &Path, signing_key: &ed25519_dalek::SigningKey) -> R
         .map_err(|error| anyhow::anyhow!("freeze destination observation: {error}"))?;
     anyhow::ensure!(
         expected
-            .writer_is_admitted(&destination, signing_key.verifying_key())
+            .writer_is_admitted_at(&destination, signing_key.verifying_key(), epoch_now(),)
             .map_err(|error| anyhow::anyhow!("check destination writer admission: {error}"))?,
         "signing key is not admitted to the source model collection in the destination; use the authority key or install its ACTION_WRITE proof first"
     );
