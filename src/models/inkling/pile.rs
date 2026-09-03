@@ -1065,7 +1065,23 @@ impl PileSource {
                 );
                 Some(id)
             }
-            Err(_) => None,
+            // No root named: the version DAG's one head, when a learned
+            // version exists (`super::learned`); the whole collection when
+            // none does, which is the checkpoint as imported.
+            Err(_) => {
+                let heads = super::learned::version_heads(&facts);
+                match heads.len() {
+                    0 => None,
+                    1 => {
+                        println!("    model root: the version graph's head {:X}", heads[0]);
+                        Some(heads[0])
+                    }
+                    n => anyhow::bail!(
+                        "{path:?}: the model graph has {n} version heads ({}); INK_MODEL_ROOT names one",
+                        hex_list(&heads)
+                    ),
+                }
+            }
         };
 
         // ── the experts, as handles ─────────────────────────────────────────

@@ -46,6 +46,7 @@ fn main() -> Result<()> {
     let mut export = false;
     let mut save = Save::No;
     let mut signing_key: Option<String> = None;
+    let mut explain: Option<String> = None;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
@@ -56,11 +57,11 @@ fn main() -> Result<()> {
                 export = true;
                 i += 1;
             }
-            // After the export, assemble the learned snapshot -- the parent
-            // collection's facts with the learned leaves substituted -- as a
-            // model collection named after the parent, and say what it holds.
-            // `--save` stops there; `--save-commit` commits it, signed with
-            // `--signing-key`. See `inkling::learned`.
+            // After the export, assemble the learned VERSION -- a new root in
+            // the model graph whose members are the parent's with the learned
+            // leaves substituted, a `parent` edge, and the recipe -- and say
+            // what it holds. `--save` stops there; `--save-commit` commits it,
+            // signed with `--signing-key`. See `inkling::learned`.
             "--save" => {
                 export = true;
                 save = Save::Dry;
@@ -73,6 +74,11 @@ fn main() -> Result<()> {
             }
             "--signing-key" => {
                 signing_key = Some(args[i + 1].clone());
+                i += 2;
+            }
+            // Why this version exists, in words, onto the version root.
+            "--explain" => {
+                explain = Some(args[i + 1].clone());
                 i += 2;
             }
             "--from" => {
@@ -235,23 +241,36 @@ fn main() -> Result<()> {
             println!("  {name}: {count} experts, each [{rows}, {logical}]");
         }
         if save != Save::No && !learned.is_empty() {
-            use mary::models::inkling::learned::{learned_snapshot, publish_learned_snapshot};
+            use mary::models::inkling::learned::{VersionRecipe, learned_version, publish_version};
             use triblespace::prelude::Pile;
-            let parent = mary::model_collection::mary_model_graph_name();
             let t = std::time::Instant::now();
             let mut store = Pile::open(std::path::Path::new(pile))
                 .map_err(|e| anyhow::anyhow!("open {pile} to write: {e:?}"))?;
             store
                 .refresh()
                 .map_err(|e| anyhow::anyhow!("refresh {pile}: {e:?}"))?;
-            let snapshot = learned_snapshot(&mut store, parent, &learned)?;
+            let recipe = VersionRecipe {
+                lr: lr.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+                anchor: std::env::var("INK_LEARN_ANCHOR").ok().and_then(|v| v.parse().ok()),
+                seed: std::env::var("INK_LEARN_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+                steps: lines.len() as u64,
+                span: format!(
+                    "{corpus} lines {from}..{}, {want} generated token(s) a turn",
+                    from + lines.len()
+                ),
+                explanation: explain.clone().unwrap_or_default(),
+                code_revision: std::env::var("INK_CODE_REVISION").unwrap_or_default(),
+            };
+            let version = learned_version(&mut store, &learned, None, &recipe)?;
             println!(
-                "=== snapshot '{}': {} leaves replaced, {} roots rebuilt, {} facts kept, {} facts in all, assembled in {:.1}s ===",
-                snapshot.name,
-                snapshot.replaced,
-                snapshot.roots,
-                snapshot.kept,
-                snapshot.facts.len(),
+                "=== version {:X} '{}': parent {:X}{}, {} leaves replaced, {} members, {} facts to add, assembled in {:.1}s ===",
+                version.root,
+                version.name,
+                version.parent,
+                if version.genesis { " (the genesis root, minted now)" } else { "" },
+                version.replaced,
+                version.members,
+                version.facts.len(),
                 t.elapsed().as_secs_f64()
             );
             if save == Save::Commit {
@@ -262,8 +281,8 @@ fn main() -> Result<()> {
                     key_path,
                 ))
                 .with_context(|| format!("load the signing key {key_path}"))?;
-                let name = snapshot.name;
-                publish_learned_snapshot(&mut store, &key, snapshot)?;
+                let name = version.name.clone();
+                publish_version(&mut store, &key, version)?;
                 println!("=== committed '{name}' ===");
             } else {
                 println!("  (not committed; --save-commit --signing-key <path> commits it)");
