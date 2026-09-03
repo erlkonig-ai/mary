@@ -368,6 +368,10 @@ pub struct Session {
     /// (`INK_LEARN_LR`); see [`super::learn`].
     #[cfg(feature = "inkling-cuda")]
     learner: Option<super::learn::Learner>,
+    /// Rows she generated since the last scored pass, kept for the anchor
+    /// (`INK_LEARN_ANCHOR`); see [`super::learn::AnchorRow`].
+    #[cfg(feature = "inkling-cuda")]
+    anchor: Vec<super::learn::AnchorRow>,
 
     /// The MoE half's row-plan invariants and per-layer expert tables, built on
     /// first touch and held for the life of the session.
@@ -947,7 +951,15 @@ impl Session {
                     "  learning           : last layer's routed experts, lr {lr}, {} rounding",
                     if stochastic { "stochastic" } else { "nearest" }
                 );
-                super::learn::Learner::bind(&client, &leaf.bytes, rows, cols, lr, stochastic)
+                let mut learner =
+                    super::learn::Learner::bind(&client, &leaf.bytes, rows, cols, lr, stochastic);
+                learner.anchor = super::learn::Learner::anchor_from_env();
+                if let Some(w) = learner.anchor {
+                    println!(
+                        "  anchor             : her rows held to the distribution that said them, weight {w}"
+                    );
+                }
+                learner
             });
             #[cfg(not(feature = "inkling-cuda"))]
             let learner = ();
@@ -1020,6 +1032,8 @@ impl Session {
             unembed,
             #[cfg(feature = "inkling-cuda")]
             learner,
+            #[cfg(feature = "inkling-cuda")]
+            anchor: Vec::new(),
             caches: Vec::new(),
             pos: 0,
             last: None,
@@ -2128,7 +2142,29 @@ impl Session {
         };
         match mode {
             PassMode::Commit => {
-                let best = argmax_row_dev(head(xd.slice([n - 1..n, 0..h])));
+                let logits = head(xd.clone().slice([n - 1..n, 0..h]));
+                let best = argmax_row_dev(logits.clone());
+                // A one-row commit is a token she generated: keep the row and
+                // the distribution it was drawn from, for the anchor at the
+                // next scored pass. Wider commits are context, not hers.
+                #[cfg(feature = "inkling-cuda")]
+                if n == 1
+                    && self.learner.as_ref().is_some_and(|l| l.anchor.is_some())
+                    && let Some(keep) = self.moe.learn.take()
+                {
+                    let dist = burn::tensor::activation::softmax(
+                        logits.cast(burn::tensor::DType::F32),
+                        1,
+                    );
+                    self.anchor.push(super::learn::AnchorRow {
+                        hn: keep.hn,
+                        xd: xd.clone(),
+                        dist,
+                    });
+                    if self.anchor.len() > super::learn::ANCHOR_ROWS {
+                        self.anchor.remove(0);
+                    }
+                }
                 self.pos += n;
                 self.last = Some(best);
                 Ok(PassOutput::Committed(best))
@@ -2161,6 +2197,88 @@ impl Session {
                     lo = hi;
                 }
                 let best = best.expect("a pass has at least one row");
+                #[cfg(feature = "inkling-cuda")]
+                let learn_inter = match tp {
+                    Some(tp) => tp
+                        .share("intermediate_size", t.intermediate_size)
+                        .map_err(|e| anyhow::anyhow!("learning: {e}"))?,
+                    None => t.intermediate_size,
+                };
+                // Her rows first: hold what she said since the last scored
+                // pass to the distribution the model gave it then, through the
+                // same experts, before his rows move them. The rows are
+                // re-routed as one batch; the router has not changed.
+                #[cfg(feature = "inkling-cuda")]
+                if let Some(learner) = self.learner.as_mut()
+                    && let Some(weight) = learner.anchor
+                    && let Some(layer) = self.moe.learn_layer
+                    && !self.anchor.is_empty()
+                {
+                    let rows = self.anchor.len();
+                    let cat = |f: &dyn Fn(&super::learn::AnchorRow) -> T2| -> T2 {
+                        burn::tensor::Tensor::cat(self.anchor.iter().map(f).collect::<Vec<_>>(), 0)
+                    };
+                    let hn = cat(&|a| a.hn.clone());
+                    let axd = cat(&|a| a.xd.clone());
+                    let dist = cat(&|a| a.dist.clone());
+                    self.anchor.clear();
+                    let ld = self
+                        .layers
+                        .get(&format!("model.llm.layers.{layer}."))
+                        .expect("the learned layer is resident on this rank");
+                    let r = ld.router.as_ref().expect("a MoE layer has a router");
+                    let (route, dp) = super::assembly::route_only(
+                        &self.client,
+                        &mut self.moe,
+                        layer,
+                        t,
+                        r,
+                        &hn,
+                        rows,
+                    )?;
+                    let tab = self
+                        .moe
+                        .route
+                        .as_ref()
+                        .and_then(|d| d.tabs.get(&layer))
+                        .and_then(|tb| tb.as_ref())
+                        .expect("the learned layer has a device expert table");
+                    let keep = super::learn::LearnKeep {
+                        layer,
+                        hn,
+                        dp,
+                        sconv: Some(ld.mlp_sconv.clone()),
+                    };
+                    let report = super::learn::learn_last_layer(
+                        &self.client,
+                        &self.dev,
+                        learner,
+                        keep,
+                        &route,
+                        tab,
+                        self.src.experts_swizzled(),
+                        &axd,
+                        final_norm,
+                        &head,
+                        super::learn::Target::Dist {
+                            dist: &dist,
+                            weight,
+                        },
+                        mup,
+                        eps,
+                        vocab,
+                        t.vocab_size,
+                        t.n_routed_experts,
+                        learn_inter,
+                        SCORE_ROWS,
+                    )?;
+                    if learn_trace() {
+                        println!(
+                            "  anchor: layer {} held {} of her rows over {} slots at weight {weight}, enqueued in {:.3}s",
+                            report.layer, report.rows, report.slots, report.secs
+                        );
+                    }
+                }
                 // Learn from what was just scored, while this pass's residual
                 // top and the last layer's expert input and plan are live. The
                 // kernels are enqueued behind the scoring and run in stream
@@ -2175,12 +2293,7 @@ impl Session {
                         .get(&keep.layer)
                         .and_then(|tab| tab.as_ref())
                         .expect("the learned layer has a device expert table");
-                    let inter = match tp {
-                        Some(tp) => tp
-                            .share("intermediate_size", t.intermediate_size)
-                            .map_err(|e| anyhow::anyhow!("learning: {e}"))?,
-                        None => t.intermediate_size,
-                    };
+                    let inter = learn_inter;
                     let report = super::learn::learn_last_layer(
                         &self.client,
                         &self.dev,
@@ -2192,7 +2305,7 @@ impl Session {
                         &xd,
                         final_norm,
                         &head,
-                        &targets,
+                        super::learn::Target::Ids(&targets),
                         mup,
                         eps,
                         vocab,

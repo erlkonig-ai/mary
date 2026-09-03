@@ -522,10 +522,40 @@ pub struct LearnKeep {
     pub sconv: Option<T2>,
 }
 
+/// One row she generated, kept for the anchor: the last layer's expert input
+/// for that row, the residual top, and the next-token distribution the model
+/// gave it WHEN SHE SAID IT. At the next scored pass the same rows are run
+/// through the (by then updated) experts and held to that distribution --
+/// the KL trust region of S5 -- before his rows move the experts again.
+pub struct AnchorRow {
+    pub hn: T2,
+    pub xd: T2,
+    /// `[1, vocab_eff]` f32 softmax.
+    pub dist: T2,
+}
+
+/// The most recent rows the anchor keeps between scored passes. Each carries a
+/// full-vocabulary distribution (about 0.8 MiB), so a long generation is
+/// anchored by its tail rather than growing without bound.
+pub const ANCHOR_ROWS: usize = 64;
+
+/// What a learning pass learns TOWARD, per row.
+pub enum Target<'a> {
+    /// The id that actually followed each row: next-token NLL.
+    Ids(&'a [usize]),
+    /// A distribution per row, `[rows, vocab_eff]` f32, held to at `weight`
+    /// times the NLL's scale: the gradient is `weight * (softmax - dist)`.
+    Dist { dist: &'a T2, weight: f32 },
+}
+
 /// What a session holds to learn: the step and the transposed head.
 pub struct Learner {
     pub lr: f32,
     pub stochastic: bool,
+    /// `INK_LEARN_ANCHOR=<f32>`: hold the rows she generated to the
+    /// distribution the model gave them when she said them, at this weight.
+    /// `None` learns from his rows alone, which is what drifted her voice.
+    pub anchor: Option<f32>,
     /// The unembedding, transposed to `[h, vocab_pad]` and packed, so that
     /// `g_logits @ U` is one W4A16 GEMM with the vocabulary as its reduction.
     pub unembed_t: dev_lane::ProjW,
@@ -543,6 +573,12 @@ impl Learner {
             let rn = std::env::var("INK_LEARN_RN").map(|v| v == "1").unwrap_or(false);
             (lr, !rn)
         })
+    }
+
+    /// `INK_LEARN_ANCHOR=<f32>`, positive, or nothing.
+    pub fn anchor_from_env() -> Option<f32> {
+        let w: f32 = std::env::var("INK_LEARN_ANCHOR").ok()?.parse().ok()?;
+        (w > 0.0).then_some(w)
     }
 
     /// Bind the transposed head from the stored BF16 unembedding
@@ -575,6 +611,7 @@ impl Learner {
         Self {
             lr,
             stochastic,
+            anchor: None,
             unembed_t: w4a16_bind(client, packed, true),
             steps: 0,
         }
@@ -628,10 +665,11 @@ fn short_conv_backward(g_out: T2, weight: T2) -> T2 {
 
 /// Learn the last layer's routed experts from one scored pass.
 ///
-/// `xd` is the pass's residual top `[n, h]`; `targets[r]` the id row `r` was
-/// scored against (rows past `targets.len()` were not scored and carry no
-/// gradient); `head` computes the head's logits `[rows, vocab_eff]` from a
-/// slice of `xd` exactly as the scored pass did.
+/// `xd` is the pass's residual top `[n, h]`; `target` says what each row is
+/// learned toward -- the id that followed it, or a distribution it is held to
+/// (rows past the target's length were not scored and carry no gradient);
+/// `head` computes the head's logits `[rows, vocab_eff]` from a slice of `xd`
+/// exactly as the scored pass did.
 #[allow(clippy::too_many_arguments)]
 pub fn learn_last_layer(
     client: &Client,
@@ -644,7 +682,7 @@ pub fn learn_last_layer(
     xd: &T2,
     final_norm: &BT<Bk, 1>,
     head: &dyn Fn(T2) -> T2,
-    targets: &[usize],
+    target: Target<'_>,
     mup: f32,
     eps: f64,
     vocab_eff: usize,
@@ -657,7 +695,17 @@ pub fn learn_last_layer(
     use super::moegroup::{fp4_linear_grouped_bf16_launch, gather_grouped_bf16_from_bf16};
     let t0 = std::time::Instant::now();
     let [n, h] = xd.dims();
-    let scored = targets.len();
+    let scored = match &target {
+        Target::Ids(ids) => ids.len(),
+        Target::Dist { dist, .. } => {
+            let [rows, width] = dist.dims();
+            anyhow::ensure!(
+                width == vocab_eff,
+                "an anchor distribution is [{rows}, {width}] where the head is {vocab_eff} wide"
+            );
+            rows
+        }
+    };
     anyhow::ensure!(scored > 0 && scored <= n, "a learning pass wants scored rows");
     let sconv = keep.sconv.as_ref().expect("the session fills in the last layer's taps");
 
@@ -669,12 +717,25 @@ pub fn learn_last_layer(
         let hi = (lo + slice_rows).min(scored);
         let rows = hi - lo;
         let logits = head(xd.clone().slice([lo..hi, 0..h]));
-        let idx: Vec<i64> = targets[lo..hi].iter().map(|&t| t as i64).collect();
-        let idx: Tensor<Bk, 2, Int> = Tensor::from_data(TensorData::new(idx, [rows, 1]), dev);
-        let minus: T2 = Tensor::zeros([rows, 1], dev).sub_scalar(1.0);
-        let g = burn::tensor::activation::softmax(logits, 1)
-            .scatter(1, idx, minus, burn::tensor::IndexingUpdateOp::Add)
-            .mul_scalar(inv);
+        let g = match &target {
+            Target::Ids(ids) => {
+                let idx: Vec<i64> = ids[lo..hi].iter().map(|&t| t as i64).collect();
+                let idx: Tensor<Bk, 2, Int> =
+                    Tensor::from_data(TensorData::new(idx, [rows, 1]), dev);
+                let minus: T2 = Tensor::zeros([rows, 1], dev).sub_scalar(1.0);
+                burn::tensor::activation::softmax(logits, 1)
+                    .scatter(1, idx, minus, burn::tensor::IndexingUpdateOp::Add)
+                    .mul_scalar(inv)
+            }
+            Target::Dist { dist, weight } => {
+                let p = burn::tensor::activation::softmax(
+                    logits.cast(burn::tensor::DType::F32),
+                    1,
+                );
+                let want: T2 = (*dist).clone().slice([lo..hi, 0..vocab_eff]);
+                (p - want).mul_scalar(*weight * inv)
+            }
+        };
         let g_full: T2 = Tensor::zeros([rows, vocab_pad], dev).slice_assign([0..rows, 0..vocab_eff], g);
         let g_slice = dev_lane::linear_w(g_full, &learner.unembed_t);
         g_hs = g_hs.slice_assign([lo..hi, 0..h], g_slice);
