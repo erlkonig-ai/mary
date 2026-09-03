@@ -51,9 +51,9 @@ use half::f16;
 // default stays wgpu/Metal. burn re-exports the same WgpuRuntime type
 // (burn-wgpu lib.rs:17), so naming cubecl directly drops burn out of this
 // module entirely.
-#[cfg(feature = "cuda-backend")]
+#[cfg(any(feature = "cuda-backend", all(target_os = "linux", feature = "qwen3tts")))]
 pub use cubecl::cuda::CudaRuntime as Rt;
-#[cfg(not(feature = "cuda-backend"))]
+#[cfg(not(any(feature = "cuda-backend", all(target_os = "linux", feature = "qwen3tts"))))]
 pub use cubecl::wgpu::WgpuRuntime as Rt;
 pub type Client = cubecl::client::ComputeClient<Rt>;
 

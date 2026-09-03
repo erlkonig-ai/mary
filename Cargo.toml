@@ -879,6 +879,13 @@ required-features = ["embed", "import"]
 name = "nomic_semantic_probe"
 required-features = ["embed", "import"]
 
+# On Linux the GPU is CUDA. burn's cuda backend and cubecl's cuda runtime join
+# the graph here only, so the Mac build never sees cudarc; `nn::backend::speak`
+# and `nn::q4::Rt` select CUDA under `all(target_os = "linux", feature = "qwen3tts")`.
+[target.'cfg(target_os = "linux")'.dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["wgpu", "metal", "autodiff", "cuda"] }
+cubecl = { version = "0.10.0", default-features = false, features = ["std", "cuda"], optional = true }
+
 [dev-dependencies]
 ciborium = "0.2"
 burn-ndarray = "0.21.0"

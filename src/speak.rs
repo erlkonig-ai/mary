@@ -70,7 +70,7 @@ use crate::models::qwen3tts::predictor::CodePredictor;
 use crate::models::qwen3tts::speaker::{SpeakerEncoder, SpeakerMel};
 use crate::models::qwen3tts::talker::Talker;
 use crate::models::qwen3tts::tokenizer::TextTokenizer;
-use crate::nn::backend::{BFused, WgpuDevice};
+use crate::nn::backend::speak::{Device as WgpuDevice, Fused as BFused};
 use crate::nn::npy;
 use crate::nn::weight_loader::WeightLoader;
 use crate::selection::ModelSelector;
@@ -489,9 +489,9 @@ impl Synthesizer {
         // MARY_SPEAK_F32=1 selects the full-precision talker. The CPU code
         // predictor and the f32 codec are unaffected by the switch.
         if std::env::var("MARY_SPEAK_F32").is_ok() {
-            spawn_impl::<crate::nn::backend::B>(weights, ref_wav, ref_text, ref_codes)
+            spawn_impl::<crate::nn::backend::speak::Raw>(weights, ref_wav, ref_text, ref_codes)
         } else {
-            spawn_impl::<crate::nn::backend::BHalf>(weights, ref_wav, ref_text, ref_codes)
+            spawn_impl::<crate::nn::backend::speak::RawHalf>(weights, ref_wav, ref_text, ref_codes)
         }
     }
 
