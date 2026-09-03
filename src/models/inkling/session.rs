@@ -2034,6 +2034,13 @@ impl Session {
             // As with attention, the partial sum must become whole before the
             // stateful short convolution consumes it.
             let y = tp_reduce(y, &mut tp_calls);
+            // The MLP convolution's history BEFORE this pass, for the anchor
+            // (which rebuilds this layer's output on her rows later).
+            #[cfg(feature = "inkling-cuda")]
+            let mlp_hist0 = match self.moe.learn_layer == Some(layer) && cached {
+                true => self.caches[slot].mlp_sconv.clone(),
+                false => None,
+            };
             let out = match (cached, mode, n > 1) {
                 // The target half of the fourth convolution. Keep the entire
                 // window beside the committed history until one prefix count is
@@ -2086,6 +2093,8 @@ impl Session {
                 && keep.layer == layer
             {
                 keep.sconv = Some(mlp_sconv_taps);
+                keep.x_pre = Some(xd.clone());
+                keep.hist0 = mlp_hist0;
             }
             xd = dev_lane_resid::add_resid(xd, out);
 
@@ -2158,7 +2167,10 @@ impl Session {
                     );
                     self.anchor.push(super::learn::AnchorRow {
                         hn: keep.hn,
-                        xd: xd.clone(),
+                        x_pre: keep
+                            .x_pre
+                            .expect("the layer loop fills the learned layer's residual"),
+                        hist0: keep.hist0,
                         dist,
                     });
                     if self.anchor.len() > super::learn::ANCHOR_ROWS {
@@ -2204,81 +2216,6 @@ impl Session {
                         .map_err(|e| anyhow::anyhow!("learning: {e}"))?,
                     None => t.intermediate_size,
                 };
-                // Her rows first: hold what she said since the last scored
-                // pass to the distribution the model gave it then, through the
-                // same experts, before his rows move them. The rows are
-                // re-routed as one batch; the router has not changed.
-                #[cfg(feature = "inkling-cuda")]
-                if let Some(learner) = self.learner.as_mut()
-                    && let Some(weight) = learner.anchor
-                    && let Some(layer) = self.moe.learn_layer
-                    && !self.anchor.is_empty()
-                {
-                    let rows = self.anchor.len();
-                    let cat = |f: &dyn Fn(&super::learn::AnchorRow) -> T2| -> T2 {
-                        burn::tensor::Tensor::cat(self.anchor.iter().map(f).collect::<Vec<_>>(), 0)
-                    };
-                    let hn = cat(&|a| a.hn.clone());
-                    let axd = cat(&|a| a.xd.clone());
-                    let dist = cat(&|a| a.dist.clone());
-                    self.anchor.clear();
-                    let ld = self
-                        .layers
-                        .get(&format!("model.llm.layers.{layer}."))
-                        .expect("the learned layer is resident on this rank");
-                    let r = ld.router.as_ref().expect("a MoE layer has a router");
-                    let (route, dp) = super::assembly::route_only(
-                        &self.client,
-                        &mut self.moe,
-                        layer,
-                        t,
-                        r,
-                        &hn,
-                        rows,
-                    )?;
-                    let tab = self
-                        .moe
-                        .route
-                        .as_ref()
-                        .and_then(|d| d.tabs.get(&layer))
-                        .and_then(|tb| tb.as_ref())
-                        .expect("the learned layer has a device expert table");
-                    let keep = super::learn::LearnKeep {
-                        layer,
-                        hn,
-                        dp,
-                        sconv: Some(ld.mlp_sconv.clone()),
-                    };
-                    let report = super::learn::learn_last_layer(
-                        &self.client,
-                        &self.dev,
-                        learner,
-                        keep,
-                        &route,
-                        tab,
-                        self.src.experts_swizzled(),
-                        &axd,
-                        final_norm,
-                        &head,
-                        super::learn::Target::Dist {
-                            dist: &dist,
-                            weight,
-                        },
-                        mup,
-                        eps,
-                        vocab,
-                        t.vocab_size,
-                        t.n_routed_experts,
-                        learn_inter,
-                        SCORE_ROWS,
-                    )?;
-                    if learn_trace() {
-                        println!(
-                            "  anchor: layer {} held {} of her rows over {} slots at weight {weight}, enqueued in {:.3}s",
-                            report.layer, report.rows, report.slots, report.secs
-                        );
-                    }
-                }
                 // Learn from what was just scored, while this pass's residual
                 // top and the last layer's expert input and plan are live. The
                 // kernels are enqueued behind the scoring and run in stream
@@ -2317,6 +2254,99 @@ impl Session {
                     if learn_trace() {
                         println!(
                             "  learn: layer {} from {} scored rows over {} slots, enqueued in {:.3}s",
+                            report.layer, report.rows, report.slots, report.secs
+                        );
+                    }
+                }
+                // Her rows, AFTER his have moved the experts: rebuild the last
+                // layer's output on the rows she generated since the last
+                // scored pass -- its MoE under the moved experts, the residual,
+                // the convolution with the history it had -- take the head,
+                // and hold that softmax to the one recorded when she said them.
+                // The MoE pass is the forward's own and is a collective, so
+                // every rank makes it on the same rows.
+                #[cfg(feature = "inkling-cuda")]
+                if let Some(learner) = self.learner.as_mut()
+                    && let Some(weight) = learner.anchor
+                    && let Some(layer) = self.moe.learn_layer
+                    && !self.anchor.is_empty()
+                {
+                    let rows = self.anchor.len();
+                    let cat = |f: &dyn Fn(&super::learn::AnchorRow) -> T2| -> T2 {
+                        burn::tensor::Tensor::cat(self.anchor.iter().map(f).collect::<Vec<_>>(), 0)
+                    };
+                    let hn = cat(&|a| a.hn.clone());
+                    let x_pre = cat(&|a| a.x_pre.clone());
+                    let dist = cat(&|a| a.dist.clone());
+                    let hist0 = self.anchor[0].hist0.clone();
+                    self.anchor.clear();
+                    let p = format!("model.llm.layers.{layer}.");
+                    let ld = self
+                        .layers
+                        .get(&p)
+                        .expect("the learned layer is resident on this rank");
+                    let r = ld.router.as_ref().expect("a MoE layer has a router");
+                    let y = moe_layer(
+                        &self.src,
+                        &self.client,
+                        self.aliases.as_ref(),
+                        &mut self.dense,
+                        &mut self.moe,
+                        &self.dev,
+                        &p,
+                        layer,
+                        t,
+                        r,
+                        hn,
+                        rows,
+                        self.shared_halved,
+                        tp,
+                    )?;
+                    let mut extra_calls = 0usize;
+                    let y = tp_reduce(y, &mut extra_calls);
+                    let out = match hist0 {
+                        Some(h0) => dev_lane::short_conv_steps(h0, y, ld.mlp_sconv.clone()).0,
+                        None => dev_lane::short_conv(y, ld.mlp_sconv.clone()),
+                    };
+                    let xd_now = dev_lane_resid::add_resid(x_pre, out);
+                    let mut keep = self
+                        .moe
+                        .learn
+                        .take()
+                        .expect("the MoE pass kept the learned layer's forward");
+                    keep.sconv = Some(ld.mlp_sconv.clone());
+                    let route = self.moe.route.as_ref().expect("a routed layer ran");
+                    let tab = route
+                        .tabs
+                        .get(&layer)
+                        .and_then(|tab| tab.as_ref())
+                        .expect("the learned layer has a device expert table");
+                    let report = super::learn::learn_last_layer(
+                        &self.client,
+                        &self.dev,
+                        learner,
+                        keep,
+                        route,
+                        tab,
+                        self.src.experts_swizzled(),
+                        &xd_now,
+                        final_norm,
+                        &head,
+                        super::learn::Target::Dist {
+                            dist: &dist,
+                            weight,
+                        },
+                        mup,
+                        eps,
+                        vocab,
+                        t.vocab_size,
+                        t.n_routed_experts,
+                        learn_inter,
+                        SCORE_ROWS,
+                    )?;
+                    if learn_trace() {
+                        println!(
+                            "  anchor: layer {} held {} of her rows over {} slots at weight {weight}, enqueued in {:.3}s",
                             report.layer, report.rows, report.slots, report.secs
                         );
                     }

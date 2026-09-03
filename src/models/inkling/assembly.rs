@@ -2849,81 +2849,13 @@ pub fn moe_layer(
             hn: hn.clone(),
             dp,
             sconv: None,
+            x_pre: None,
+            hist0: None,
         });
     }
     let sh = shared_experts_dev(hn, sw, g, k, ns, layer);
 
     Ok(acc + sh)
-}
-
-/// Route `hn` `[n, h]` through `layer`'s router exactly as [`moe_layer`]
-/// does -- projection, device top-k, device row plan -- and return the plan
-/// with a route of that width, WITHOUT running the experts.
-///
-/// For the anchor of [`super::learn`]: rows she generated one decode step at a
-/// time are re-routed as one batch when they are learned from, instead of
-/// keeping each step's plan. The router and its bias have not changed, so the
-/// picks are the ones the steps made. Needs the layer to have run once on this
-/// session (its expert table and bias are then on the device).
-#[allow(clippy::too_many_arguments)]
-pub fn route_only(
-    client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
-    st: &mut MoeState,
-    layer: usize,
-    t: &crate::models::inkling::config::InklingTextConfig,
-    r: &RouterDev,
-    hn: &T2,
-    n: usize,
-) -> Result<(DevRoute, crate::models::inkling::devplan::DevRowPlan)> {
-    let rows = t.n_routed_experts + t.n_shared_experts;
-    let k = t.num_experts_per_tok;
-    let ns = t.n_shared_experts;
-    let (lg, cols) = match &r.proj {
-        RouterProj::PerCall(w) => (
-            dev_lane::linear(dev_lane_resid::from_resid(hn.clone()), w.clone()),
-            rows,
-        ),
-        RouterProj::Pre(wt) => (
-            dev_lane::linear_pre_t(dev_lane_resid::from_resid(hn.clone()), wt.clone()),
-            rows,
-        ),
-        RouterProj::Bf16 { w, .. } => (dev_lane::linear_bf16(hn.clone(), w), w.n),
-    };
-    let tb = st
-        .route
-        .as_ref()
-        .and_then(|dr| dr.tabs.get(&layer))
-        .and_then(|tb| tb.as_ref())
-        .context("route_only: the layer's device expert table is not built yet")?;
-    let bias_h = st
-        .bias
-        .get(&layer)
-        .context("route_only: the layer's router bias is not on the device yet")?
-        .clone();
-    let topk_width = 2 * k + ns + 1;
-    let topk_h = crate::models::inkling::routetopk::router_topk_launch(
-        client,
-        &crate::models::inkling::seam::handle_of(lg),
-        &bias_h,
-        n,
-        cols,
-        t.n_routed_experts,
-        ns,
-        k,
-        t.route_scale as f32 * r.global_scale,
-    );
-    let route = devroute_new(client, k, n);
-    let dp = crate::models::inkling::devplan::plan_from_topk_launch(
-        client,
-        &topk_h,
-        tb,
-        &route.fault,
-        route.kmax,
-        crate::models::inkling::fp4gemm::MTILE,
-        topk_width,
-        n,
-    );
-    Ok((route, dp))
 }
 
 /// Every routed expert for one layer, on the NATIVE NVFP4 tensor-core path.

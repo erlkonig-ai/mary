@@ -520,16 +520,27 @@ pub struct LearnKeep {
     /// The MLP short convolution's taps, `[h, kernel]`, filled in by the
     /// session (the layer's device state is not `moe_layer`'s to keep).
     pub sconv: Option<T2>,
+    /// The residual entering the MLP block, `[n, h]`, and the MLP
+    /// convolution's history before this pass, `[kernel - 1, h]`; filled in
+    /// by the session for the anchor, which has to rebuild the layer's OUTPUT
+    /// on her rows under experts that have moved since.
+    pub x_pre: Option<T2>,
+    pub hist0: Option<T2>,
 }
 
-/// One row she generated, kept for the anchor: the last layer's expert input
-/// for that row, the residual top, and the next-token distribution the model
-/// gave it WHEN SHE SAID IT. At the next scored pass the same rows are run
-/// through the (by then updated) experts and held to that distribution --
-/// the KL trust region of S5 -- before his rows move the experts again.
+/// One row she generated, kept for the anchor: what the last layer's MLP
+/// block saw for that row (its normed input, the residual it adds to, the
+/// convolution history before it) and the next-token distribution the model
+/// gave the row WHEN SHE SAID IT. After his rows have moved the experts, the
+/// same rows are run through the block again under the moved experts and the
+/// head, and that softmax is held to the recorded one -- the KL trust region
+/// of S5, one turn behind. Evaluating the rows BEFORE the move, against the
+/// state that recorded them, is a gradient of exactly zero; that was the first
+/// form, and it moved nothing.
 pub struct AnchorRow {
     pub hn: T2,
-    pub xd: T2,
+    pub x_pre: T2,
+    pub hist0: Option<T2>,
     /// `[1, vocab_eff]` f32 softmax.
     pub dist: T2,
 }
@@ -581,6 +592,17 @@ impl Learner {
         (w > 0.0).then_some(w)
     }
 
+    /// `INK_LEARN_SEED=<u32>`: where the coin's step counter starts. Two runs
+    /// that differ only here are the control for anything that claims to
+    /// change a trajectory: on 2026-09-03 one seed drifted her voice at turn
+    /// 26 and another never did, at the same score.
+    pub fn seed_from_env() -> u32 {
+        std::env::var("INK_LEARN_SEED")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    }
+
     /// Bind the transposed head from the stored BF16 unembedding
     /// `[vocab_pad, h]`: transposed on the device, quantised on the device.
     pub fn bind(client: &Client, unembed_bf16: &[u8], vocab_pad: usize, h: usize, lr: f32, stochastic: bool) -> Self {
@@ -613,7 +635,7 @@ impl Learner {
             stochastic,
             anchor: None,
             unembed_t: w4a16_bind(client, packed, true),
-            steps: 0,
+            steps: Self::seed_from_env(),
         }
     }
 }
