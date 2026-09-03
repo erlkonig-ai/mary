@@ -380,13 +380,13 @@ fn micro() {
 
     // warm compile all three kernels
     unsafe {
-        touch_kernel::launch_unchecked::<burn::backend::wgpu::WgpuRuntime>(
+        touch_kernel::launch_unchecked::<megakernel::Rt>(
             &client,
             CubeCount::new_single(),
             CubeDim::new_1d(32),
             ArrayArg::from_raw_parts(touch.clone(), 1),
         );
-        chain_matvec_kernel::launch_unchecked::<burn::backend::wgpu::WgpuRuntime>(
+        chain_matvec_kernel::launch_unchecked::<megakernel::Rt>(
             &client,
             CubeCount::new_1d(n / 128),
             CubeDim::new_1d(128),
@@ -396,7 +396,7 @@ fn micro() {
             n,
             n,
         );
-        persistent_chain_kernel::launch_unchecked::<burn::backend::wgpu::WgpuRuntime>(
+        persistent_chain_kernel::launch_unchecked::<megakernel::Rt>(
             &client,
             CubeCount::new_single(),
             CubeDim::new_1d(256),
@@ -414,7 +414,7 @@ fn micro() {
     let t0 = Instant::now();
     for _ in 0..reps {
         unsafe {
-            touch_kernel::launch_unchecked::<burn::backend::wgpu::WgpuRuntime>(
+            touch_kernel::launch_unchecked::<megakernel::Rt>(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_1d(32),
@@ -431,7 +431,7 @@ fn micro() {
     let t0 = Instant::now();
     for _ in 0..reps_rt {
         unsafe {
-            touch_kernel::launch_unchecked::<burn::backend::wgpu::WgpuRuntime>(
+            touch_kernel::launch_unchecked::<megakernel::Rt>(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_1d(32),
@@ -451,7 +451,7 @@ fn micro() {
     for s in 0..k_steps {
         let (src, dst) = if s % 2 == 0 { (0, n) } else { (n, 0) };
         unsafe {
-            chain_matvec_kernel::launch_unchecked::<burn::backend::wgpu::WgpuRuntime>(
+            chain_matvec_kernel::launch_unchecked::<megakernel::Rt>(
                 &client,
                 CubeCount::new_1d(n / 128),
                 CubeDim::new_1d(128),
@@ -469,7 +469,7 @@ fn micro() {
     for dim in [128u32, 256, 512, 1024] {
         let t0 = Instant::now();
         unsafe {
-            persistent_chain_kernel::launch_unchecked::<burn::backend::wgpu::WgpuRuntime>(
+            persistent_chain_kernel::launch_unchecked::<megakernel::Rt>(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_1d(dim),
