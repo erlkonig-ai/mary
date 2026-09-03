@@ -20,6 +20,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
+use triblespace::core::clock::epoch_now;
 use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
@@ -211,7 +212,7 @@ pub(crate) fn collection_or_create(
             .map_err(|error| anyhow!("register '{name}' collection: {error}")),
         [collection] => {
             let admitted = collection
-                .writer_is_admitted(&snapshot, signer)
+                .writer_is_admitted_at(&snapshot, signer, epoch_now())
                 .with_context(|| format!("check WRITE policy for '{name}'"))?;
             if !admitted {
                 bail!(
@@ -322,7 +323,7 @@ pub fn local_model_support(
     collection: ModelCollection,
 ) -> anyhow::Result<Support> {
     collection
-        .admitted(store)
+        .admitted_at(store, epoch_now())
         .context("admit local model collection support")
 }
 
@@ -417,7 +418,7 @@ pub fn snapshot_model_bundle_collection_local_latest_with_admission(
     let store = pile.snapshot().context("freeze model bundle observation")?;
     let collection = sole_named_collection_in(&store, mary_model_bundle_name())?;
     let (support, commits) = collection
-        .admitted_with_commits(&store)
+        .admitted_with_commits_at(&store, epoch_now())
         .context("admit model bundle commits")?;
     let snapshot = snapshot_model_bundle_collection_exact(&store, &support)?;
     Ok((snapshot, commits))

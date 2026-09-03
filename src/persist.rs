@@ -29,6 +29,8 @@ use ed25519_dalek::SigningKey;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(any(feature = "import", feature = "qwen3tts", feature = "tokenizer"))]
+use triblespace::core::clock::epoch_now;
 #[cfg(feature = "import")]
 use triblespace::core::collection::CollectionCommit;
 use triblespace::core::repo::SnapshotSource;
@@ -2232,7 +2234,7 @@ mod tokenizer_collection_tests {
         assert_eq!(collections.len(), 1);
         assert!(
             collections[0]
-                .writer_is_admitted(&store, signing_key.verifying_key())
+                .writer_is_admitted_at(&store, signing_key.verifying_key(), epoch_now())
                 .unwrap(),
             "the first append must found a collection writable by the durable caller key"
         );
