@@ -962,7 +962,11 @@ impl Session {
         let mut moe = MoeState::default();
         #[cfg(feature = "inkling-cuda")]
         {
-            moe.learn_layer = (learner.is_some() && !partial).then(|| hi - 1);
+            // `INK_LEARN_PARTIAL=1` arms it on a partial stack too, for the
+            // mechanics only: the head then unembeds a hidden state the stack
+            // did not finish, so the loss is diagnostic and so is the step.
+            let partial_ok = std::env::var("INK_LEARN_PARTIAL").map(|v| v == "1").unwrap_or(false);
+            moe.learn_layer = (learner.is_some() && (!partial || partial_ok)).then(|| hi - 1);
         }
         #[cfg(not(feature = "inkling-cuda"))]
         let _ = &learner;

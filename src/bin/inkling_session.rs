@@ -33,13 +33,19 @@
 //! that its scores are one per id after the first, finite, and chunk-blind.
 //! See [`score_gate`].
 //!
+//! `--learn` runs the online-learning path end to end with `INK_LEARN_LR` set:
+//! score the prompt, let the learner take its step from that pass, reset,
+//! score the same prompt again. The one claim: the loss on the text it just
+//! learned from went down. Nothing is compared against a second
+//! implementation. See [`learn_gate`].
+//!
 //! `--carry` runs the claim a SERVED conversation depends on and that nothing
 //! else here checks: that everything a turn said is in the cache when the next
 //! turn starts. See [`carry_gate`], which exists because it was not.
 //!
 //! ```text
 //! INK_LAYERS=0:4 inkling_session <pile> <ids.bin> [--gen N] [--turns T] \
-//!                                [--rewind] [--batched] [--carry] [--score]
+//!                                [--rewind] [--batched] [--carry] [--score] [--learn]
 //! ```
 
 use anyhow::{Context, Result};
@@ -59,6 +65,7 @@ fn main() -> Result<()> {
     let mut batched = false;
     let mut carry = false;
     let mut score = false;
+    let mut learn = false;
     let rest: Vec<String> = args.collect();
     let mut i = 0;
     while i < rest.len() {
@@ -85,6 +92,10 @@ fn main() -> Result<()> {
             }
             "--score" => {
                 score = true;
+                i += 1;
+            }
+            "--learn" => {
+                learn = true;
                 i += 1;
             }
             other => anyhow::bail!("unknown argument {other:?}"),
@@ -121,6 +132,9 @@ fn main() -> Result<()> {
     }
     if score {
         return score_gate(&mut session, &prompt, want);
+    }
+    if learn {
+        return learn_gate(&mut session, &prompt, want);
     }
 
     for turn in 0..turns {
@@ -852,6 +866,54 @@ fn score_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<(
     println!("  prompt nll: {:?}", nll_p.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>());
     println!("  delta  nll: {:?}", nll_d.iter().map(|x| (x * 100.0).round() / 100.0).collect::<Vec<_>>());
     println!("SCORE GATE OK: scored passes commit what plain passes commit, and every appended id after the first is scored");
+    Ok(())
+}
+
+/// The online-learning path, end to end, judged by the only score there is.
+///
+/// `INK_LEARN_LR` must be set (the session refuses otherwise, since there
+/// would be nothing to run). Each round scores the prompt with a scored
+/// prefill, which also runs the learner on that pass; the session is reset
+/// between rounds so every round sees the same text under the weights the
+/// previous rounds left. The claim is that the mean negative log-likelihood
+/// of the prompt falls from the first round to the last. On a partial stack
+/// the number is diagnostic, and the harness says so.
+fn learn_gate(session: &mut Session, prompt: &[usize], rounds: usize) -> Result<()> {
+    anyhow::ensure!(prompt.len() >= 4, "the learn gate wants at least four prompt ids");
+    anyhow::ensure!(
+        std::env::var("INK_LEARN_LR").ok().and_then(|v| v.parse::<f32>().ok()).unwrap_or(0.0) > 0.0,
+        "the learn gate needs INK_LEARN_LR > 0; nothing would learn otherwise"
+    );
+    let rounds = rounds.max(2);
+    let mean = |v: &[f32]| v.iter().map(|&x| x as f64).sum::<f64>() / v.len().max(1) as f64;
+    let mut means = Vec::with_capacity(rounds);
+    for round in 0..rounds {
+        if round > 0 {
+            session.reset();
+        }
+        let t = std::time::Instant::now();
+        let (_tok, nll) = session.prefill_scored(prompt)?;
+        anyhow::ensure!(nll.iter().all(|x| x.is_finite()), "round {round}: a score is not finite");
+        let m = mean(&nll);
+        println!(
+            "LEARN round {round}: {} ids scored, mean {m:.4} nats/token ({:.2}s incl. the step)",
+            nll.len(),
+            t.elapsed().as_secs_f64()
+        );
+        means.push(m);
+    }
+    let layers = session.layer_range();
+    let full = layers.start == 0 && layers.end == 42;
+    let (first, last) = (means[0], means[rounds - 1]);
+    println!(
+        "LEARN {first:.4} -> {last:.4} nats/token over {rounds} rounds on the same prompt{}",
+        if full { "" } else { " [PARTIAL STACK: diagnostic, not the model's]" }
+    );
+    anyhow::ensure!(
+        last < first,
+        "the loss on the text it learned from did not fall ({first:.4} -> {last:.4})"
+    );
+    println!("LEARN GATE OK: the loss on the learned text fell");
     Ok(())
 }
 

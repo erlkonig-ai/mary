@@ -117,7 +117,8 @@ fn hash_unit(x: u32) -> f32 {
 /// `stochastic` off it is unused and the nearest code wins.
 ///
 /// Grid magnitudes by code: `0 .5 1 1.5 2 3 4 6`. Beyond 6 the value clips
-/// to 6 — the one biased region, which the host reference clips the same way.
+/// to 6, the one biased region. A code that decodes to `-0.0` re-encodes to
+/// itself.
 #[cube]
 fn e2m1_code(q: f32, u: f32, #[comptime] stochastic: bool) -> u32 {
     let a = min(q.abs(), 6.0f32);
@@ -167,10 +168,10 @@ fn e2m1_code(q: f32, u: f32, #[comptime] stochastic: bool) -> u32 {
             code = lo + 1;
         }
     }
-    if q < 0.0 && code != 0 {
-        code |= 8u32;
-    }
-    code
+    // The sign travels as the sign BIT, so a negative zero (code 0x8, which
+    // the quantiser writes for values that rounded to zero from below) comes
+    // back as itself rather than as +0.
+    code | ((u32::reinterpret(q) >> 31) << 3)
 }
 
 /// E4M3 byte to f32. Subnormal: `2^-6 * m/8`; normal: `2^(e-7) * (1 + m/8)`.
@@ -273,16 +274,26 @@ pub fn expert_update<G: Scalar + Cast, X: Scalar + Cast>(
                 }
             }
 
-            let mut out = 0u32;
+            // The step in CODE SPACE: `q = code - lr * grad / s`, so a zero
+            // step is exactly the code it read (no `v * s / s` round trip), and
+            // the block scale enters once, as a reciprocal.
+            let mut out = word;
             if s > 0.0 {
+                out = 0u32;
                 let inv = 1.0f32 / s;
                 #[unroll]
                 for j in 0..8usize {
                     let code = (word >> (4 * j as u32)) & 0xfu32;
-                    let v = e2m1_bits(code) * s;
-                    let q = (v - lr * grad[j]) * inv;
+                    let q = e2m1_bits(code) - lr * grad[j] * inv;
                     let u = hash_unit(u32::cast_from(widx) * 8u32 + u32::cast_from(j) + seed);
-                    out |= e2m1_code(q, u, stochastic) << (4 * j as u32);
+                    let mut c = e2m1_code(q, u, stochastic);
+                    // An exact zero keeps the code's own sign: `-0.0 - (+0.0)`
+                    // is `+0.0`, which would flip a negative-zero code on a
+                    // step that moved nothing.
+                    if q == 0.0 {
+                        c = code & 8u32;
+                    }
+                    out |= c << (4 * j as u32);
                 }
             }
             w[widx] = out;
@@ -316,9 +327,9 @@ pub fn expert_gin<G: Scalar + Cast>(
     if first >= cnt {
         terminate!();
     }
-    let mut n_rows = GIN_ROWS;
-    if first + n_rows > cnt {
-        n_rows = cnt - first;
+    let mut n_rows = cnt - first;
+    if n_rows > GIN_ROWS {
+        n_rows = GIN_ROWS;
     }
     let start = grp_start[e] as usize + first;
     let t = (CUBE_POS_X as usize) * 4 + lane / 8;
@@ -899,7 +910,6 @@ mod tests {
     use crate::models::inkling::fp4gemm::{swizzle_b_codes, swizzle_b_scales};
     use crate::models::inkling::fp4quant::quantize_nvfp4;
     use crate::models::inkling::nvfp4::decode_row;
-    use crate::models::inkling::train_online::nearest_code;
     use cubecl::cuda::CudaRuntime;
 
     fn fill(n: usize, seed: f32) -> Vec<f32> {
@@ -916,6 +926,11 @@ mod tests {
 
     fn floats(b: &[u8]) -> Vec<f32> {
         b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    fn read(client: &Client, h: &Handle) -> Vec<u8> {
+        let bytes = client.read_one(h.clone()).expect("device readback");
+        Vec::from(&bytes[..])
     }
 
     fn bf16_bytes(v: &[f32]) -> Vec<u8> {
@@ -940,8 +955,8 @@ mod tests {
         let w = fill(n * k, seed);
         let wh = client.create_from_slice(bytes(&w));
         let (codes, scales) = quantize_nvfp4(client, &wh, n, k);
-        let codes_rm = client.read_one(codes.binding());
-        let scales_rm = client.read_one(scales.binding());
+        let codes_rm = read(client, &codes);
+        let scales_rm = read(client, &scales);
         let mut arena = swizzle_b_codes(&codes_rm, n, k);
         arena.extend(swizzle_b_scales(&scales_rm, n, k));
         Plane { arena, codes_rm, scales_rm, n, k }
@@ -971,90 +986,54 @@ mod tests {
         (start, cnt, rows)
     }
 
+    /// The update kernel's ADDRESSING, not its arithmetic: the loss on real
+    /// turns is the only judge of the step (wiki e2f92661), but a kernel that
+    /// writes the right step to the wrong nibble would only show there slowly.
+    /// So: a zero step leaves every byte as it was; a real step touches only
+    /// the planes of the expert that had rows, changes its codes somewhere, and
+    /// never touches a scale byte.
     #[test]
-    fn the_update_kernel_takes_the_host_reference_step_to_the_code() {
+    fn the_update_kernel_writes_only_the_codes_of_the_expert_it_was_given() {
         let client = <CudaRuntime as Runtime>::client(&Default::default());
         let (n, k, m_total) = (64, 256, 48);
         let p0 = plane(&client, n, k, 0.3);
         let p1 = plane(&client, n, k, 1.7);
-        // Two experts back to back in one arena; offsets name each plane.
         let mut arena = p0.arena.clone();
         let off = vec![0u64, (n * k / 2) as u64, arena.len() as u64, (arena.len() + n * k / 2) as u64];
         arena.extend(&p1.arena);
         let wmap = client.create_from_slice(&arena);
         let off_h = client.create_from_slice(bytes(&off));
         let sc = client.create_from_slice(bytes(&[1.0f32, 1.0]));
-        let (start, cnt, rows) = groups(&client);
+        // Only expert 1 has rows (stack rows 0 and 32); expert 0 has none.
+        let start = client.create_from_slice(bytes(&[0u32, 0]));
+        let cnt = client.create_from_slice(bytes(&[0u32, 2]));
+        let rows = client.create_from_slice(bytes(&[0u32, 32]));
         let g_out = fill(m_total * n, 2.2);
         let x = bf16_round(&fill(m_total * k, 3.1));
         let g_h = client.create_from_slice(bytes(&g_out));
         let x_h = client.create_from_slice(&bf16_bytes(&x));
-        let lr = 0.05;
         let plane_ref = PlaneRef { wmap: &wmap, wmap_bytes: arena.len(), off: &off_h, scale2: &sc };
-        let grp = Groups { start: &start, cnt: &cnt, rows: &rows, n_routed: 2, max_rows: 3 };
-        expert_update_launch::<f32, half::bf16>(
-            &client, &plane_ref, &grp, &g_h, &x_h, m_total, n, k, lr, 7, false,
-        );
-        let got = client.read_one(wmap.binding());
+        let grp = Groups { start: &start, cnt: &cnt, rows: &rows, n_routed: 2, max_rows: 2 };
 
-        // The host reference: decode, step with the same rows, nearest-round
-        // against the frozen scale, then swizzle to compare bytes.
-        let mut mismatches = 0usize;
-        let mut ties = 0usize;
-        for (e, p) in [&p0, &p1].iter().enumerate() {
-            let rows_e: &[usize] = if e == 0 { &[16] } else { &[0, 32] };
-            let w = decode_rm(p);
-            let cols = k / 2;
-            let spr = k / 16;
-            let mut codes = vec![0u8; n * cols];
-            for o in 0..n {
-                for i in 0..k {
-                    let mut grad = 0f32;
-                    for &r in rows_e {
-                        grad += g_out[r * n + o] * x[r * k + i];
-                    }
-                    let s = crate::models::inkling::nvfp4::e4m3_to_f32(p.scales_rm[o * spr + i / 16]);
-                    let v = w[o * k + i] - lr * grad;
-                    let c = nearest_code(v, s);
-                    // A tie at a midpoint is decided differently by the two
-                    // ladders; count it rather than call it a defect.
-                    if s > 0.0 {
-                        let q = (v / s).abs().min(6.0);
-                        for mid in [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] {
-                            if (q - mid).abs() < 1e-6 {
-                                ties += 1;
-                            }
-                        }
-                    }
-                    if i % 2 == 0 {
-                        codes[o * cols + i / 2] = c;
-                    } else {
-                        codes[o * cols + i / 2] |= c << 4;
-                    }
-                }
-            }
-            let want = swizzle_b_codes(&codes, n, k);
-            let base = off[2 * e] as usize;
-            for (j, (&a, &b)) in got[base..base + n * cols].iter().zip(&want).enumerate() {
-                if a != b {
-                    mismatches += 1;
-                    if mismatches <= 5 {
-                        eprintln!("expert {e} code byte {j}: device {a:#04x} host {b:#04x}");
-                    }
-                }
-            }
-            // The scales are untouched.
-            let sbase = off[2 * e + 1] as usize;
-            assert_eq!(&got[sbase..sbase + n * spr], &swizzle_b_scales(&p.scales_rm, n, k)[..]);
-        }
-        assert!(
-            mismatches <= ties,
-            "{mismatches} code bytes differ from the host step ({ties} midpoint ties)"
+        // A zero step is the identity on every byte, including the coin.
+        expert_update_launch::<f32, half::bf16>(
+            &client, &plane_ref, &grp, &g_h, &x_h, m_total, n, k, 0.0, 7, true,
         );
-        // And the step DID something: a zero-mismatch run against unchanged
-        // codes would pass vacuously.
-        let untouched = got[..n * k / 2] == p0.arena[..n * k / 2];
-        assert!(!untouched, "the update kernel left expert 0's codes unchanged");
+        assert_eq!(read(&client, &wmap), arena, "a zero step changed bytes");
+
+        // A real step: expert 0 untouched entirely, expert 1's scales untouched,
+        // expert 1's codes moved somewhere.
+        expert_update_launch::<f32, half::bf16>(
+            &client, &plane_ref, &grp, &g_h, &x_h, m_total, n, k, 0.5, 7, true,
+        );
+        let got = read(&client, &wmap);
+        let (c0, s0) = (off[0] as usize, off[1] as usize);
+        let (c1, s1) = (off[2] as usize, off[3] as usize);
+        assert_eq!(&got[c0..s0 + n * k / 16], &arena[c0..s0 + n * k / 16], "expert 0 was touched");
+        assert_eq!(&got[s1..s1 + n * k / 16], &arena[s1..s1 + n * k / 16], "expert 1's scales were touched");
+        let changed = got[c1..s1].iter().zip(&arena[c1..s1]).filter(|(a, b)| a != b).count();
+        assert!(changed > 0, "the step left expert 1's codes unchanged");
+        assert!(changed < n * k / 2, "the step rewrote every code byte, which a small step cannot");
     }
 
     #[test]
@@ -1076,7 +1055,7 @@ mod tests {
         let plane_ref = PlaneRef { wmap: &wmap, wmap_bytes: arena.len(), off: &off_h, scale2: &sc };
         let grp = Groups { start: &start, cnt: &cnt, rows: &rows, n_routed: 2, max_rows: 3 };
         expert_gin_launch::<f32>(&client, &plane_ref, &grp, &g_h, &g_in, m_total, n, k);
-        let got = floats(&client.read_one(g_in.binding()));
+        let got = floats(&read(&client, &g_in));
         let (w0, w1) = (decode_rm(&p0), decode_rm(&p1));
         let mut worst = 0f32;
         for r in 0..m_total {
