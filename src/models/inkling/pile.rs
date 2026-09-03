@@ -1070,7 +1070,7 @@ impl PileSource {
             // version exists (`super::learned`); the whole collection when
             // none does, which is the checkpoint as imported.
             Err(_) => {
-                let heads = super::learned::version_heads(&facts);
+                let heads = super::version::version_heads(&facts);
                 match heads.len() {
                     0 => None,
                     1 => {

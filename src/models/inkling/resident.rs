@@ -1400,8 +1400,8 @@ pub trait Model: Send {
     /// moved. A collective on a tensor-parallel pair.
     fn persist_learned(
         &mut self,
-        recipe: &super::learned::VersionRecipe,
-    ) -> Result<Option<super::learned::Persisted>> {
+        recipe: &VersionRecipe,
+    ) -> Result<Option<Persisted>> {
         let _ = recipe;
         Ok(None)
     }
@@ -1416,6 +1416,37 @@ pub trait Model: Send {
     /// Idempotent, because it is called both explicitly and from a `Drop` that
     /// cannot know whether it already ran.
     fn shutdown(&mut self) -> Result<()>;
+}
+
+// ── a learned version, as the turn vocabulary knows it ─────────────────────
+//
+// Backend-free on purpose: the mind asks for a version and records that one
+// was written; assembling it is `version` on the CUDA lane.
+
+/// How a version was learned. Facts on the version root, for analysis later.
+#[derive(Clone, Debug, Default)]
+pub struct VersionRecipe {
+    pub lr: f64,
+    pub anchor: Option<f64>,
+    pub seed: u64,
+    pub steps: u64,
+    pub span: String,
+    pub explanation: String,
+    pub code_revision: String,
+}
+
+/// What a persisted version is, for the record that says it happened.
+#[derive(Clone, Debug)]
+pub struct Persisted {
+    /// The version root, committed -- or equal to `parent` when nothing had
+    /// moved and nothing was written.
+    pub root: triblespace::prelude::Id,
+    pub parent: triblespace::prelude::Id,
+    pub name: String,
+    /// Experts whose bytes moved.
+    pub replaced: usize,
+    /// Whether the parent was minted as the genesis root in the same commit.
+    pub genesis: bool,
 }
 
 // ── the drive seam ──────────────────────────────────────────────────────────

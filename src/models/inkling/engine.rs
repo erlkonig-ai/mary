@@ -891,8 +891,8 @@ impl Model for Engine {
 
     fn persist_learned(
         &mut self,
-        recipe: &super::learned::VersionRecipe,
-    ) -> Result<Option<super::learned::Persisted>> {
+        recipe: &super::resident::VersionRecipe,
+    ) -> Result<Option<super::resident::Persisted>> {
         use triblespace::prelude::*;
         if self.terminated || !self.session.learning() {
             return Ok(None);
@@ -912,8 +912,8 @@ impl Model for Engine {
         store
             .refresh()
             .map_err(|e| anyhow::anyhow!("refresh {}: {e:?}", self.ready.pile))?;
-        let version = super::learned::learned_version(&mut store, &learned, parent, recipe)?;
-        let persisted = super::learned::Persisted {
+        let version = super::version::learned_version(&mut store, &learned, parent, recipe)?;
+        let persisted = super::resident::Persisted {
             root: version.root,
             parent: version.parent,
             name: version.name.clone(),
@@ -921,7 +921,7 @@ impl Model for Engine {
             genesis: version.genesis,
         };
         if version.root != version.parent {
-            super::learned::publish_version(&mut store, &key, version)?;
+            super::version::publish_version(&mut store, &key, version)?;
         }
         store
             .close()

@@ -266,7 +266,7 @@ pub fn context_preflight_fragment(evidence: &ContextPreflighted) -> Fragment {
 /// `epoch`: which root, how many experts moved.
 pub fn persisted_fragment(
     epoch: u64,
-    persisted: &crate::models::inkling::learned::Persisted,
+    persisted: &super::resident::Persisted,
 ) -> Fragment {
     entity! { _ @
         metadata::tag: schema::kind_persisted,

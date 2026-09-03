@@ -243,7 +243,8 @@ fn main() -> Result<()> {
             println!("  {name}: {count} experts, each [{rows}, {logical}]");
         }
         if save != Save::No && !learned.is_empty() {
-            use mary::models::inkling::learned::{VersionRecipe, learned_version, publish_version};
+            use mary::models::inkling::resident::VersionRecipe;
+            use mary::models::inkling::version::{learned_version, publish_version};
             use triblespace::prelude::Pile;
             let t = std::time::Instant::now();
             let mut store = Pile::open(std::path::Path::new(pile))

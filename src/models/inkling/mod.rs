@@ -136,6 +136,7 @@ pub mod vision;
 // is the handle it makes possible: weights, KV and position as ONE value that
 // survives across calls.
 pub mod assembly;
+pub mod version;
 #[cfg(feature = "inkling-cuda")]
 pub mod train;
 #[cfg(feature = "inkling-cuda")]
