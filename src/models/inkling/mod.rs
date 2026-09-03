@@ -136,6 +136,8 @@ pub mod vision;
 // is the handle it makes possible: weights, KV and position as ONE value that
 // survives across calls.
 pub mod assembly;
+#[cfg(feature = "inkling-cuda")]
+pub mod train;
 pub mod session;
 
 // …and the MIND that a held model becomes. `resident` is the vocabulary of an
