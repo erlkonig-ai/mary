@@ -44,6 +44,14 @@
 #    The guard below now also requires BASH_VERSION, so a zsh source is inert
 #    rather than wrong.
 #
+# 6. THE PATTERN INSIDE AN ENVIRONMENT ASSIGNMENT. `pgrep -f cargo` matches a
+#    tmux launcher whose argv carries `env PATH=/home/x/.cargo/bin:...`, so a
+#    box with an agent session open on it read as busy forever (2026-09-03:
+#    the exact-source runner refused sky three times running). -> The pattern
+#    is matched against the BASENAMES of argv words, anchored at the start,
+#    with `NAME=value` words dropped: a workload is a program, and a program
+#    is named by a word of its own, not by a substring of someone's PATH.
+#
 # Exit codes: 0 = BUSY, 1 = idle, 2 = unknown (treat as busy).
 
 set -uo pipefail
@@ -69,11 +77,23 @@ box_busy_local() {
   # -a is not portable (macOS pgrep lacks it), so take PIDs and read argv per PID.
   hits=""
   local pid
-  for pid in $(pgrep -f "$pat" 2>/dev/null); do
+  for pid in $(ps -eo pid= 2>/dev/null); do
     case " $mine " in *" $pid "*) continue ;; esac   # never ourselves
     local cmd
     cmd=$(ps -o command= -p "$pid" 2>/dev/null) || continue
     [ -n "$cmd" ] || continue
+    # Failure 6: match program NAMES, not command-line text. Each argv word
+    # that is not an environment assignment is reduced to its basename and the
+    # pattern must match it from its first character; `python -m sglang.x`
+    # still matches on its module word, `env PATH=...cargo/bin... claude` does
+    # not.
+    local word matched=0
+    for word in $cmd; do
+      case "$word" in *=*) continue ;; esac
+      word=${word##*/}
+      if [[ $word =~ ^($pat)([^A-Za-z0-9_]|$) ]]; then matched=1; break; fi
+    done
+    [ "$matched" = 1 ] || continue
     # A SEARCHER IS NOT A WORKLOAD. Failure 1 says we must not match OURSELVES,
     # and the ancestry filter above does that exactly. It does not cover someone
     # ELSE'S searcher: a process whose whole job is to grep for the pattern
