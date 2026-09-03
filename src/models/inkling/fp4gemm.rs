@@ -1366,8 +1366,70 @@ pub fn swizzle_b_scales_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
     }
 }
 
+/// The inverse of [`swizzle_b_codes_into`]: fragment order back to row-major
+/// `[n, k/2]`. The learner writes the arena in fragment order; a checkpoint
+/// wants the row-major plane the quantiser produced, and this is the only
+/// way the learned codes get back into one.
+pub fn unswizzle_b_codes_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
+    assert_eq!(n % NTILE, 0, "n {n} is not a multiple of {NTILE}");
+    assert_eq!(k % KTILE, 0, "k {k} is not a multiple of {KTILE}");
+    assert_eq!(src.len(), n * k / 2, "codes are not [n, k/2]");
+    assert_eq!(dst.len(), src.len(), "destination is not the source's length");
+    let kt = k / KTILE;
+    let row_w = k / 8;
+    for nt in 0..n / NTILE {
+        for t in 0..kt {
+            let blk = (nt * kt + t) * 256;
+            for c in 0..NTILE {
+                for w in 0..8 {
+                    let d = ((nt * NTILE + c) * row_w + t * 8 + w) * 4;
+                    let s = blk + swz_word(c, w) * 4;
+                    dst[d..d + 4].copy_from_slice(&src[s..s + 4]);
+                }
+            }
+        }
+    }
+}
+
+/// The inverse of [`swizzle_b_scales_into`].
+pub fn unswizzle_b_scales_into(src: &[u8], dst: &mut [u8], n: usize, k: usize) {
+    assert_eq!(n % NTILE, 0);
+    assert_eq!(k % KTILE, 0);
+    assert_eq!(src.len(), n * (k / GROUP), "scales are not [n, k/16]");
+    assert_eq!(dst.len(), src.len(), "destination is not the source's length");
+    let kt = k / KTILE;
+    let spr = k / GROUP;
+    let per = KTILE / GROUP;
+    for nt in 0..n / NTILE {
+        for t in 0..kt {
+            let blk = (nt * kt + t) * NTILE * per;
+            for c in 0..NTILE {
+                let d = (nt * NTILE + c) * spr + t * per;
+                dst[d..d + per].copy_from_slice(&src[blk + c * per..blk + c * per + per]);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod swizzle_tests {
+    /// Swizzle then unswizzle is the identity on both planes, so a learned
+    /// arena plane goes back into a checkpoint as exactly its bytes.
+    #[test]
+    fn unswizzle_inverts_swizzle_on_both_planes() {
+        let (n, k) = (64, 256);
+        let codes: Vec<u8> = (0..n * k / 2).map(|i| (i * 7 + 3) as u8).collect();
+        let scales: Vec<u8> = (0..n * k / 16).map(|i| (i * 13 + 5) as u8).collect();
+        let sw = swizzle_b_codes(&codes, n, k);
+        let mut back = vec![0u8; sw.len()];
+        unswizzle_b_codes_into(&sw, &mut back, n, k);
+        assert_eq!(back, codes);
+        let sw = swizzle_b_scales(&scales, n, k);
+        let mut back = vec![0u8; sw.len()];
+        unswizzle_b_scales_into(&sw, &mut back, n, k);
+        assert_eq!(back, scales);
+    }
+
     use super::*;
 
     /// Every source byte lands somewhere, exactly once.
