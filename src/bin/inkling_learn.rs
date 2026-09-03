@@ -160,6 +160,7 @@ fn main() -> Result<()> {
     );
 
     let mut means = Vec::with_capacity(lines.len());
+    let mut frozen_means = Vec::with_capacity(lines.len());
     for (k, line) in lines.iter().enumerate() {
         // His words, the way the resident meets them: as what the message
         // faculty printed.
@@ -176,8 +177,18 @@ fn main() -> Result<()> {
         })?;
         let mean = end.delta_mean_nll().unwrap_or(f64::NAN);
         means.push(mean);
+        // The control, when a layer is frozen: the checkpoint's experts over
+        // the same rows of the same pass. Its column is the null hypothesis
+        // of every turn.
+        let frozen = match end.delta_mean_nll_frozen() {
+            Some(f) => {
+                frozen_means.push(f);
+                format!("  frozen {f:.4}")
+            }
+            None => String::new(),
+        };
         println!(
-            "turn {k:3} ({:3} scored of {:3} delta): {mean:.4} nats/token  first {:.2}s  turn {:.2}s  said {:?}",
+            "turn {k:3} ({:3} scored of {:3} delta): {mean:.4} nats/token{frozen}  first {:.2}s  turn {:.2}s  said {:?}",
             end.delta_nll.len(),
             end.delta_tokens,
             end.first_token_secs,
@@ -192,6 +203,14 @@ fn main() -> Result<()> {
         "=== {n} turns: mean {all:.4} nats/delta token; turns 1.. {later:.4}; per turn {} ===",
         means.iter().map(|m| format!("{m:.3}")).collect::<Vec<_>>().join(" ")
     );
+    if frozen_means.len() == n {
+        let f_all = frozen_means.iter().sum::<f64>() / n as f64;
+        let wins = means.iter().zip(&frozen_means).filter(|(m, f)| m < f).count();
+        println!(
+            "=== frozen control: mean {f_all:.4} nats/delta token; learned below frozen on {wins}/{n} turns; per turn {} ===",
+            frozen_means.iter().map(|m| format!("{m:.3}")).collect::<Vec<_>>().join(" ")
+        );
+    }
     if export {
         let t = std::time::Instant::now();
         let learned = engine.export_learned()?;

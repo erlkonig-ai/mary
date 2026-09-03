@@ -2690,6 +2690,7 @@ pub fn moe_layer(
     n: usize,
     shared_halved: bool,
     tp: Option<crate::models::inkling::tp::Tp>,
+    frozen: bool,
 ) -> Result<T2> {
     let h = t.hidden_size;
     let global_inter = t.intermediate_size;
@@ -2733,18 +2734,21 @@ pub fn moe_layer(
         st.route = Some(fresh);
     }
     let dr = st.route.get_or_insert_with(|| devroute_new(client, k, n));
-    if !dr.tabs.contains_key(&layer) {
+    if !dr.tabs.contains_key(&(layer, frozen)) {
         let t_s = Instant::now();
         let nvfp4 = cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight"));
+        anyhow::ensure!(!frozen || nvfp4, "{p}: only NVFP4 experts can be frozen");
         let tb = match aliases {
-            Some(al) if nvfp4 => build_expert_table(cp, al, client, p, t.n_routed_experts)?,
+            Some(al) if nvfp4 => {
+                build_expert_table(cp, al, client, p, t.n_routed_experts, frozen)?
+            }
             Some(al) => build_expert_table_bf16(cp, al, client, p, t.n_routed_experts)?,
             None => None,
         };
         st.host.slice += t_s.elapsed().as_secs_f64();
-        dr.tabs.insert(layer, tb);
+        dr.tabs.insert((layer, frozen), tb);
     }
-    let tb = dr.tabs[&layer].as_ref().with_context(|| {
+    let tb = dr.tabs[&(layer, frozen)].as_ref().with_context(|| {
         format!(
             "{p}: the {} routed experts have no single aligned host mapping, so the device \
              expert table cannot be built and this layer would need the host row plan. A \
@@ -2843,7 +2847,7 @@ pub fn moe_layer(
     // A learning pass needs this layer's expert input and its plan after the
     // layer is over; keep them when the session armed this layer.
     #[cfg(feature = "inkling-cuda")]
-    if st.learn_layer == Some(layer) {
+    if st.learn_layer == Some(layer) && !frozen {
         st.learn = Some(super::learn::LearnKeep {
             layer,
             hn: hn.clone(),
@@ -3593,8 +3597,12 @@ pub struct DevRoute {
     /// cannot take (BF16 experts, no registered mapping, a misaligned plane).
     /// The `None` is cached too — a layer that refused once refuses every pass,
     /// and re-deriving that costs 1024 lookups.
-    pub tabs:
-        std::collections::HashMap<usize, Option<crate::models::inkling::devplan::ExpertTable>>,
+    /// Keyed by `(layer, frozen)`: a learned layer has a second table over its
+    /// frozen copy, the control a scored pass runs beside the live experts.
+    pub tabs: std::collections::HashMap<
+        (usize, bool),
+        Option<crate::models::inkling::devplan::ExpertTable>,
+    >,
     /// Expert SLOTS in the plan, which is also the block count: `n * top_k`.
     ///
     /// It was called `k` while it could only be `top_k`, and the rename is the
@@ -3698,6 +3706,7 @@ pub fn build_expert_table(
     client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
     prefix: &str,
     n_routed: usize,
+    frozen: bool,
 ) -> Result<Option<crate::models::inkling::devplan::ExpertTable>> {
     let n13 = format!("{prefix}mlp.experts.w13_weight");
     let n2 = format!("{prefix}mlp.experts.w2_weight");
@@ -3707,9 +3716,15 @@ pub fn build_expert_table(
     let mut sc2: Vec<f32> = Vec::with_capacity(n_routed);
     let mut which: Option<usize> = None;
     let mut expert_bytes = 0usize;
+    // The live arena, or the frozen copy of this layer: same planes, same
+    // order, a different mapping.
+    let packed = |name: &str, e: usize| match frozen {
+        true => src.expert_packed_frozen(name, e),
+        false => src.expert_packed(name, e),
+    };
     for e in 0..n_routed {
-        let w13 = src.expert_packed(&n13, e)?;
-        let w2 = src.expert_packed(&n2, e)?;
+        let w13 = packed(&n13, e)?;
+        let w2 = packed(&n2, e)?;
         let planes: [&[u8]; 4] = [&w13.codes, &w13.scales, &w2.codes, &w2.scales];
         let mut o = [0u64; 4];
         let mut bytes = 0usize;

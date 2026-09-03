@@ -213,6 +213,23 @@ impl Weights {
         self.src.expert_packed_stored(base, e)
     }
 
+    /// One frozen expert's packed planes; see
+    /// [`PileSource::expert_packed_frozen`].
+    pub fn expert_packed_frozen(&self, base: &str, e: usize) -> Result<PackedSlab> {
+        self.src.expert_packed_frozen(base, e)
+    }
+
+    /// The layer prefix whose experts are frozen, if any.
+    pub fn frozen_prefix(&self) -> Option<&str> {
+        self.src.frozen_prefix()
+    }
+
+    /// Freeze one layer's routed experts as the control; see
+    /// [`PileSource::freeze_experts`].
+    pub fn freeze_experts(&mut self, prefix: &str) -> Result<(usize, usize)> {
+        self.src.freeze_experts(prefix)
+    }
+
     /// One expert's packed planes, borrowed, undecoded.
     pub fn expert_packed(&self, base: &str, e: usize) -> Result<PackedSlab> {
         let t0 = Instant::now();

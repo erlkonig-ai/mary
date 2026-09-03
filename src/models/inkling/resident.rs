@@ -954,6 +954,14 @@ pub struct TurnEnd {
     /// per generated token, and never the model's own words.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub delta_nll: Vec<f32>,
+    /// The CONTROL beside [`TurnEnd::delta_nll`]: the same delta tokens scored
+    /// by the checkpoint's experts on the learned layer, over the same rows in
+    /// the same pass, everything else identical. One entry per entry of
+    /// `delta_nll` while a layer is frozen; empty when nothing learns. Same
+    /// framing rule. The difference of the two is what learning did to this
+    /// turn, measured without a second model.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delta_nll_frozen: Vec<f32>,
     /// Tokens of the model's OWN previous turn this pass appended BEFORE the
     /// delta: `0` on turn 0 and `1` on every turn after it.
     ///
@@ -990,6 +998,15 @@ impl TurnEnd {
     pub fn delta_mean_nll(&self) -> Option<f64> {
         (!self.delta_nll.is_empty())
             .then(|| self.delta_nll.iter().map(|&x| x as f64).sum::<f64>() / self.delta_nll.len() as f64)
+    }
+
+    /// Mean of [`TurnEnd::delta_nll_frozen`], the checkpoint's score of the
+    /// same delta, `None` when no layer was frozen.
+    pub fn delta_mean_nll_frozen(&self) -> Option<f64> {
+        (!self.delta_nll_frozen.is_empty()).then(|| {
+            self.delta_nll_frozen.iter().map(|&x| x as f64).sum::<f64>()
+                / self.delta_nll_frozen.len() as f64
+        })
     }
 
     /// One line for a report, carrying its own framing rule.

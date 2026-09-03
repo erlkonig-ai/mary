@@ -975,6 +975,12 @@ pub struct PileSource {
     /// aliasing the pile mapping in place) reports false and every consumer
     /// reads the row-major lane, which is the only lane those bytes support.
     swizzled: bool,
+    /// A second copy of one layer's routed experts, taken from the arena
+    /// before the learner touched it and never written again: the
+    /// checkpoint's experts, in this rank's cut and fragment order, in their
+    /// own aligned allocation. See [`PileSource::freeze_experts`].
+    frozen: Option<anybytes::Bytes>,
+    frozen_experts: std::collections::HashMap<(String, i64), CopiedExpert>,
 }
 
 #[derive(Clone)]
@@ -1271,6 +1277,8 @@ impl PileSource {
             copied: None,
             copied_experts: std::collections::HashMap::new(),
             swizzled: false,
+            frozen: None,
+            frozen_experts: std::collections::HashMap::new(),
         })
     }
 
@@ -1348,6 +1356,91 @@ impl PileSource {
             });
         }
         self.expert_packed_stored(base, e)
+    }
+
+    /// One FROZEN expert's packed planes: the checkpoint's, cut and permuted
+    /// like the live copy, untouched by the learner. Only the layer
+    /// [`PileSource::freeze_experts`] froze answers here.
+    pub fn expert_packed_frozen(&self, base: &str, e: usize) -> Result<PackedSlab> {
+        let c = self
+            .frozen_experts
+            .get(&(base.to_string(), e as i64))
+            .with_context(|| format!("{base}[{e}] is not frozen"))?;
+        anyhow::ensure!(c.nvfp4, "{base}[{e}] is BF16, not packed NVFP4");
+        let elems = c.rows * c.logical;
+        let codes_len = elems / 2;
+        let scales_len = elems / NVFP4_BLOCK;
+        let (_, _, scale2) = split_payload(&c.payload, elems)?;
+        Ok(PackedSlab {
+            codes: c.payload.slice(..codes_len),
+            scales: c.payload.slice(codes_len..codes_len + scales_len),
+            scale2,
+            rows: c.rows,
+            cols: c.logical / 2,
+        })
+    }
+
+    /// Whether a layer's experts were frozen (and which prefix), so a scored
+    /// pass knows it has a control to run.
+    pub fn frozen_prefix(&self) -> Option<&str> {
+        self.frozen_experts
+            .keys()
+            .next()
+            .and_then(|(n, _)| n.rsplit_once("mlp.experts.").map(|(p, _)| p))
+    }
+
+    /// Freeze one layer's routed experts: copy this rank's cut of every expert
+    /// under `prefix` out of the arena, as it is now, into a second aligned
+    /// allocation that the learner never writes. Call it after
+    /// [`PileSource::copy_share`] and before any learning pass; the copy is
+    /// the checkpoint's experts, and it is what the live loss is measured
+    /// against on every scored pass -- the control that costs one expert layer
+    /// over the same rows instead of a second model.
+    ///
+    /// Returns (experts frozen, bytes).
+    pub fn freeze_experts(&mut self, prefix: &str) -> Result<(usize, usize)> {
+        anyhow::ensure!(self.frozen.is_none(), "experts were already frozen");
+        let mut keys: Vec<(String, i64)> = self
+            .copied_experts
+            .keys()
+            .filter(|(n, _)| n.starts_with(prefix))
+            .cloned()
+            .collect();
+        anyhow::ensure!(!keys.is_empty(), "{prefix}: no copied experts to freeze");
+        keys.sort();
+        const VIEW_ALIGN: usize = 16;
+        let mut cursor = 0usize;
+        let mut offsets = Vec::with_capacity(keys.len());
+        for k in &keys {
+            let len = self.copied_experts[k].payload.len();
+            offsets.push((cursor, cursor + len));
+            cursor = (cursor + len).next_multiple_of(VIEW_ALIGN);
+        }
+        let mut buf = vec![0u8; cursor + VIEW_ALIGN];
+        let skew = buf.as_ptr().align_offset(VIEW_ALIGN);
+        for (k, (start, end)) in keys.iter().zip(&offsets) {
+            buf[skew + start..skew + end].copy_from_slice(&self.copied_experts[k].payload);
+        }
+        let bytes = anybytes::Bytes::from_source(buf);
+        let view: anybytes::View<[u8]> = bytes
+            .clone()
+            .view()
+            .map_err(|e| anyhow::anyhow!("viewing the frozen expert allocation: {e}"))?;
+        let bytes = view.bytes();
+        for (k, (start, end)) in keys.iter().zip(&offsets) {
+            let c = &self.copied_experts[k];
+            self.frozen_experts.insert(
+                k.clone(),
+                CopiedExpert {
+                    payload: bytes.slice(skew + start..skew + end),
+                    rows: c.rows,
+                    logical: c.logical,
+                    nvfp4: c.nvfp4,
+                },
+            );
+        }
+        self.frozen = Some(bytes);
+        Ok((keys.len(), cursor))
     }
 
     /// One expert's NVFP4 planes as the PILE stores them, whole and in
@@ -1473,18 +1566,27 @@ impl PileSource {
         )>,
     > {
         if let Some(bytes) = &self.copied {
-            let view: anybytes::View<[u8]> = bytes
-                .clone()
-                .view()
-                .map_err(|e| anyhow::anyhow!("viewing the anonymous weight allocation: {e}"))?;
-            let owner: std::sync::Arc<Vec<u8>> = view
-                .downcast_to_owner()
-                .map_err(|_| anyhow::anyhow!("anonymous weight allocation lost its Vec owner"))?;
-            return Ok(vec![(
-                bytes.as_ptr() as usize,
-                bytes.len(),
-                owner as std::sync::Arc<dyn std::any::Any + Send + Sync>,
-            )]);
+            // The arena, and the frozen experts' allocation beside it when
+            // there is one: each is its own mapping, and an expert table is
+            // built inside exactly one of them.
+            let mut out = Vec::with_capacity(2);
+            for (bytes, what) in std::iter::once((bytes, "anonymous weight"))
+                .chain(self.frozen.iter().map(|b| (b, "frozen expert")))
+            {
+                let view: anybytes::View<[u8]> = bytes
+                    .clone()
+                    .view()
+                    .map_err(|e| anyhow::anyhow!("viewing the {what} allocation: {e}"))?;
+                let owner: std::sync::Arc<Vec<u8>> = view
+                    .downcast_to_owner()
+                    .map_err(|_| anyhow::anyhow!("{what} allocation lost its Vec owner"))?;
+                out.push((
+                    bytes.as_ptr() as usize,
+                    bytes.len(),
+                    owner as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+                ));
+            }
+            return Ok(out);
         }
         let any = self
             .dense

@@ -521,7 +521,7 @@ impl Engine {
     /// everything before it. The wire is unchanged — the peer makes the same
     /// pass unscored, because the head is rank-local and scoring changes no
     /// collective — so a scored rank and a plain one stay in step.
-    fn pass_scored(&mut self, pass: Pass) -> Result<(usize, Vec<f32>)> {
+    fn pass_scored(&mut self, pass: Pass) -> Result<(usize, super::session::ScoredNll)> {
         // The wire names the SCORED pass, so the other rank scores too: under
         // tensor parallelism the learner runs on every rank, each on its own
         // cut of the experts, and a rank that ran the plain pass would keep
@@ -683,10 +683,14 @@ impl Engine {
         // live loss data the online-learning path exists for, and it is what
         // makes a learning change measurable at all: `INK_SCORE=0` turns it
         // off for a run that wants the head's last row only.
-        let (first, delta_nll) = match self.score {
+        let (first, scored) = match self.score {
             true => self.pass_scored(pass)?,
-            false => (self.pass(pass)?, Vec::new()),
+            false => (self.pass(pass)?, super::session::ScoredNll::default()),
         };
+        let super::session::ScoredNll {
+            nll: delta_nll,
+            frozen: delta_nll_frozen,
+        } = scored;
         let first_token_secs = started.elapsed().as_secs_f64();
 
         // ── the incremental detokenizer ─────────────────────────────────────
@@ -739,6 +743,7 @@ impl Engine {
             token_ids: generated,
             delta_tokens: delta_ids.len(),
             delta_nll,
+            delta_nll_frozen,
             carried,
             // The engine generated exactly what it was asked for. Whether the
             // model's response is FINISHED is a structural question about the

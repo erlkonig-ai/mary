@@ -641,8 +641,18 @@ enum PassMode {
 enum PassOutput {
     Committed(usize),
     /// The committed token and the per-row negative log-likelihoods, in nats.
-    Scored { best: usize, nll: Vec<f32> },
+    Scored { best: usize, nll: ScoredNll },
     Target(Vec<usize>),
+}
+
+/// What a scored pass measured: one negative log-likelihood per scored row
+/// under the live weights, and -- while a layer is frozen -- the same rows
+/// under the checkpoint's experts on that layer, everything else identical.
+/// `frozen` is empty when nothing is frozen and otherwise as long as `nll`.
+#[derive(Clone, Debug, Default)]
+pub struct ScoredNll {
+    pub nll: Vec<f32>,
+    pub frozen: Vec<f32>,
 }
 
 /// Rows per head slice on a scored pass. A scored pass needs one prediction per
@@ -901,6 +911,25 @@ impl Session {
         // host mappings falls back to a copying bind, which is slower but not
         // wrong -- `Aliases::disabled()` counts what it copied instead of
         // aliasing it.
+        // The CONTROL: while learning is armed, the learned layer's experts
+        // are copied once more, out of the arena and before any step, into
+        // their own mapping. Every scored pass then runs that layer twice
+        // over the same rows -- live, and the checkpoint's -- so each turn
+        // carries her loss and the frozen model's without a second model or
+        // a second context. Registered with the arena below, so the device
+        // aliases it the same way.
+        #[cfg(feature = "inkling-cuda")]
+        {
+            let partial_ok = std::env::var("INK_LEARN_PARTIAL").map(|v| v == "1").unwrap_or(false);
+            if super::learn::Learner::from_env().is_some() && (!partial || partial_ok) {
+                let layer = hi - 1;
+                let (n, bytes) = src.freeze_experts(&format!("model.llm.layers.{layer}."))?;
+                println!(
+                    "  frozen             : layer {layer}'s {n} routed expert planes copied once ({:.2} GiB), the checkpoint's, as the control of every scored pass",
+                    bytes as f64 / (1u64 << 30) as f64
+                );
+            }
+        }
         let aliases = Some(
             super::fp4gemm::Aliases::register(&client, src.mappings()?)
                 .unwrap_or_else(super::fp4gemm::Aliases::disabled),
@@ -1563,7 +1592,7 @@ impl Session {
     /// nats. The score is prequential — each id is scored by a model that has
     /// not yet seen it — which is what makes it comparable across time and
     /// across learning: it is the only score the online-learning path keeps.
-    pub fn prefill_scored(&mut self, ids: &[usize]) -> Result<(usize, Vec<f32>)> {
+    pub fn prefill_scored(&mut self, ids: &[usize]) -> Result<(usize, ScoredNll)> {
         anyhow::ensure!(
             self.pos == 0,
             "this Session already holds {} positions. Use `extend_scored` to continue the \
@@ -1579,9 +1608,9 @@ impl Session {
     /// under the model that had seen everything before it. A chunk boundary is
     /// no gap in the score: the last row of a chunk is scored against the first
     /// id of the next.
-    pub fn extend_scored(&mut self, ids: &[usize]) -> Result<(usize, Vec<f32>)> {
+    pub fn extend_scored(&mut self, ids: &[usize]) -> Result<(usize, ScoredNll)> {
         if ids.is_empty() {
-            return self.step().map(|t| (t, Vec::new()));
+            return self.step().map(|t| (t, ScoredNll::default()));
         }
         if self.caches.is_empty() {
             return self.chunked_scored(ids, self.prefill_budget);
@@ -1589,18 +1618,19 @@ impl Session {
         self.chunked_scored(ids, self.extend_batch)
     }
 
-    fn chunked_scored(&mut self, ids: &[usize], width: usize) -> Result<(usize, Vec<f32>)> {
+    fn chunked_scored(&mut self, ids: &[usize], width: usize) -> Result<(usize, ScoredNll)> {
         let mut out = 0;
-        let mut nll = Vec::with_capacity(ids.len());
+        let mut nll = ScoredNll::default();
         let mut start = 0;
         for chunk in ids.chunks(width) {
             let next = ids.get(start + chunk.len()).copied();
             let (best, scored) = self.forward_committed(chunk, PassMode::Scored { next })?;
-            nll.extend(scored);
+            nll.nll.extend(scored.nll);
+            nll.frozen.extend(scored.frozen);
             out = best;
             start += chunk.len();
         }
-        debug_assert_eq!(nll.len(), ids.len() - 1, "every id after the first is scored");
+        debug_assert_eq!(nll.nll.len(), ids.len() - 1, "every id after the first is scored");
         Ok((out, nll))
     }
 
@@ -1726,7 +1756,7 @@ impl Session {
 
     /// [`Session::forward`] in either committing mode. `PassMode::Scored` also
     /// returns the per-row score; `PassMode::Commit` returns an empty one.
-    fn forward_committed(&mut self, ids: &[usize], mode: PassMode) -> Result<(usize, Vec<f32>)> {
+    fn forward_committed(&mut self, ids: &[usize], mode: PassMode) -> Result<(usize, ScoredNll)> {
         debug_assert!(mode != PassMode::Target, "a target pass is a transaction, not a commit");
         anyhow::ensure!(!ids.is_empty(), "a pass with no tokens would be vacuous");
         let end = self
@@ -1755,7 +1785,7 @@ impl Session {
         let out = match self.forward_pass(ids, mode) {
             Ok(PassOutput::Committed(best)) => self
                 .validate_cache_completeness()
-                .map(|_| (best, Vec::new())),
+                .map(|_| (best, ScoredNll::default())),
             Ok(PassOutput::Scored { best, nll }) => {
                 self.validate_cache_completeness().map(|_| (best, nll))
             }
@@ -2027,6 +2057,7 @@ impl Session {
                         n,
                         shared_halved,
                         tp,
+                        false,
                     )?
                 }
             };
@@ -2209,6 +2240,74 @@ impl Session {
                     lo = hi;
                 }
                 let best = best.expect("a pass has at least one row");
+                // The CONTROL. The residual stream is the checkpoint's up to
+                // the learned layer, so the frozen model's score of these
+                // same rows is that one layer again over its frozen experts
+                // -- the MoE (a collective, so every rank makes it), the
+                // residual, the convolution with the history it had -- then
+                // the head. Taken here, before this pass learns from its
+                // rows, so both columns are prequential. The kept forward
+                // stays for the learner: this pass reads it and leaves it.
+                #[cfg(feature = "inkling-cuda")]
+                let frozen_nll: Vec<f32> = match (self.moe.learn.as_ref(), self.src.frozen_prefix()) {
+                    (Some(keep), Some(prefix)) if !targets.is_empty() => {
+                        let layer = keep.layer;
+                        let hn = keep.hn.clone();
+                        let x_pre = keep
+                            .x_pre
+                            .clone()
+                            .expect("the layer loop fills the learned layer's residual");
+                        let hist0 = keep.hist0.clone();
+                        let p = prefix.to_string();
+                        let ld = self
+                            .layers
+                            .get(&p)
+                            .expect("the frozen layer is resident on this rank");
+                        let r = ld.router.as_ref().expect("a MoE layer has a router");
+                        let y = moe_layer(
+                            &self.src,
+                            &self.client,
+                            self.aliases.as_ref(),
+                            &mut self.dense,
+                            &mut self.moe,
+                            &self.dev,
+                            &p,
+                            layer,
+                            t,
+                            r,
+                            hn,
+                            n,
+                            self.shared_halved,
+                            tp,
+                            true,
+                        )?;
+                        let mut extra_calls = 0usize;
+                        let y = tp_reduce(y, &mut extra_calls);
+                        let out = match hist0 {
+                            Some(h0) => dev_lane::short_conv_steps(h0, y, ld.mlp_sconv.clone()).0,
+                            None => dev_lane::short_conv(y, ld.mlp_sconv.clone()),
+                        };
+                        let xf = dev_lane_resid::add_resid(x_pre, out);
+                        let mut out = Vec::with_capacity(targets.len());
+                        let mut lo = 0;
+                        while lo < n {
+                            let hi = (lo + SCORE_ROWS).min(n);
+                            let scored = targets.len().min(hi) - lo;
+                            if scored > 0 {
+                                let logits = head(xf.clone().slice([lo..hi, 0..h]));
+                                out.extend(row_nll_dev(
+                                    logits.slice([0..scored, 0..vocab]),
+                                    &targets[lo..lo + scored],
+                                ));
+                            }
+                            lo = hi;
+                        }
+                        out
+                    }
+                    _ => Vec::new(),
+                };
+                #[cfg(not(feature = "inkling-cuda"))]
+                let frozen_nll: Vec<f32> = Vec::new();
                 #[cfg(feature = "inkling-cuda")]
                 let learn_inter = match tp {
                     Some(tp) => tp
@@ -2227,7 +2326,7 @@ impl Session {
                     let route = self.moe.route.as_ref().expect("a routed layer ran");
                     let tab = route
                         .tabs
-                        .get(&keep.layer)
+                        .get(&(keep.layer, false))
                         .and_then(|tab| tab.as_ref())
                         .expect("the learned layer has a device expert table");
                     let inter = learn_inter;
@@ -2301,6 +2400,7 @@ impl Session {
                         rows,
                         self.shared_halved,
                         tp,
+                        false,
                     )?;
                     let mut extra_calls = 0usize;
                     let y = tp_reduce(y, &mut extra_calls);
@@ -2318,7 +2418,7 @@ impl Session {
                     let route = self.moe.route.as_ref().expect("a routed layer ran");
                     let tab = route
                         .tabs
-                        .get(&layer)
+                        .get(&(layer, false))
                         .and_then(|tab| tab.as_ref())
                         .expect("the learned layer has a device expert table");
                     let report = super::learn::learn_last_layer(
@@ -2353,7 +2453,13 @@ impl Session {
                 }
                 self.pos += n;
                 self.last = Some(best);
-                Ok(PassOutput::Scored { best, nll })
+                Ok(PassOutput::Scored {
+                    best,
+                    nll: ScoredNll {
+                        nll,
+                        frozen: frozen_nll,
+                    },
+                })
             }
             PassMode::Target => Ok(PassOutput::Target(argmax_rows_dev(head(xd)))),
         }

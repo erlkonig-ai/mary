@@ -5247,7 +5247,7 @@ fn main() -> Result<()> {
                     }
                     let dr = devroute
                         .get_or_insert_with(|| devroute_new(&fp4_client, t.num_experts_per_tok, n));
-                    if !dr.tabs.contains_key(&layer) {
+                    if !dr.tabs.contains_key(&(layer, false)) {
                         let t_s = Instant::now();
                         // Which table the layer's own bytes ask for. Both lanes
                         // are grouped and both take a plan; only the shape of the
@@ -5256,7 +5256,14 @@ fn main() -> Result<()> {
                         let nvfp4 = cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight"));
                         let tb = match fp4_aliases.as_ref() {
                             Some(al) if nvfp4 => {
-                                build_expert_table(&cp, al, &fp4_client, &p, t.n_routed_experts)?
+                                build_expert_table(
+                                    &cp,
+                                    al,
+                                    &fp4_client,
+                                    &p,
+                                    t.n_routed_experts,
+                                    false,
+                                )?
                             }
                             Some(al) => build_expert_table_bf16(
                                 &cp,
@@ -5275,9 +5282,9 @@ fn main() -> Result<()> {
                                 t.n_routed_experts
                             );
                         }
-                        dr.tabs.insert(layer, tb);
+                        dr.tabs.insert((layer, false), tb);
                     }
-                    dr.tabs[&layer].is_some()
+                    dr.tabs[&(layer, false)].is_some()
                 } else {
                     false
                 };
@@ -5487,7 +5494,7 @@ fn main() -> Result<()> {
                     let dr = devroute
                         .as_ref()
                         .expect("a device plan implies the run state");
-                    let tb = dr.tabs[&layer]
+                    let tb = dr.tabs[&(layer, false)]
                         .as_ref()
                         .expect("a device plan implies a table");
                     Some(mary::models::inkling::devplan::plan_from_topk_launch(
@@ -5550,7 +5557,7 @@ fn main() -> Result<()> {
                         let dr = devroute
                             .as_ref()
                             .expect("a device plan implies the run state");
-                        let tb = dr.tabs[&layer]
+                        let tb = dr.tabs[&(layer, false)]
                             .as_ref()
                             .expect("a device plan implies a table");
                         devplan_verify_layer(
@@ -5580,7 +5587,7 @@ fn main() -> Result<()> {
                     let dr = devroute
                         .as_ref()
                         .expect("a device plan implies the run state");
-                    let tb = dr.tabs[&layer]
+                    let tb = dr.tabs[&(layer, false)]
                         .as_ref()
                         .expect("a device plan implies a table");
                     let a = if tb.scaled {
