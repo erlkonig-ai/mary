@@ -832,7 +832,10 @@ fn score_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<(
 
     // Arm B: the scored pass.
     session.reset();
+    // The scored pass carries the learned and the frozen column; this gate
+    // judges the learned one (the frozen column is the control, checked live).
     let (b1, nll_p) = session.prefill_scored(prompt)?;
+    let nll_p = nll_p.nll;
     anyhow::ensure!(b1 == a0, "the scored prefill committed {b1}, the plain one {a0}");
     anyhow::ensure!(
         nll_p.len() == prompt.len() - 1,
@@ -842,6 +845,7 @@ fn score_gate(session: &mut Session, prompt: &[usize], steps: usize) -> Result<(
     );
     anyhow::ensure!(nll_p.iter().all(|x| x.is_finite()), "a prompt score is not finite: {nll_p:?}");
     let (b2, nll_d) = session.extend_scored(&delta)?;
+    let nll_d = nll_d.nll;
     anyhow::ensure!(b2 == a2, "the scored extend committed {b2}, the plain one {a2}");
     anyhow::ensure!(
         nll_d.len() == delta.len() - 1,
@@ -893,6 +897,7 @@ fn learn_gate(session: &mut Session, prompt: &[usize], rounds: usize) -> Result<
         }
         let t = std::time::Instant::now();
         let (_tok, nll) = session.prefill_scored(prompt)?;
+        let nll = nll.nll;
         anyhow::ensure!(nll.iter().all(|x| x.is_finite()), "round {round}: a score is not finite");
         let m = mean(&nll);
         println!(
