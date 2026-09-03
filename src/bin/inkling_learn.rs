@@ -151,6 +151,8 @@ fn main() -> Result<()> {
         context_budget: Some(16384),
         tensor_parallel,
         sealed: false,
+        // The bench writes a version through its own --save flow, if at all.
+        signing_key: None,
     })?;
     let mut engine = match loaded {
         Loaded::Follower(mut follower) => {

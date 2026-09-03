@@ -101,6 +101,14 @@ pub mod schema {
         /// `delta_scored_tokens`. Present only while a layer is frozen.
         /// Minted 2026-09-03: 64084D7D95B797DC90A24A7FB593CF48.
         "64084D7D95B797DC90A24A7FB593CF48" as pub delta_nll_frozen_nats: F64;
+        /// The version root a `kind_persisted` event wrote into the model
+        /// graph; its parent edge and recipe live on that root.
+        /// Minted 2026-09-03: 78719700B06DB891B3105FF2448172A4.
+        "78719700B06DB891B3105FF2448172A4" as pub persisted_version:
+            triblespace::prelude::inlineencodings::GenId;
+        /// How many experts' bytes had moved since the parent.
+        /// Minted 2026-09-03: 96AEF1B2FBBB856126FD0E4555462D7D.
+        "96AEF1B2FBBB856126FD0E4555462D7D" as pub persisted_experts: U256BE;
         /// Seconds for the complete logical turn, around the Session calls.
         /// Minted 2026-08-28: 379776AE923C962A7DE2A6DBC03DA77F.
         "379776AE923C962A7DE2A6DBC03DA77F" as pub turn_seconds: F64;
@@ -143,6 +151,9 @@ pub mod schema {
     /// Minted 2026-08-28: 393BFF0B7490738059AAE5440B5DBBAB.
     #[allow(non_upper_case_globals)]
     pub const kind_turn_end: Id = triblespace::macros::id_hex!("393BFF0B7490738059AAE5440B5DBBAB");
+    /// A learned version was written back into the model graph
+    /// (`Model::persist_learned`). Minted 2026-09-03.
+    pub const kind_persisted: Id = triblespace::macros::id_hex!("EAC03015B00190308DCE7E58ACE5D800");
 
     /// One exact context-admission preflight.
     /// Minted 2026-08-28: EFEE37F606721308DD306D1A02711294.
@@ -249,6 +260,20 @@ pub fn context_preflight_fragment(evidence: &ContextPreflighted) -> Fragment {
         schema::fits: evidence.fits,
     };
     fragment
+}
+
+/// A learned version written back into the model graph, at the end of
+/// `epoch`: which root, how many experts moved.
+pub fn persisted_fragment(
+    epoch: u64,
+    persisted: &crate::models::inkling::learned::Persisted,
+) -> Fragment {
+    entity! { _ @
+        metadata::tag: schema::kind_persisted,
+        schema::context_epoch: epoch as u128,
+        schema::persisted_version: persisted.root,
+        schema::persisted_experts: persisted.replaced as u128,
+    }
 }
 
 /// Preserve a warm-context replacement only after the model acknowledged it.

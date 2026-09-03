@@ -1203,6 +1203,24 @@ impl Session {
     /// a host read that raced it would carry a mixture of two steps. Off the
     /// token path by construction -- this runs when a caller asks for the
     /// learned model, not per pass.
+    /// Whether a learner is armed on this session.
+    pub fn learning(&self) -> bool {
+        #[cfg(feature = "inkling-cuda")]
+        {
+            self.learner.is_some()
+        }
+        #[cfg(not(feature = "inkling-cuda"))]
+        {
+            false
+        }
+    }
+
+    /// The model root the weights were loaded from, if one was named or
+    /// chosen (see `pile::PileSource::model_root`).
+    pub fn model_root(&self) -> Option<triblespace::prelude::Id> {
+        self.src.model_root()
+    }
+
     pub fn export_learned(&mut self) -> Result<Vec<super::learned::LearnedCut>> {
         #[cfg(feature = "inkling-cuda")]
         {

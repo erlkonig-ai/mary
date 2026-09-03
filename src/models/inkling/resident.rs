@@ -1392,6 +1392,20 @@ pub trait Model: Send {
 
     /// Abandon the model TERMINALLY after a failure, releasing any peer.
     ///
+    /// Write what the learner moved back into the model graph as a VERSION:
+    /// a child of the root this model loaded from, carrying `recipe`, signed
+    /// with the resident's key -- so that a day learned survives a restart.
+    /// Called before a context is replaced and before shutdown. `Ok(None)`
+    /// when this model does not learn, has no key to sign with, or nothing
+    /// moved. A collective on a tensor-parallel pair.
+    fn persist_learned(
+        &mut self,
+        recipe: &super::learned::VersionRecipe,
+    ) -> Result<Option<super::learned::Persisted>> {
+        let _ = recipe;
+        Ok(None)
+    }
+
     /// A tensor rank whose partner has stopped making collectives blocks in
     /// NCCL with no timeout, so this must reach the peer, not merely drop local
     /// state.

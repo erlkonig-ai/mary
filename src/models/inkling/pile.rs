@@ -38,6 +38,7 @@ use triblespace::core::blob::encodings::tensor::{
 };
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::prelude::BlobStoreGet;
+use triblespace::prelude::Id;
 
 use super::load::PackedExpert;
 
@@ -981,6 +982,10 @@ pub struct PileSource {
     /// own aligned allocation. See [`PileSource::freeze_experts`].
     frozen: Option<anybytes::Bytes>,
     frozen_experts: std::collections::HashMap<(String, i64), CopiedExpert>,
+    /// The model root this source resolved: `INK_MODEL_ROOT`, or the version
+    /// graph's head, or `None` for the whole collection. A learned version
+    /// written back is this root's child.
+    model_root: Option<Id>,
 }
 
 #[derive(Clone)]
@@ -1291,7 +1296,13 @@ impl PileSource {
             swizzled: false,
             frozen: None,
             frozen_experts: std::collections::HashMap::new(),
+            model_root: root,
         })
+    }
+
+    /// The model root this source loaded from, if one was named or chosen.
+    pub fn model_root(&self) -> Option<Id> {
+        self.model_root
     }
 
     /// One dense tensor by checkpoint name, as a view.

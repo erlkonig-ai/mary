@@ -99,6 +99,10 @@ pub struct EngineConfig {
     /// Refuse execution-changing environment overrides and announce
     /// `sealed-v1`.
     pub sealed: bool,
+    /// The key that signs a learned version written back into the model
+    /// graph (`Model::persist_learned`). `None`: nothing learned is ever
+    /// written back.
+    pub signing_key: Option<std::path::PathBuf>,
 }
 
 /// The tensor-parallel placement of one rank.
@@ -133,6 +137,8 @@ pub struct Engine {
     /// Set once the run has ended or failed. A terminated engine must not enter
     /// another collective, because its peer is no longer in one.
     terminated: bool,
+    /// The key that signs a learned version written back (`Model::persist_learned`).
+    signing_key: Option<std::path::PathBuf>,
     /// Score every delta as it is attended to (see [`TurnEnd::delta_nll`]).
     /// On by default; `INK_SCORE=0` turns it off.
     score: bool,
@@ -334,6 +340,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
             .map_err(|error| anyhow::anyhow!("load {}: {error}", config.tokenizer.display()))?,
     ));
     Ok(Loaded::Engine(Engine {
+        signing_key: config.signing_key.clone(),
         session,
         codec,
         tokenizer,
@@ -880,6 +887,46 @@ impl Model for Engine {
         // collectives fail.
         self.announce(Pass::Abort)
             .context("release the peer rank after a terminal failure")
+    }
+
+    fn persist_learned(
+        &mut self,
+        recipe: &super::learned::VersionRecipe,
+    ) -> Result<Option<super::learned::Persisted>> {
+        use triblespace::prelude::*;
+        if self.terminated || !self.session.learning() {
+            return Ok(None);
+        }
+        let Some(key_path) = self.signing_key.clone() else {
+            return Ok(None);
+        };
+        let key = triblespace::core::signing_key_file::load_existing(&key_path)
+            .with_context(|| format!("load the signing key {}", key_path.display()))?;
+        let learned = self.export_learned()?;
+        if learned.is_empty() {
+            return Ok(None);
+        }
+        let parent = self.session.model_root();
+        let mut store = Pile::open(std::path::Path::new(&self.ready.pile))
+            .map_err(|e| anyhow::anyhow!("open {} to write a version: {e:?}", self.ready.pile))?;
+        store
+            .refresh()
+            .map_err(|e| anyhow::anyhow!("refresh {}: {e:?}", self.ready.pile))?;
+        let version = super::learned::learned_version(&mut store, &learned, parent, recipe)?;
+        let persisted = super::learned::Persisted {
+            root: version.root,
+            parent: version.parent,
+            name: version.name.clone(),
+            replaced: version.replaced,
+            genesis: version.genesis,
+        };
+        if version.root != version.parent {
+            super::learned::publish_version(&mut store, &key, version)?;
+        }
+        store
+            .close()
+            .map_err(|e| anyhow::anyhow!("close {}: {e:?}", self.ready.pile))?;
+        Ok(Some(persisted))
     }
 
     fn shutdown(&mut self) -> Result<()> {

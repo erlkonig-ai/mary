@@ -224,6 +224,12 @@ impl Weights {
         self.src.frozen_prefix()
     }
 
+    /// The model root this source loaded from, if one was named or chosen;
+    /// a learned version written back is its child.
+    pub fn model_root(&self) -> Option<triblespace::prelude::Id> {
+        self.src.model_root()
+    }
+
     /// Freeze one layer's routed experts as the control; see
     /// [`PileSource::freeze_experts`].
     pub fn freeze_experts(&mut self, prefix: &str) -> Result<(usize, usize)> {

@@ -501,6 +501,20 @@ pub struct VersionRecipe {
     pub code_revision: String,
 }
 
+/// What a persisted version is, for the record that says it happened.
+#[derive(Clone, Debug)]
+pub struct Persisted {
+    /// The version root, committed -- or equal to `parent` when nothing had
+    /// moved and nothing was written.
+    pub root: Id,
+    pub parent: Id,
+    pub name: String,
+    /// Experts whose bytes moved.
+    pub replaced: usize,
+    /// Whether the parent was minted as the genesis root in the same commit.
+    pub genesis: bool,
+}
+
 /// A version assembled from learned experts, before or after it is committed.
 pub struct LearnedVersion {
     /// The version root.
