@@ -1153,3 +1153,10 @@ required-features = ["inkling-cuda"]
 [[bin]]
 name = "inkling_ann_gate"
 required-features = ["inkling-cuda"]
+
+# S1 of the training path (compass 84605490): one decoder layer differentiable
+# under Autodiff<Cuda<f32>>, gated on forward parity and finite-difference
+# gradients against the host f32 reference.
+[[bin]]
+name = "inkling_train_probe"
+required-features = ["inkling-cuda"]
