@@ -31,3 +31,27 @@ pub type BFusedHalf = burn_fusion::Fusion<
 >;
 
 pub type FloatElem = f32;
+
+/// The VOICE's backend family: the talker (raw, f16 by default), the speaker
+/// encoder (raw) and the codec (fusion-wrapped f32), plus their device. On the
+/// Mac these are the Metal aliases above; on Linux they are CUDA, because the
+/// wgpu lane there runs the talker at ~164 ms a frame (2026-09-03, GB10 via
+/// Vulkan: no tensor cores under it) where the Mac's Metal lane runs it at 28
+/// and the same GB10 on CUDA has more to give than either. The rest of mary
+/// keeps `B`/`BHalf`/`WgpuDevice` untouched; only `speak` reads these.
+#[cfg(all(feature = "qwen3tts", target_os = "linux"))]
+pub mod speak {
+    pub use burn::backend::cuda::CudaDevice as Device;
+    pub type Raw = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime, f32, i32, u8>;
+    pub type RawHalf = burn_cubecl::CubeBackend<cubecl::cuda::CudaRuntime, half::f16, i32, u8>;
+    pub type Fused = burn_fusion::Fusion<Raw>;
+    pub type FusedHalf = burn_fusion::Fusion<RawHalf>;
+}
+#[cfg(all(feature = "qwen3tts", not(target_os = "linux")))]
+pub mod speak {
+    pub use super::WgpuDevice as Device;
+    pub type Raw = super::B;
+    pub type RawHalf = super::BHalf;
+    pub type Fused = super::BFused;
+    pub type FusedHalf = super::BFusedHalf;
+}
