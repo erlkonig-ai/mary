@@ -629,6 +629,13 @@ pub enum Pass {
     Prefill(Vec<usize>),
     /// `Session::extend` over these ids: carry, then whatever is new.
     Extend(Vec<usize>),
+    /// `Session::prefill_scored`: the same pass, and every rank also scores
+    /// what it appends — which is what runs the online learner on every rank,
+    /// so a tensor-parallel pair updates both cuts of every expert. The scores
+    /// are rank-local (the head is replicated) and only rank 0 keeps them.
+    PrefillScored(Vec<usize>),
+    /// `Session::extend_scored`; see [`Pass::PrefillScored`].
+    ExtendScored(Vec<usize>),
     /// `Session::step`: one decode, no new rows.
     Step,
     /// `Session::reset`: the sequence is being replaced.
@@ -649,6 +656,8 @@ impl Pass {
     const AGREE: u8 = 0x05;
     const FINISH: u8 = 0x06;
     const ABORT: u8 = 0x07;
+    const PREFILL_SCORED: u8 = 0x08;
+    const EXTEND_SCORED: u8 = 0x09;
 
     /// `[tag u8][count u32be][count x u32be ids]`.
     ///
@@ -661,6 +670,8 @@ impl Pass {
         let (tag, ids): (u8, &[usize]) = match self {
             Pass::Prefill(ids) => (Self::PREFILL, ids.as_slice()),
             Pass::Extend(ids) => (Self::EXTEND, ids.as_slice()),
+            Pass::PrefillScored(ids) => (Self::PREFILL_SCORED, ids.as_slice()),
+            Pass::ExtendScored(ids) => (Self::EXTEND_SCORED, ids.as_slice()),
             Pass::Step => (Self::STEP, NONE),
             Pass::Reset => (Self::RESET, NONE),
             Pass::Agree => (Self::AGREE, NONE),
@@ -690,6 +701,8 @@ impl Pass {
         Ok(match tag {
             Self::PREFILL => Pass::Prefill(ids),
             Self::EXTEND => Pass::Extend(ids),
+            Self::PREFILL_SCORED => Pass::PrefillScored(ids),
+            Self::EXTEND_SCORED => Pass::ExtendScored(ids),
             Self::STEP => {
                 empty(&ids, "Step")?;
                 Pass::Step

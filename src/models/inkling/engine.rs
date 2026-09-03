@@ -413,6 +413,22 @@ impl Follower {
                         .context("extend this rank's sequence")?;
                     self.fold(token);
                 }
+                // Scored passes score here too (the scores are dropped; rank 0
+                // keeps its own), and that is what runs this rank's learner.
+                Pass::PrefillScored(ids) => {
+                    let (token, _nll) = self
+                        .session
+                        .prefill_scored(&ids)
+                        .context("prefill and score this rank's first sequence")?;
+                    self.fold(token);
+                }
+                Pass::ExtendScored(ids) => {
+                    let (token, _nll) = self
+                        .session
+                        .extend_scored(&ids)
+                        .context("extend and score this rank's sequence")?;
+                    self.fold(token);
+                }
                 Pass::Step => {
                     let token = self.session.step().context("advance one token")?;
                     self.fold(token);
@@ -494,7 +510,16 @@ impl Engine {
     /// pass unscored, because the head is rank-local and scoring changes no
     /// collective — so a scored rank and a plain one stay in step.
     fn pass_scored(&mut self, pass: Pass) -> Result<(usize, Vec<f32>)> {
-        self.lead(&pass)?;
+        // The wire names the SCORED pass, so the other rank scores too: under
+        // tensor parallelism the learner runs on every rank, each on its own
+        // cut of the experts, and a rank that ran the plain pass would keep
+        // yesterday's half of the model.
+        let wire = match &pass {
+            Pass::Prefill(ids) => Pass::PrefillScored(ids.clone()),
+            Pass::Extend(ids) => Pass::ExtendScored(ids.clone()),
+            other => anyhow::bail!("{other:?} is not a pass that appends ids to score"),
+        };
+        self.lead(&wire)?;
         let (token, nll) = match &pass {
             Pass::Prefill(ids) => self
                 .session

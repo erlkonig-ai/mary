@@ -463,6 +463,10 @@ required-features = ["inkling-cuda"]
 name = "inkling_session"
 required-features = ["inkling-cuda"]
 
+[[bin]]
+name = "inkling_learn"
+required-features = ["inkling-cuda", "tokenizer"]
+
 # Text on stdin, an ids file out — the missing half of a forward that reads ids
 # and never text. Same `tokenizers` executor as the gate below, which is what
 # makes it one tokenizer rather than a second transcription.
