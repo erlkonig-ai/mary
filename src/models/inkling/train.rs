@@ -62,8 +62,10 @@ pub fn mem_guard(where_: &str) {
 }
 
 // ------------------------------------------------------------------ host + device weights
+#[derive(Clone)]
 pub struct HostDense { pub gate: Vec<f32>, pub up: Vec<f32>, pub down: Vec<f32>, pub global_scale: f32, pub di: usize }
 
+#[derive(Clone)]
 pub struct HostW {
     pub attn_norm: Vec<f32>, pub mlp_norm: Vec<f32>, pub attn_sconv: Vec<f32>, pub mlp_sconv: Vec<f32>,
     pub wq: Vec<f32>, pub wk: Vec<f32>, pub wv: Vec<f32>, pub wr: Vec<f32>, pub wo: Vec<f32>,
@@ -76,6 +78,7 @@ pub struct HostW {
     pub dense: Option<HostDense>,
 }
 
+#[derive(Clone)]
 pub struct Geom {
     pub layer: usize, pub n: usize, pub h: usize, pub mi: usize, pub n_routed: usize, pub n_shared: usize, pub top_k: usize,
     pub route_scale: f32, pub kernel: usize, pub eps: f64, pub dims: AttnDims, pub ls: LogScaling, pub mask: Vec<f32>,
@@ -108,6 +111,22 @@ pub fn c2<B: Backend>(dev: &B::Device, v: Vec<f32>, r: usize, c: usize) -> Tenso
 pub fn ints<B: Backend>(dev: &B::Device, v: Vec<i64>) -> Tensor<B, 1, Int> {
     let n = v.len();
     Tensor::<B, 1, Int>::from_data(TensorData::new(v, [n]), dev)
+}
+
+/// The layer's geometry for a sequence of `n` positions (`rel_extent` comes from the rel_proj tensor shape).
+pub fn geom_for(t: &InklingTextConfig, layer: usize, n: usize, rel_extent: usize) -> Geom {
+    let h = t.hidden_size;
+    let kind = t.attn_kind(layer);
+    let (heads, kv_heads, hd) = t.heads(kind);
+    let kernel = t.sconv_kernel_size;
+    let window = match kind { AttnKind::Local => Some(t.sliding_window_size), AttnKind::Global => None };
+    Geom {
+        layer, n, h, mi: t.intermediate_size, n_routed: t.n_routed_experts, n_shared: t.n_shared_experts, top_k: t.num_experts_per_tok,
+        route_scale: t.route_scale as f32, kernel, eps: t.rms_norm_eps,
+        dims: AttnDims { hidden: h, heads, kv_heads, head_dim: hd, d_rel: t.d_rel, rel_extent, kernel, rms_eps: t.rms_norm_eps, kind },
+        ls: LogScaling { n_floor: t.log_scaling_n_floor as f32, alpha: t.log_scaling_alpha as f32 },
+        mask: causal_mask(n, window), heads, kv_heads, hd, d_rel: t.d_rel, rel_extent, is_dense: t.is_dense(layer),
+    }
 }
 
 /// Everything a layer needs except its routed experts (which depend on routing).
@@ -146,31 +165,38 @@ pub fn load_layer(cp: &Checkpoint, t: &InklingTextConfig, layer: usize, n: usize
         ks: g("attn.k_sconv.weight")?, vs: g("attn.v_sconv.weight")?, rp: rp_loaded.data,
         rw, rb, rg, sgate, sup, sdown, experts: HashMap::new(), dense,
     };
-    let geom = Geom {
-        layer, n, h, mi, n_routed: t.n_routed_experts, n_shared: t.n_shared_experts, top_k: t.num_experts_per_tok,
-        route_scale: t.route_scale as f32, kernel, eps: t.rms_norm_eps,
-        dims: AttnDims { hidden: h, heads, kv_heads, head_dim: hd, d_rel: t.d_rel, rel_extent, kernel, rms_eps: t.rms_norm_eps, kind },
-        ls: LogScaling { n_floor: t.log_scaling_n_floor as f32, alpha: t.log_scaling_alpha as f32 },
-        mask: causal_mask(n, window), heads, kv_heads, hd, d_rel: t.d_rel, rel_extent, is_dense,
-    };
-    Ok((hw, geom))
+    let _ = (kind, heads, kv_heads, hd, kernel, window, is_dense);
+    Ok((hw, geom_for(t, layer, n, rel_extent)))
 }
 
 /// Fetch (dequantised, host f32) exactly the routed experts named by `routing`.
+/// One routed expert, dequantised to host f32 with gate rows first.
+/// The checkpoint INTERLEAVES gate and up rows in w13; the layer wants gate rows first,
+/// then up rows (the 2026-08-08 "Paris" bug, found again here by a near-uniform user-turn loss).
+pub fn load_expert_f32(cp: &Checkpoint, layer: usize, e: usize, mi: usize, h: usize) -> Result<(Vec<f32>, Vec<f32>)> {
+    let pfx = format!("model.llm.layers.{layer}.");
+    let w13 = deinterleave_fused(&cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data, 2 * mi, h);
+    let w2 = cp.expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?.data;
+    anyhow::ensure!(w13.len() == 2 * mi * h && w2.len() == h * mi, "layer {layer} expert {e} shape");
+    Ok((w13, w2))
+}
+
+/// Fetch (dequantised, host f32) exactly the routed experts named by `routing`, in parallel.
 pub fn load_experts(cp: &Checkpoint, g: &Geom, hw: &mut HostW, routing: &[Routing]) -> Result<usize> {
-    let pfx = format!("model.llm.layers.{}.", g.layer);
     let mut touched: Vec<usize> = routing.iter().flat_map(|r| r.experts.clone()).collect();
     touched.sort_unstable(); touched.dedup();
-    for &e in &touched {
-        if hw.experts.contains_key(&e) { continue; }
-        mem_guard(&format!("loading expert {e} of layer {}", g.layer));
-        // The checkpoint INTERLEAVES gate and up rows in w13; the layer wants gate rows first,
-        // then up rows (the 2026-08-08 "Paris" bug, found again here by a near-uniform user-turn loss).
-        let w13 = deinterleave_fused(&cp.expert_slice(&format!("{pfx}mlp.experts.w13_weight"), e)?.data, 2 * g.mi, g.h);
-        let w2 = cp.expert_slice(&format!("{pfx}mlp.experts.w2_weight"), e)?.data;
-        anyhow::ensure!(w13.len() == 2 * g.mi * g.h && w2.len() == g.h * g.mi, "layer {} expert {e} shape", g.layer);
-        hw.experts.insert(e, (w13, w2));
-    }
+    let missing: Vec<usize> = touched.iter().copied().filter(|e| !hw.experts.contains_key(e)).collect();
+    mem_guard(&format!("loading {} experts of layer {}", missing.len(), g.layer));
+    let threads = 8usize.min(missing.len().max(1));
+    let chunks: Vec<&[usize]> = missing.chunks(missing.len().div_ceil(threads).max(1)).collect();
+    let results: Vec<Result<Vec<(usize, (Vec<f32>, Vec<f32>))>>> = std::thread::scope(|sc| {
+        let handles: Vec<_> = chunks.iter().map(|chunk| sc.spawn(move || {
+            chunk.iter().map(|&e| load_expert_f32(cp, g.layer, e, g.mi, g.h).map(|w| (e, w))).collect::<Result<Vec<_>>>()
+        })).collect();
+        handles.into_iter().map(|hd| hd.join().expect("expert loader thread")).collect()
+    });
+    for r in results { for (e, w) in r? { hw.experts.insert(e, w); } }
+    mem_guard(&format!("loaded experts of layer {}", g.layer));
     Ok(touched.len())
 }
 
@@ -331,7 +357,9 @@ pub fn embed_host(hh: &HostHead, ids: &[usize], t: &InklingTextConfig) -> Vec<f3
 
 /// Next-token cross-entropy through the real head, under autodiff. Returns
 /// (mean NLL over the T targets, per-token NLLs, dL/d hidden).
-pub fn head_loss(dev: &Dev, hh: &HostHead, hidden: &[f32], targets: &[usize], n: usize, h: usize, eps: f64) -> (f32, Vec<f32>, Vec<f32>) {
+/// `scored_from`: positions before it are template context (conditioned on, not scored), so the
+/// mean is over the turn's own tokens exactly as the resident would meet them.
+pub fn head_loss(dev: &Dev, hh: &HostHead, hidden: &[f32], targets: &[usize], n: usize, h: usize, eps: f64, scored_from: usize) -> (f32, Vec<f32>, Vec<f32>) {
     let x = c2::<Ad>(dev, hidden.to_vec(), n, h).require_grad();
     let fnorm = Tensor::<Ad, 1>::from_data(TensorData::new(hh.fnorm.clone(), [h]), dev);
     let unembed = c2::<Ad>(dev, hh.unembed[..hh.unpadded * h].to_vec(), hh.unpadded, h);
@@ -341,7 +369,7 @@ pub fn head_loss(dev: &Dev, hh: &HostHead, hidden: &[f32], targets: &[usize], n:
     let tgt = Tensor::<Ad, 2, Int>::from_data(TensorData::new(targets.iter().map(|&v| v as i64).collect::<Vec<_>>(), [n, 1]), dev);
     let picked = logp.gather(1, tgt).reshape([n]); // [n]
     let per_token: Vec<f32> = picked.clone().neg().into_data().to_vec::<f32>().unwrap();
-    let loss = picked.mean().neg();
+    let loss = picked.slice([scored_from..n]).mean().neg();
     let l = loss.clone().into_data().to_vec::<f32>().unwrap()[0];
     let grads = loss.backward();
     let gx = x.grad(&grads).expect("hidden grad").into_data().to_vec::<f32>().unwrap();

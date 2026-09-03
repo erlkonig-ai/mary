@@ -138,6 +138,8 @@ pub mod vision;
 pub mod assembly;
 #[cfg(feature = "inkling-cuda")]
 pub mod train;
+#[cfg(feature = "inkling-cuda")]
+pub mod train_online;
 pub mod session;
 
 // …and the MIND that a held model becomes. `resident` is the vocabulary of an

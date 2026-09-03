@@ -1164,3 +1164,7 @@ required-features = ["inkling-cuda"]
 [[bin]]
 name = "inkling_train_step"
 required-features = ["inkling-cuda", "tokenizer"]
+
+[[bin]]
+name = "inkling_train_online"
+required-features = ["inkling-cuda", "tokenizer"]

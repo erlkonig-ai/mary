@@ -48,12 +48,28 @@ fn main() -> Result<()> {
         let ids: Vec<usize> = enc.get_ids().iter().map(|&u| u as usize).collect();
         if ids.len() >= n + 1 { chosen = Some((i, ids)); break; }
     }
-    let (turn_idx, ids) = chosen.ok_or_else(|| anyhow!("no turn at or after line {turn0} has {} tokens", n + 1))?;
-    let inputs = ids[..n].to_vec();
-    let targets = ids[1..n + 1].to_vec();
+    let (turn_idx, text_ids) = chosen.ok_or_else(|| anyhow!("no turn at or after line {turn0} has {} tokens", n + 1))?;
+    // The turn as the resident meets it: the template's effort line, then the user message
+    // markers, then the text, then the end marker. Only the text and its end marker are scored.
+    let special = |name: &str| -> Result<usize> { tok.token_to_id(name).map(|v| v as usize).ok_or_else(|| anyhow!("tokenizer lacks {name}")) };
+    let (msg_system, msg_user, content_text, end_message) = (special("<|message_system|>")?, special("<|content_text|>")?, special("<|content_text|>")?, special("<|end_message|>")?);
+    let msg_user = special("<|message_user|>")?; let _ = msg_system; let _ = content_text;
+    let effort = tok.encode("Thinking effort level: 0.9", false).map_err(|e| anyhow!("encode: {e}"))?;
+    let mut ids: Vec<usize> = vec![special("<|message_system|>")?, special("<|content_text|>")?];
+    ids.extend(effort.get_ids().iter().map(|&u| u as usize));
+    ids.push(end_message);
+    ids.extend([msg_user, special("<|content_text|>")?]);
+    let scored_from = ids.len() - 1; // the position that predicts the first text token
+    ids.extend_from_slice(&text_ids[..n]);
+    ids.push(end_message);
+    let total = ids.len() - 1; // positions
+    let inputs = ids[..total].to_vec();
+    let targets = ids[1..].to_vec();
+    let n_scored = total - scored_from;
     let h = t.hidden_size;
     let eps = t.rms_norm_eps;
-    println!("=== inkling_train_step: layers {l0}..{l1} of {}, {n} tokens of user turn #{turn_idx} ({} tokens total) ===", t.num_hidden_layers, ids.len());
+    println!("=== inkling_train_step: layers {l0}..{l1} of {}, user turn #{turn_idx}: {n} text tokens (+1 end marker) scored, {scored_from} template positions conditioned on, {total} positions total ===", t.num_hidden_layers);
+    let n = total; // every layer sees all positions
     println!("  MemAvailable at start: {:.1} GiB", mem_available_gib());
 
     let dev = Dev::default();
@@ -106,7 +122,7 @@ fn main() -> Result<()> {
     // ---------------------------------------------------------------- head: the loss that matters
     let t_loss = Instant::now();
     let (loss, per_token, mut g_up) = if full_stack {
-        head_loss(&dev, &hh, &x, &targets, n, h, eps)
+        head_loss(&dev, &hh, &x, &targets, n, h, eps, scored_from)
     } else {
         // partial stack: no meaningful loss; push a unit-scale random gradient so the backward still runs
         println!("  (partial stack: loss is NOT the model's; backward driven by a fixed pseudo-gradient)");
@@ -116,9 +132,13 @@ fn main() -> Result<()> {
     let loss_s = t_loss.elapsed().as_secs_f64();
     if full_stack {
         let ppl = (loss as f64).exp();
-        println!("  LOSS {loss:.4} nats/token over {n} user-turn targets (ppl {ppl:.1}), head fwd+bwd {loss_s:.2}s");
-        let shown: Vec<String> = per_token.iter().take(8).map(|v| format!("{v:.2}")).collect();
-        println!("  per-token nll (first 8): {}", shown.join(" "));
+        println!("  LOSS {loss:.4} nats/token over {n_scored} scored user-turn targets (ppl {ppl:.1}), head fwd+bwd {loss_s:.2}s");
+        let shown: Vec<String> = per_token[scored_from..].iter().take(12).map(|v| format!("{v:.2}")).collect();
+        println!("  per-token nll of the scored tokens (first 12): {}", shown.join(" "));
+        let spelled: Vec<String> = targets[scored_from..].iter().zip(&per_token[scored_from..]).map(|(&id, nll)| format!("{:?}:{nll:.1}", tok.decode(&[id as u32], false).unwrap_or_default())).collect();
+        println!("  tokens with nll: {}", spelled.join(" "));
+        let mut sorted: Vec<f32> = per_token[scored_from..].to_vec(); sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!("  scored nll median {:.2}, p90 {:.2}, max {:.2}", sorted[sorted.len() / 2], sorted[sorted.len() * 9 / 10], sorted[sorted.len() - 1]);
     }
     let gnorm = |v: &[f32]| (v.iter().map(|x| (x * x) as f64).sum::<f64>()).sqrt();
     println!("  |dL/dh_top| = {:.3e}", gnorm(&g_up));
@@ -167,7 +187,7 @@ fn main() -> Result<()> {
         println!("         after release: MemAvailable {:.1} GiB, {pool}", mem_available_gib());
         mem_guard(&format!("after bwd layer {layer}"));
     }
-    println!("=== step done: layers {l0}..{l1}, {n} tokens; loss {loss:.4}; |grad all weights| {:.3e}; |dL/dx_embed| {:.3e}", total_wgrad_sq.sqrt(), gnorm(&g_up));
+    println!("=== step done: layers {l0}..{l1}, {n} positions ({n_scored} scored); loss {loss:.4}; |grad all weights| {:.3e}; |dL/dx_embed| {:.3e}", total_wgrad_sq.sqrt(), gnorm(&g_up));
     println!("    forward  load {fwd_load:.1}s  compute {fwd_compute:.1}s   (load is prototype-only: a resident model holds its weights)");
     println!("    backward load {bwd_load:.1}s  compute {bwd_compute:.1}s   (compute is the extra work a live turn costs; preemptible per layer)");
     println!("    per-layer backward compute mean {:.2}s; lowest MemAvailable seen {min_avail:.1} GiB", bwd_compute / (l1 - l0) as f64);
