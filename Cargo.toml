@@ -804,6 +804,10 @@ name = "qwen3tts_stream"
 required-features = ["qwen3tts"]
 
 [[bin]]
+name = "qwen3tts_refkit"
+required-features = ["qwen3tts"]
+
+[[bin]]
 name = "qwen3tts_megakernel_probe"
 required-features = ["megakernel"]
 
