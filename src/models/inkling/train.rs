@@ -9,7 +9,7 @@
 //! before loading the next.
 use crate::models::inkling::attn::{AttnDims, LogScaling, causal_mask};
 use crate::models::inkling::block::Routing;
-use crate::models::inkling::burn::{linear as b_linear, rms_norm as b_rms_norm, short_conv as b_short_conv, silu as b_silu};
+use crate::models::inkling::burn::{linear as b_linear, linear_pre_t as b_linear_t, rms_norm as b_rms_norm, short_conv as b_short_conv, silu as b_silu};
 use crate::models::inkling::config::{AttnKind, InklingTextConfig};
 pub use crate::models::inkling::config::InklingConfig;
 use crate::models::inkling::load::{Checkpoint, deinterleave_fused, split_gate_up, split_shared_w13};
@@ -91,13 +91,29 @@ pub struct DevW<B: Backend> {
     pub attn_norm: Tensor<B, 1>, pub mlp_norm: Tensor<B, 1>, pub attn_sconv: Tensor<B, 2>, pub mlp_sconv: Tensor<B, 2>,
     pub wq: Tensor<B, 2>, pub wk: Tensor<B, 2>, pub wv: Tensor<B, 2>, pub wr: Tensor<B, 2>, pub wo: Tensor<B, 2>,
     pub qn: Tensor<B, 1>, pub kn: Tensor<B, 1>, pub ks: Tensor<B, 2>, pub vs: Tensor<B, 2>, pub rp: Tensor<B, 2>,
-    pub rw: Tensor<B, 2>, pub sgate: Vec<Tensor<B, 2>>, pub sup: Vec<Tensor<B, 2>>, pub sdown: Vec<Tensor<B, 2>>,
+    pub rw: Tensor<B, 2>,
+    /// shared and routed expert matrices live TRANSPOSED ([in, out]); gradients come out transposed too
+    pub sgate: Vec<Tensor<B, 2>>, pub sup: Vec<Tensor<B, 2>>, pub sdown: Vec<Tensor<B, 2>>,
     pub experts: HashMap<usize, (Tensor<B, 2>, Tensor<B, 2>)>,
     pub dense: Option<DevDense<B>>,
 }
 
 /// Weight leaf. `require_grad` is a no-op on a backend without autodiff, so the same
 /// builders serve the graph-free forward (`Bk`) and the backward (`Ad`).
+/// Row-major [rows, cols] -> [cols, rows] on the host, so a weight can live on the device already
+/// transposed: `x.matmul(w_t)` then reuses ONE tensor per call. With `linear(x, w)` each call's
+/// `w.transpose()` materialises a copy that autodiff keeps for the backward -- at 61 positions x 6
+/// experts x 3 products that was ~1,100 copies of a 33 MB expert per layer (42 GiB, 6 s).
+pub fn transpose_host(v: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    assert_eq!(v.len(), rows * cols);
+    let mut out = vec![0f32; v.len()];
+    for r in 0..rows { for c in 0..cols { out[c * rows + r] = v[r * cols + c]; } }
+    out
+}
+/// Weight leaf already transposed to [in, out] (see `transpose_host`).
+pub fn t2t<B: Backend>(dev: &B::Device, v: &[f32], rows: usize, cols: usize) -> Tensor<B, 2> {
+    Tensor::<B, 2>::from_data(TensorData::new(transpose_host(v, rows, cols), [cols, rows]), dev).require_grad()
+}
 pub fn t2<B: Backend>(dev: &B::Device, v: &[f32], r: usize, c: usize) -> Tensor<B, 2> {
     assert_eq!(v.len(), r * c, "t2: {} != {r}x{c}", v.len());
     Tensor::<B, 2>::from_data(TensorData::new(v.to_vec(), [r, c]), dev).require_grad()
@@ -205,7 +221,7 @@ pub fn bind_experts<B: Backend>(dev: &B::Device, dw: &mut DevW<B>, hw: &HostW, g
     for (&e, (w13, w2)) in &hw.experts {
         if !dw.experts.contains_key(&e) {
             mem_guard(&format!("binding expert {e} of layer {}", g.layer));
-            dw.experts.insert(e, (t2(dev, w13, 2 * g.mi, g.h), t2(dev, w2, g.h, g.mi)));
+            dw.experts.insert(e, (t2t(dev, w13, 2 * g.mi, g.h), t2t(dev, w2, g.h, g.mi)));
         }
     }
 }
@@ -213,7 +229,7 @@ pub fn bind_experts<B: Backend>(dev: &B::Device, dw: &mut DevW<B>, hw: &HostW, g
 pub fn build_dev<B: Backend>(dev: &B::Device, hw: &HostW, g: &Geom) -> DevW<B> {
     let (h, mi, heads, kvh, hd, kernel) = (g.h, g.mi, g.heads, g.kv_heads, g.hd, g.kernel);
     let mut experts = HashMap::new();
-    for (&e, (w13, w2)) in &hw.experts { experts.insert(e, (t2(dev, w13, 2 * mi, h), t2(dev, w2, h, mi))); }
+    for (&e, (w13, w2)) in &hw.experts { experts.insert(e, (t2t(dev, w13, 2 * mi, h), t2t(dev, w2, h, mi))); }
     let dense = hw.dense.as_ref().map(|d| DevDense { gate: t2(dev, &d.gate, d.di, h), up: t2(dev, &d.up, d.di, h), down: t2(dev, &d.down, h, d.di), global_scale: d.global_scale });
     let ns = g.n_shared;
     DevW {
@@ -224,9 +240,9 @@ pub fn build_dev<B: Backend>(dev: &B::Device, hw: &HostW, g: &Geom) -> DevW<B> {
         qn: t1(dev, &hw.qn), kn: t1(dev, &hw.kn), ks: t2(dev, &hw.ks, kvh * hd, kernel), vs: t2(dev, &hw.vs, kvh * hd, kernel),
         rp: t2(dev, &hw.rp, g.d_rel, g.rel_extent),
         rw: if g.is_dense { c2(dev, vec![0.0], 1, 1) } else { t2(dev, &hw.rw, g.n_routed + ns, h) },
-        sgate: (0..if g.is_dense { 0 } else { ns }).map(|s| t2(dev, &hw.sgate[s * mi * h..(s + 1) * mi * h], mi, h)).collect(),
-        sup: (0..if g.is_dense { 0 } else { ns }).map(|s| t2(dev, &hw.sup[s * mi * h..(s + 1) * mi * h], mi, h)).collect(),
-        sdown: (0..if g.is_dense { 0 } else { ns }).map(|s| t2(dev, &hw.sdown[s * h * mi..(s + 1) * h * mi], h, mi)).collect(),
+        sgate: (0..if g.is_dense { 0 } else { ns }).map(|s| t2t(dev, &hw.sgate[s * mi * h..(s + 1) * mi * h], mi, h)).collect(),
+        sup: (0..if g.is_dense { 0 } else { ns }).map(|s| t2t(dev, &hw.sup[s * mi * h..(s + 1) * mi * h], mi, h)).collect(),
+        sdown: (0..if g.is_dense { 0 } else { ns }).map(|s| t2t(dev, &hw.sdown[s * h * mi..(s + 1) * h * mi], h, mi)).collect(),
         experts, dense,
     }
 }
@@ -309,17 +325,17 @@ pub fn burn_layer<B: Backend>(dev: &B::Device, w: &DevW<B>, g: &Geom, x: Tensor<
             let mut acc: Option<Tensor<B, 2>> = None;
             for (slot, &e) in rt.experts.iter().enumerate() {
                 let (w13, w2) = w.experts.get(&e).unwrap_or_else(|| panic!("layer {} expert {e} not bound", g.layer));
-                let both = b_linear(xt.clone(), w13.clone());
+                let both = b_linear_t(xt.clone(), w13.clone());
                 let gate = both.clone().slice([0..1, 0..g.mi]);
                 let up = both.slice([0..1, g.mi..2 * g.mi]);
-                let c = b_linear(b_silu(gate) * up, w2.clone()) * wts.clone().slice([0..1, slot..slot + 1]);
+                let c = b_linear_t(b_silu(gate) * up, w2.clone()) * wts.clone().slice([0..1, slot..slot + 1]);
                 acc = Some(match acc { None => c, Some(a0) => a0 + c });
             }
             for s in 0..g.n_shared {
-                let gs = b_linear(xt.clone(), w.sgate[s].clone());
-                let us = b_linear(xt.clone(), w.sup[s].clone());
+                let gs = b_linear_t(xt.clone(), w.sgate[s].clone());
+                let us = b_linear_t(xt.clone(), w.sup[s].clone());
                 let gamma = wts.clone().slice([0..1, g.top_k + s..g.top_k + s + 1]);
-                let c = b_linear(b_silu(gs) * us * gamma, w.sdown[s].clone());
+                let c = b_linear_t(b_silu(gs) * us * gamma, w.sdown[s].clone());
                 acc = Some(match acc { None => c, Some(a0) => a0 + c });
             }
             outs.push(acc.expect("at least one expert"));

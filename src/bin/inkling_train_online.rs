@@ -35,12 +35,14 @@ fn main() -> Result<()> {
     let k_turns: usize = env_or("INK_ONLINE_TURNS", 8);
     let cap: usize = env_or("INK_ONLINE_TOKENS", 48);
     let min_tokens: usize = env_or("INK_ONLINE_MIN_TOKENS", 12);
-    let layer: usize = env_or("INK_ONLINE_LAYER", t.num_hidden_layers - 1);
+    let layers_env = std::env::var("INK_ONLINE_LAYERS").unwrap_or_else(|_| format!("{}:{}", t.num_hidden_layers - 1, t.num_hidden_layers));
+    let (l0, l1) = { let mut it = layers_env.split(':'); (it.next().unwrap().parse::<usize>()?, it.next().unwrap().parse::<usize>()?) };
+    anyhow::ensure!(l0 < l1 && l1 <= t.num_hidden_layers && (l0..l1).all(|l| !t.is_dense(l)), "INK_ONLINE_LAYERS {layers_env} must be a range of MoE layers");
+    let arms_env = std::env::var("INK_ONLINE_ARMS").unwrap_or_else(|_| "none,f32,fp4sr".into());
     let lr: f32 = env_or("INK_ONLINE_LR", 0.1);
     let seed: u64 = env_or("INK_ONLINE_SEED", 7);
     let turn0: usize = env_or("INK_STEP_TURN", 0);
     let turns_path = std::env::var("INK_TURNS").unwrap_or_else(|_| "/tmp/claude-1000/-home-liora-liora/f03d61a4-efd1-4cac-982c-c155f6c0d5ab/scratchpad/userturns/user_turns.txt".into());
-    anyhow::ensure!(!t.is_dense(layer) && layer < t.num_hidden_layers, "INK_ONLINE_LAYER {layer} must be a MoE layer");
     mem_guard("start");
 
     // --- turns, each rendered as the resident meets it
@@ -62,7 +64,7 @@ fn main() -> Result<()> {
         turns.push(Turn { line: i, ids, scored_from, n_text });
     }
     anyhow::ensure!(turns.len() == k_turns, "only {} usable turns from line {turn0}", turns.len());
-    println!("=== inkling_train_online: layer {layer}, {k_turns} turns (cap {cap} text tokens), lr {lr}, seed {seed}, arms none/f32/fp4sr ===");
+    println!("=== inkling_train_online: layers {l0}..{l1}, {k_turns} turns (cap {cap} text tokens), lr {lr}, seed {seed}, arms {arms_env} ===");
     for (k, tr) in turns.iter().enumerate() { println!("  turn {k}: corpus line {} , {} text tokens", tr.line, tr.n_text); }
 
     let dev = Dev::default();
@@ -70,10 +72,15 @@ fn main() -> Result<()> {
     let h = t.hidden_size; let eps = t.rms_norm_eps;
     mem_guard("head tables");
 
-    // host cache of non-expert layer weights (experts are per turn)
-    let mut cache: Vec<Option<HostW>> = (0..=layer).map(|_| None).collect();
-    let mut rel_extent: Vec<usize> = vec![0; layer + 1];
-    let mut arms = vec![Arm::new("none", ArmKind::None, 0.0, seed), Arm::new("f32", ArmKind::F32, lr, seed), Arm::new("fp4sr", ArmKind::Fp4Sr, lr, seed)];
+    // host cache of non-expert layer weights; experts accumulate per trained layer in `bases`
+    let mut cache: Vec<Option<HostW>> = (0..l1).map(|_| None).collect();
+    let mut rel_extent: Vec<usize> = vec![0; l1];
+    let mut arms: Vec<Arm> = arms_env.split(',').map(|a| match a.trim() {
+        "none" => Arm::new("none", ArmKind::None, 0.0, seed),
+        "f32" => Arm::new("f32", ArmKind::F32, lr, seed),
+        "fp4sr" => Arm::new("fp4sr", ArmKind::Fp4Sr, lr, seed),
+        other => panic!("unknown arm {other}"),
+    }).collect();
     let mut losses: Vec<Vec<f32>> = vec![Vec::new(); arms.len()];
     let t_all = Instant::now();
 
@@ -82,8 +89,8 @@ fn main() -> Result<()> {
         let inputs = &tr.ids[..n]; let targets = &tr.ids[1..];
         let t_turn = Instant::now();
         let mut x: Vec<f32> = embed_host(&hh, inputs, &t);
-        // ---- shared forward below the trained layer (identical in every arm)
-        for l in 0..layer {
+        // ---- shared forward below the trained layers (identical in every arm)
+        for l in 0..l0 {
             if cache[l].is_none() { let (hw, g) = load_layer(&cp, &t, l, n)?; rel_extent[l] = g.rel_extent; cache[l] = Some(hw); }
             let g = geom_for(&t, l, n, rel_extent[l]);
             let mut hw = cache[l].clone().unwrap();
@@ -102,35 +109,37 @@ fn main() -> Result<()> {
             pool_release(&dev);
         }
         let t_shared = t_turn.elapsed().as_secs_f64();
-        // ---- trained layer: routing is shared (router and attention are not trained)
-        if cache[layer].is_none() { let (hw, g) = load_layer(&cp, &t, layer, n)?; rel_extent[layer] = g.rel_extent; cache[layer] = Some(hw); }
-        let g = geom_for(&t, layer, n, rel_extent[layer]);
-        let mut base = cache[layer].clone().unwrap();
-        set_router_global_scale(base.rg);
-        let routing: Vec<Routing> = {
-            let dw0: DevW<Bk> = build_dev(&dev, &base, &g);
-            let (_a, _b, logits) = pre_moe(&dev, &dw0, &g, c2::<Bk>(&dev, x.clone(), n, h));
-            let lg: Vec<f32> = logits.unwrap().into_data().to_vec::<f32>().unwrap();
-            select_routing(&lg, &base.rb, &g)
-        };
-        load_experts(&cp, &g, &mut base, &routing)?;
-        let base_no_experts = HostW { experts: Default::default(), ..base.clone() };
-        let mut touched: Vec<usize> = routing.iter().flat_map(|r| r.experts.clone()).collect();
-        touched.sort_unstable(); touched.dedup();
+        for l in l0..l1 { if cache[l].is_none() { let (hw, g) = load_layer(&cp, &t, l, n)?; rel_extent[l] = g.rel_extent; cache[l] = Some(hw); } }
+        let mut n_touched_total = 0usize;
         let mut line = format!("turn {k:>2} ({:>3} scored):", tr.n_text + 1);
         for (a, arm) in arms.iter_mut().enumerate() {
             let t_arm = Instant::now();
-            // this arm's view of the layer: the checkpoint's experts, overridden where the arm has
-            // learned. Built straight onto the device -- no host clone of the layer per arm (the
-            // clone cost ~4 GB per arm per turn and pushed turn 2 to 32 GiB free).
-            let mut dw: DevW<Ad> = build_dev(&dev, &base_no_experts, &g);
-            for &e in &touched {
-                let (w13, w2) = match arm.current(e) { Some(w) => w, None => base.experts.get(&e).unwrap().clone() };
-                dw.experts.insert(e, (t2(&dev, &w13, 2 * g.mi, g.h), t2(&dev, &w2, g.h, g.mi)));
+            // ---- trained layers under autodiff, chained; each arm routes on ITS OWN residual stream
+            let mut xa: Tensor<Ad, 2> = c2::<Ad>(&dev, x.clone(), n, h);
+            let mut dws: Vec<(usize, DevW<Ad>, Vec<usize>)> = Vec::new();
+            for l in l0..l1 {
+                let g = geom_for(&t, l, n, rel_extent[l]);
+                let base = cache[l].as_mut().unwrap();
+                set_router_global_scale(base.rg);
+                let base_no_experts = HostW { experts: Default::default(), ..base.clone() };
+                let mut dw: DevW<Ad> = build_dev(&dev, &base_no_experts, &g);
+                let routing: Vec<Routing> = {
+                    let (_a, _b, logits) = pre_moe(&dev, &dw, &g, xa.clone());
+                    let lg: Vec<f32> = logits.unwrap().into_data().to_vec::<f32>().unwrap();
+                    select_routing(&lg, &base.rb, &g)
+                };
+                load_experts(&cp, &g, base, &routing)?;
+                let mut touched: Vec<usize> = routing.iter().flat_map(|r| r.experts.clone()).collect();
+                touched.sort_unstable(); touched.dedup();
+                for &e in &touched {
+                    let (w13, w2) = match arm.current(l, e) { Some(w) => w, None => base.experts.get(&e).unwrap().clone() };
+                    dw.experts.insert(e, (t2t(&dev, &w13, 2 * g.mi, g.h), t2t(&dev, &w2, g.h, g.mi)));
+                }
+                xa = burn_layer(&dev, &dw, &g, xa, &routing);
+                n_touched_total += touched.len();
+                dws.push((l, dw, touched));
             }
-            let xin = c2::<Ad>(&dev, x.clone(), n, h);
-            let y = burn_layer(&dev, &dw, &g, xin, &routing);
-            let yv: Vec<f32> = y.clone().into_data().to_vec::<f32>().unwrap();
+            let yv: Vec<f32> = xa.clone().into_data().to_vec::<f32>().unwrap();
             // SCORE before LEARN
             let (loss, per_token, g_up) = head_loss(&dev, &hh, &yv, targets, n, h, eps, tr.scored_from);
             losses[a].push(loss);
@@ -140,20 +149,25 @@ fn main() -> Result<()> {
             }
             if arm.kind != ArmKind::None {
                 let gout = c2::<Ad>(&dev, g_up, n, h);
-                let grads = (y * gout).sum().backward();
-                for &e in &touched {
-                    let (w13, w2) = dw.experts.get(&e).unwrap();
-                    let g13: Vec<f32> = w13.grad(&grads).expect("w13 grad").into_data().to_vec::<f32>().unwrap();
-                    let g2: Vec<f32> = w2.grad(&grads).expect("w2 grad").into_data().to_vec::<f32>().unwrap();
-                    arm.step(&cp, layer, e, base.experts.get(&e).unwrap(), &g13, &g2)?;
+                let grads = (xa * gout).sum().backward();
+                for (l, dw, touched) in &dws {
+                    for &e in touched {
+                        let (w13t, w2t) = dw.experts.get(&e).unwrap();
+                        let gl = geom_for(&t, *l, n, rel_extent[*l]);
+                        // leaves are [in, out]; the arms keep gate-first [2mi, h] / [h, mi]
+                        let g13 = transpose_host(&w13t.grad(&grads).expect("w13 grad").into_data().to_vec::<f32>().unwrap(), gl.h, 2 * gl.mi);
+                        let g2 = transpose_host(&w2t.grad(&grads).expect("w2 grad").into_data().to_vec::<f32>().unwrap(), gl.mi, gl.h);
+                        let base_w = cache[*l].as_ref().unwrap().experts.get(&e).unwrap();
+                        arm.step(&cp, *l, e, base_w, &g13, &g2)?;
+                    }
                 }
                 drop(grads);
-            }
-            drop(dw);
+            } else { drop(xa); }
+            drop(dws);
             pool_release(&dev);
             line.push_str(&format!("  {} {:.4} ({:.1}s, {:.0} GiB free)", arm.name, loss, t_arm.elapsed().as_secs_f64(), mem_available_gib()));
         }
-        println!("{line}   [shared fwd {t_shared:.0}s, {} experts touched, MemAvailable {:.1} GiB]", touched.len(), mem_available_gib());
+        println!("{line}   [shared fwd {t_shared:.0}s, {} expert-layers touched over arms, MemAvailable {:.1} GiB]", n_touched_total, mem_available_gib());
         mem_guard(&format!("after turn {k}"));
     }
     println!("=== {k_turns} turns in {:.0}s ===", t_all.elapsed().as_secs_f64());

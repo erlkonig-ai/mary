@@ -115,7 +115,8 @@ pub struct Arm {
     pub name: String,
     pub lr: f32,
     pub kind: ArmKind,
-    pub states: HashMap<usize, ExpertState>,
+    /// keyed by (layer, expert)
+    pub states: HashMap<(usize, usize), ExpertState>,
     pub coin: Coin,
     pub codes_changed: u64,
     pub codes_clipped: u64,
@@ -127,9 +128,9 @@ impl Arm {
     pub fn new(name: &str, kind: ArmKind, lr: f32, seed: u64) -> Self {
         Arm { name: name.into(), lr, kind, states: HashMap::new(), coin: Coin::new(seed), codes_changed: 0, codes_clipped: 0 }
     }
-    /// The f32 weights this arm currently holds for expert `e`, or None if untouched (checkpoint).
-    pub fn current(&self, e: usize) -> Option<(Vec<f32>, Vec<f32>)> {
-        match self.states.get(&e)? {
+    /// The f32 weights this arm currently holds for expert `e` of `layer`, or None if untouched (checkpoint).
+    pub fn current(&self, layer: usize, e: usize) -> Option<(Vec<f32>, Vec<f32>)> {
+        match self.states.get(&(layer, e))? {
             ExpertState::F32 { w13, w2 } => Some((w13.clone(), w2.clone())),
             ExpertState::Fp4(q) => Some((decode_packed(&q.w13), decode_packed(&q.w2))),
         }
@@ -141,15 +142,15 @@ impl Arm {
         match self.kind {
             ArmKind::None => {}
             ArmKind::F32 => {
-                let st = self.states.entry(e).or_insert_with(|| ExpertState::F32 { w13: base.0.clone(), w2: base.1.clone() });
+                let st = self.states.entry((layer, e)).or_insert_with(|| ExpertState::F32 { w13: base.0.clone(), w2: base.1.clone() });
                 if let ExpertState::F32 { w13, w2 } = st {
                     for (w, g) in w13.iter_mut().zip(g13) { *w -= lr * g; }
                     for (w, g) in w2.iter_mut().zip(g2) { *w -= lr * g; }
                 }
             }
             ArmKind::Fp4Sr => {
-                if !self.states.contains_key(&e) { self.states.insert(e, ExpertState::Fp4(fetch_fp4(cp, layer, e)?)); }
-                if let Some(ExpertState::Fp4(q)) = self.states.get_mut(&e) {
+                if !self.states.contains_key(&(layer, e)) { self.states.insert((layer, e), ExpertState::Fp4(fetch_fp4(cp, layer, e)?)); }
+                if let Some(ExpertState::Fp4(q)) = self.states.get_mut(&(layer, e)) {
                     let mut w13 = decode_packed(&q.w13);
                     let mut w2 = decode_packed(&q.w2);
                     for (w, g) in w13.iter_mut().zip(g13) { *w -= lr * g; }
