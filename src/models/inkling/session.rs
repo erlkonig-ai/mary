@@ -364,6 +364,10 @@ pub struct Session {
     /// The unembedding, bound W4A16 — the weight stays four bits and the
     /// activation stays BF16.
     unembed: dev_lane::ProjW,
+    /// Online learning of the last layer's routed experts, when armed
+    /// (`INK_LEARN_LR`); see [`super::learn`].
+    #[cfg(feature = "inkling-cuda")]
+    learner: Option<super::learn::Learner>,
 
     /// The MoE half's row-plan invariants and per-layer expert tables, built on
     /// first touch and held for the life of the session.
@@ -643,6 +647,12 @@ enum PassOutput {
 /// does.
 const SCORE_ROWS: usize = 64;
 
+/// `INK_LEARN_TRACE=1`: one line per learning pass.
+#[cfg(feature = "inkling-cuda")]
+fn learn_trace() -> bool {
+    std::env::var("INK_LEARN_TRACE").map(|v| v == "1").unwrap_or(false)
+}
+
 /// One device layer viewed through the backend-free target settlement trait.
 struct PendingTargetLayer<'a> {
     cache: &'a mut LayerCache,
@@ -909,7 +919,7 @@ impl Session {
         };
         let embed_norm = src.held("model.llm.embed_norm.weight")?.data.clone();
 
-        let (final_norm, unembed) = {
+        let (final_norm, unembed, learner) = {
             let fnorm = src.held("model.llm.norm.weight")?;
             let leaf = src.stored("model.llm.unembed.weight")?;
             anyhow::ensure!(
@@ -931,11 +941,31 @@ impl Session {
             // quarter of the bytes, and the per-step floor cut by the same
             // ratio.
             let packed = quantized_bf16(&client, &leaf.bytes, rows, cols);
+            #[cfg(feature = "inkling-cuda")]
+            let learner = super::learn::Learner::from_env().map(|(lr, stochastic)| {
+                println!(
+                    "  learning           : last layer's routed experts, lr {lr}, {} rounding",
+                    if stochastic { "stochastic" } else { "nearest" }
+                );
+                super::learn::Learner::bind(&client, &leaf.bytes, rows, cols, lr, stochastic)
+            });
+            #[cfg(not(feature = "inkling-cuda"))]
+            let learner = ();
             (
                 up1r::<Bk>(&fnorm.data, h, &dev),
                 w4a16_bind(&client, packed, true),
+                learner,
             )
         };
+        // Learning keeps the LAST layer's forward, on the rank that owns the
+        // head: a partial stack has no loss to learn from.
+        let mut moe = MoeState::default();
+        #[cfg(feature = "inkling-cuda")]
+        {
+            moe.learn_layer = (learner.is_some() && !partial).then(|| hi - 1);
+        }
+        #[cfg(not(feature = "inkling-cuda"))]
+        let _ = &learner;
 
         // Pay the content hash for this range's experts HERE, once, rather than
         // in whichever decode step first routes to each of them. Rule 6 says
@@ -978,12 +1008,14 @@ impl Session {
             partial,
             layers: BTreeMap::new(),
             dense: DeviceDense::default(),
-            moe: MoeState::default(),
+            moe,
             shared_halved: super::load::shared_w13_halved(),
             embed,
             embed_norm,
             final_norm,
             unembed,
+            #[cfg(feature = "inkling-cuda")]
+            learner,
             caches: Vec::new(),
             pos: 0,
             last: None,
@@ -1919,6 +1951,8 @@ impl Session {
 
             // ---- MLP ------------------------------------------------------
             let hn = dev_lane_resid::rms_norm(xd.clone(), ld.mlp_norm.clone(), t.rms_norm_eps);
+            #[cfg(feature = "inkling-cuda")]
+            let mlp_sconv_taps = ld.mlp_sconv.clone();
             let y = match t.is_dense(layer) {
                 true => {
                     let w = self.dense.dense_for(
@@ -2007,6 +2041,12 @@ impl Session {
                     unreachable!("a target extension requires an existing prefix")
                 }
             };
+            #[cfg(feature = "inkling-cuda")]
+            if let Some(keep) = self.moe.learn.as_mut()
+                && keep.layer == layer
+            {
+                keep.sconv = Some(mlp_sconv_taps);
+            }
             xd = dev_lane_resid::add_resid(xd, out);
 
             let expected = if group.is_some() { 2 } else { 0 };
@@ -2095,6 +2135,53 @@ impl Session {
                     lo = hi;
                 }
                 let best = best.expect("a pass has at least one row");
+                // Learn from what was just scored, while this pass's residual
+                // top and the last layer's expert input and plan are live. The
+                // kernels are enqueued behind the scoring and run in stream
+                // order before the next pass reads the arena.
+                #[cfg(feature = "inkling-cuda")]
+                if let (Some(learner), Some(keep)) = (self.learner.as_mut(), self.moe.learn.take())
+                    && !targets.is_empty()
+                {
+                    let route = self.moe.route.as_ref().expect("a routed layer ran");
+                    let tab = route
+                        .tabs
+                        .get(&keep.layer)
+                        .and_then(|tab| tab.as_ref())
+                        .expect("the learned layer has a device expert table");
+                    let inter = match tp {
+                        Some(tp) => tp
+                            .share("intermediate_size", t.intermediate_size)
+                            .map_err(|e| anyhow::anyhow!("learning: {e}"))?,
+                        None => t.intermediate_size,
+                    };
+                    let report = super::learn::learn_last_layer(
+                        &self.client,
+                        &self.dev,
+                        learner,
+                        keep,
+                        route,
+                        tab,
+                        self.src.experts_swizzled(),
+                        &xd,
+                        final_norm,
+                        &head,
+                        &targets,
+                        mup,
+                        eps,
+                        vocab,
+                        t.vocab_size,
+                        t.n_routed_experts,
+                        inter,
+                        SCORE_ROWS,
+                    )?;
+                    if learn_trace() {
+                        println!(
+                            "  learn: layer {} from {} scored rows over {} slots, enqueued in {:.3}s",
+                            report.layer, report.rows, report.slots, report.secs
+                        );
+                    }
+                }
                 self.pos += n;
                 self.last = Some(best);
                 Ok(PassOutput::Scored { best, nll })

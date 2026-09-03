@@ -85,7 +85,7 @@ use super::devplan::{DevRowPlan, ExpertTable};
 use super::fp4gemm::{KTILE, NTILE};
 use super::fp4quant::e2m1_bits;
 use super::moegroup::BlockPlanDev;
-use super::seam::{handle_of, handle_of_any, tensor_of};
+use super::seam::{handle_of, handle_of_any};
 
 type Client = ComputeClient<cubecl::cuda::CudaRuntime>;
 type Dev = burn::backend::cuda::CudaDevice;
@@ -660,9 +660,9 @@ pub fn learn_last_layer(
         let logits = head(xd.clone().slice([lo..hi, 0..h]));
         let idx: Vec<i64> = targets[lo..hi].iter().map(|&t| t as i64).collect();
         let idx: Tensor<Bk, 2, Int> = Tensor::from_data(TensorData::new(idx, [rows, 1]), dev);
-        let minus: T2 = Tensor::full([rows, 1], -1.0, dev);
+        let minus: T2 = Tensor::zeros([rows, 1], dev).sub_scalar(1.0);
         let g = burn::tensor::activation::softmax(logits, 1)
-            .scatter(1, idx, minus)
+            .scatter(1, idx, minus, burn::tensor::IndexingUpdateOp::Add)
             .mul_scalar(inv);
         let g_full: T2 = Tensor::zeros([rows, vocab_pad], dev).slice_assign([0..rows, 0..vocab_eff], g);
         let g_slice = dev_lane::linear_w(g_full, &learner.unembed_t);
@@ -783,7 +783,6 @@ pub fn learn_last_layer(
     );
     // The learning pass is enqueued; its kernels run in stream order before
     // the next pass reads the arena. Nothing here waits.
-    let _ = tensor_of;
     Ok(LearnReport {
         layer: keep.layer,
         rows: scored,
@@ -889,4 +888,211 @@ pub fn expert_gin_launch<G: Scalar + Cast + CubeElement>(
             n,
         )
     };
+}
+
+#[cfg(test)]
+mod tests {
+    //! Both kernels against the host: a small random plane, quantised by the
+    //! device quantiser, swizzled into fragment order by the load path's own
+    //! permutation, and read back after one step.
+    use super::*;
+    use crate::models::inkling::fp4gemm::{swizzle_b_codes, swizzle_b_scales};
+    use crate::models::inkling::fp4quant::quantize_nvfp4;
+    use crate::models::inkling::nvfp4::decode_row;
+    use crate::models::inkling::train_online::nearest_code;
+    use cubecl::cuda::CudaRuntime;
+
+    fn fill(n: usize, seed: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| (i as f32 * 0.7919 + seed).sin() * 0.5 + (i as f32 * 0.1237).cos() * 0.25)
+            .collect()
+    }
+
+    fn bytes<T: Copy>(v: &[T]) -> &[u8] {
+        // SAFETY: a plain-data slice viewed as its own bytes, for the life of
+        // the borrow.
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+    }
+
+    fn floats(b: &[u8]) -> Vec<f32> {
+        b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    }
+
+    fn bf16_bytes(v: &[f32]) -> Vec<u8> {
+        v.iter().flat_map(|&x| half::bf16::from_f32(x).to_le_bytes()).collect()
+    }
+
+    fn bf16_round(v: &[f32]) -> Vec<f32> {
+        v.iter().map(|&x| half::bf16::from_f32(x).to_f32()).collect()
+    }
+
+    /// One plane `[n, k]` in the arena's layout, with the row-major codes and
+    /// scales it was built from.
+    struct Plane {
+        arena: Vec<u8>,
+        codes_rm: Vec<u8>,
+        scales_rm: Vec<u8>,
+        n: usize,
+        k: usize,
+    }
+
+    fn plane(client: &Client, n: usize, k: usize, seed: f32) -> Plane {
+        let w = fill(n * k, seed);
+        let wh = client.create_from_slice(bytes(&w));
+        let (codes, scales) = quantize_nvfp4(client, &wh, n, k);
+        let codes_rm = client.read_one(codes.binding());
+        let scales_rm = client.read_one(scales.binding());
+        let mut arena = swizzle_b_codes(&codes_rm, n, k);
+        arena.extend(swizzle_b_scales(&scales_rm, n, k));
+        Plane { arena, codes_rm, scales_rm, n, k }
+    }
+
+    fn decode_rm(p: &Plane) -> Vec<f32> {
+        let cols = p.k / 2;
+        let spr = p.k / 16;
+        let mut out = vec![0f32; p.n * p.k];
+        for r in 0..p.n {
+            decode_row(
+                &p.codes_rm[r * cols..(r + 1) * cols],
+                &p.scales_rm[r * spr..(r + 1) * spr],
+                1.0,
+                &mut out[r * p.k..(r + 1) * p.k],
+            );
+        }
+        out
+    }
+
+    /// Rows for two experts: expert 1 owns stack rows {0, 32}, expert 0 owns
+    /// {16}, in a 3-tile stack.
+    fn groups(client: &Client) -> (Handle, Handle, Handle) {
+        let start = client.create_from_slice(bytes(&[0u32, 1]));
+        let cnt = client.create_from_slice(bytes(&[1u32, 2]));
+        let rows = client.create_from_slice(bytes(&[16u32, 0, 32]));
+        (start, cnt, rows)
+    }
+
+    #[test]
+    fn the_update_kernel_takes_the_host_reference_step_to_the_code() {
+        let client = <CudaRuntime as Runtime>::client(&Default::default());
+        let (n, k, m_total) = (64, 256, 48);
+        let p0 = plane(&client, n, k, 0.3);
+        let p1 = plane(&client, n, k, 1.7);
+        // Two experts back to back in one arena; offsets name each plane.
+        let mut arena = p0.arena.clone();
+        let off = vec![0u64, (n * k / 2) as u64, arena.len() as u64, (arena.len() + n * k / 2) as u64];
+        arena.extend(&p1.arena);
+        let wmap = client.create_from_slice(&arena);
+        let off_h = client.create_from_slice(bytes(&off));
+        let sc = client.create_from_slice(bytes(&[1.0f32, 1.0]));
+        let (start, cnt, rows) = groups(&client);
+        let g_out = fill(m_total * n, 2.2);
+        let x = bf16_round(&fill(m_total * k, 3.1));
+        let g_h = client.create_from_slice(bytes(&g_out));
+        let x_h = client.create_from_slice(&bf16_bytes(&x));
+        let lr = 0.05;
+        let plane_ref = PlaneRef { wmap: &wmap, wmap_bytes: arena.len(), off: &off_h, scale2: &sc };
+        let grp = Groups { start: &start, cnt: &cnt, rows: &rows, n_routed: 2, max_rows: 3 };
+        expert_update_launch::<f32, half::bf16>(
+            &client, &plane_ref, &grp, &g_h, &x_h, m_total, n, k, lr, 7, false,
+        );
+        let got = client.read_one(wmap.binding());
+
+        // The host reference: decode, step with the same rows, nearest-round
+        // against the frozen scale, then swizzle to compare bytes.
+        let mut mismatches = 0usize;
+        let mut ties = 0usize;
+        for (e, p) in [&p0, &p1].iter().enumerate() {
+            let rows_e: &[usize] = if e == 0 { &[16] } else { &[0, 32] };
+            let w = decode_rm(p);
+            let cols = k / 2;
+            let spr = k / 16;
+            let mut codes = vec![0u8; n * cols];
+            for o in 0..n {
+                for i in 0..k {
+                    let mut grad = 0f32;
+                    for &r in rows_e {
+                        grad += g_out[r * n + o] * x[r * k + i];
+                    }
+                    let s = crate::models::inkling::nvfp4::e4m3_to_f32(p.scales_rm[o * spr + i / 16]);
+                    let v = w[o * k + i] - lr * grad;
+                    let c = nearest_code(v, s);
+                    // A tie at a midpoint is decided differently by the two
+                    // ladders; count it rather than call it a defect.
+                    if s > 0.0 {
+                        let q = (v / s).abs().min(6.0);
+                        for mid in [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0] {
+                            if (q - mid).abs() < 1e-6 {
+                                ties += 1;
+                            }
+                        }
+                    }
+                    if i % 2 == 0 {
+                        codes[o * cols + i / 2] = c;
+                    } else {
+                        codes[o * cols + i / 2] |= c << 4;
+                    }
+                }
+            }
+            let want = swizzle_b_codes(&codes, n, k);
+            let base = off[2 * e] as usize;
+            for (j, (&a, &b)) in got[base..base + n * cols].iter().zip(&want).enumerate() {
+                if a != b {
+                    mismatches += 1;
+                    if mismatches <= 5 {
+                        eprintln!("expert {e} code byte {j}: device {a:#04x} host {b:#04x}");
+                    }
+                }
+            }
+            // The scales are untouched.
+            let sbase = off[2 * e + 1] as usize;
+            assert_eq!(&got[sbase..sbase + n * spr], &swizzle_b_scales(&p.scales_rm, n, k)[..]);
+        }
+        assert!(
+            mismatches <= ties,
+            "{mismatches} code bytes differ from the host step ({ties} midpoint ties)"
+        );
+        // And the step DID something: a zero-mismatch run against unchanged
+        // codes would pass vacuously.
+        let untouched = got[..n * k / 2] == p0.arena[..n * k / 2];
+        assert!(!untouched, "the update kernel left expert 0's codes unchanged");
+    }
+
+    #[test]
+    fn the_input_gradient_kernel_is_the_host_matmul() {
+        let client = <CudaRuntime as Runtime>::client(&Default::default());
+        let (n, k, m_total) = (64, 256, 48);
+        let p0 = plane(&client, n, k, 0.3);
+        let p1 = plane(&client, n, k, 1.7);
+        let mut arena = p0.arena.clone();
+        let off = vec![0u64, (n * k / 2) as u64, arena.len() as u64, (arena.len() + n * k / 2) as u64];
+        arena.extend(&p1.arena);
+        let wmap = client.create_from_slice(&arena);
+        let off_h = client.create_from_slice(bytes(&off));
+        let sc = client.create_from_slice(bytes(&[1.0f32, 1.0]));
+        let (start, cnt, rows) = groups(&client);
+        let g_out = fill(m_total * n, 2.2);
+        let g_h = client.create_from_slice(bytes(&g_out));
+        let g_in = client.create_from_slice(&vec![0u8; m_total * k * 4]);
+        let plane_ref = PlaneRef { wmap: &wmap, wmap_bytes: arena.len(), off: &off_h, scale2: &sc };
+        let grp = Groups { start: &start, cnt: &cnt, rows: &rows, n_routed: 2, max_rows: 3 };
+        expert_gin_launch::<f32>(&client, &plane_ref, &grp, &g_h, &g_in, m_total, n, k);
+        let got = floats(&client.read_one(g_in.binding()));
+        let (w0, w1) = (decode_rm(&p0), decode_rm(&p1));
+        let mut worst = 0f32;
+        for r in 0..m_total {
+            let w = match r {
+                16 => Some(&w0),
+                0 | 32 => Some(&w1),
+                _ => None,
+            };
+            for i in 0..k {
+                let want = match w {
+                    Some(w) => (0..n).map(|o| g_out[r * n + o] * w[o * k + i]).sum::<f32>(),
+                    None => 0.0,
+                };
+                worst = worst.max((got[r * k + i] - want).abs());
+            }
+        }
+        assert!(worst < 1e-3, "input gradient off by {worst}");
+    }
 }

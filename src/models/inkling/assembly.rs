@@ -2631,6 +2631,14 @@ pub struct LayerCache {
 pub struct MoeState {
     /// The device row-plan state, or `None` before the first routed layer.
     pub route: Option<DevRoute>,
+    /// The layer whose forward is kept for a learning pass, if learning is
+    /// armed on this session (the last layer, on the rank that owns the head).
+    #[cfg(feature = "inkling-cuda")]
+    pub learn_layer: Option<usize>,
+    /// What that layer's most recent forward left for the learning pass; taken
+    /// by the session at the head of a scored pass.
+    #[cfg(feature = "inkling-cuda")]
+    pub learn: Option<super::learn::LearnKeep>,
     /// Per absolute layer: the router bias, on the device.
     pub bias: std::collections::HashMap<usize, cubecl::server::Handle>,
     /// Where the host time inside a routed layer went. Measurement, kept beside
@@ -2832,6 +2840,17 @@ pub fn moe_layer(
     )?;
     let g =
         crate::models::inkling::seam::tensor_of(client.clone(), dev.clone(), topk_h, n, topk_width);
+    // A learning pass needs this layer's expert input and its plan after the
+    // layer is over; keep them when the session armed this layer.
+    #[cfg(feature = "inkling-cuda")]
+    if st.learn_layer == Some(layer) {
+        st.learn = Some(super::learn::LearnKeep {
+            layer,
+            hn: hn.clone(),
+            dp,
+            sconv: None,
+        });
+    }
     let sh = shared_experts_dev(hn, sw, g, k, ns, layer);
 
     Ok(acc + sh)
