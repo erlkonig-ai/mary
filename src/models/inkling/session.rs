@@ -1153,6 +1153,28 @@ impl Session {
         self.group.as_mut()
     }
 
+    /// This rank's cut of every expert the learner has moved, in the pile's
+    /// byte order ([`super::learned::export_learned`]).
+    ///
+    /// Syncs the device first: the arena is written by the update kernel, and
+    /// a host read that raced it would carry a mixture of two steps. Off the
+    /// token path by construction -- this runs when a caller asks for the
+    /// learned model, not per pass.
+    pub fn export_learned(&mut self) -> Result<Vec<super::learned::LearnedCut>> {
+        #[cfg(feature = "inkling-cuda")]
+        {
+            let Some(layer) = self.moe.learn_layer else {
+                return Ok(Vec::new());
+            };
+            cubecl::future::block_on(self.client.sync());
+            let tp = self.group.as_ref().map(|g| g.tp());
+            let n_routed = self.cfg.text_config.n_routed_experts;
+            return super::learned::export_learned(&self.src, tp, layer, n_routed);
+        }
+        #[cfg(not(feature = "inkling-cuda"))]
+        Ok(Vec::new())
+    }
+
     /// Run proposed tokens through the target model without committing them yet.
     ///
     /// This is the transaction boundary a speculative caller needs and no more:

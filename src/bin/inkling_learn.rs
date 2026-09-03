@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         args.len() >= 4,
         "usage: inkling_learn <pile> <tokenizer.json> <turns.txt> [--from LINE] [--turns N] \
-         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b]"
+         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--export]"
     );
     let (pile, tokenizer, corpus) = (&args[1], &args[2], &args[3]);
     let mut from = 100usize;
@@ -42,9 +42,17 @@ fn main() -> Result<()> {
     let mut want = 1usize;
     let mut rendezvous: Option<String> = None;
     let mut layers: Option<std::ops::Range<usize>> = None;
+    let mut export = false;
     let mut i = 4;
     while i < args.len() {
         match args[i].as_str() {
+            // After the last turn, pull every learned expert out of both
+            // ranks' arenas, joined whole, and say what came back. Nothing is
+            // written to a pile yet (see `inkling::learned`).
+            "--export" => {
+                export = true;
+                i += 1;
+            }
             "--from" => {
                 from = args[i + 1].parse().context("--from wants a line number")?;
                 i += 2;
@@ -156,6 +164,29 @@ fn main() -> Result<()> {
         "=== {n} turns: mean {all:.4} nats/delta token; turns 1.. {later:.4}; per turn {} ===",
         means.iter().map(|m| format!("{m:.3}")).collect::<Vec<_>>().join(" ")
     );
+    if export {
+        let t = std::time::Instant::now();
+        let learned = engine.export_learned()?;
+        let secs = t.elapsed().as_secs_f64();
+        let mut per_name: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+        let mut blob_bytes = 0usize;
+        for x in &learned {
+            let blob = mary::models::inkling::pile::expert_blob(&x.packed)
+                .with_context(|| format!("{}[{}] as a pile leaf", x.name, x.expert))?;
+            blob_bytes += blob.bytes.len();
+            let e = per_name.entry(x.name.as_str()).or_default();
+            e.0 += 1;
+            e.1 = x.packed.rows * 1000 + x.packed.cols * 2;
+        }
+        println!(
+            "=== export: {} learned experts, {:.1} MiB of leaves, in {secs:.1}s ===",
+            learned.len(),
+            blob_bytes as f64 / (1u64 << 20) as f64
+        );
+        for (name, (count, dims)) in &per_name {
+            println!("  {name}: {count} experts, each [{}, {}]", dims / 1000, dims % 1000);
+        }
+    }
     engine.shutdown()?;
     Ok(())
 }

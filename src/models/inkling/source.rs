@@ -206,6 +206,13 @@ impl Weights {
         self.src.experts_swizzled()
     }
 
+    /// One expert's packed planes as the pile stores them: whole, row-major,
+    /// untouched by the copy and by the learner. See
+    /// [`PileSource::expert_packed_stored`].
+    pub fn expert_packed_stored(&self, base: &str, e: usize) -> Result<PackedSlab> {
+        self.src.expert_packed_stored(base, e)
+    }
+
     /// One expert's packed planes, borrowed, undecoded.
     pub fn expert_packed(&self, base: &str, e: usize) -> Result<PackedSlab> {
         let t0 = Instant::now();

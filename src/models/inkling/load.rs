@@ -112,6 +112,7 @@ pub struct RawTensor {
 /// first. `scales` is `[rows, rows_of_scales]` raw E4M3 bytes, one per
 /// [`crate::models::inkling::nvfp4::GROUP`] logical elements. `scale2` is the
 /// single F32 factor this expert carries. Logical width is `cols * 2`.
+#[derive(Clone, Debug, PartialEq)]
 pub struct PackedExpert {
     pub codes: Vec<u8>,
     pub scales: Vec<u8>,

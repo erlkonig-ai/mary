@@ -559,6 +559,59 @@ impl Group {
         Ok(())
     }
 
+    /// Send rank 0 this rank's learned cuts, in answer to [`Pass::Export`].
+    /// Only a non-zero rank may call it.
+    ///
+    /// `[count u32be][count x LearnedCut]` on the socket to rank 0. A whole
+    /// layer's worth on this model is under two gibibytes, and the write
+    /// blocks against rank 0's read of it, which rank 0 makes after its own
+    /// export -- so the socket buffer, not a second thread, absorbs the skew.
+    pub fn send_cuts(&mut self, cuts: &[super::learned::LearnedCut]) -> Result<()> {
+        anyhow::ensure!(
+            self.tp.rank() != 0,
+            "rank 0 collects learned cuts; it has nobody to send them to"
+        );
+        let peer = self
+            .socks
+            .first_mut()
+            .context("this rank has no rendezvous socket to rank 0")?;
+        peer.write_all(&(cuts.len() as u32).to_be_bytes())
+            .context("send the learned-cut count")?;
+        let mut frame = Vec::new();
+        for cut in cuts {
+            frame.clear();
+            cut.encode_into(&mut frame);
+            peer.write_all(&frame)
+                .with_context(|| format!("send {}[{}] rank {}", cut.name, cut.expert, cut.rank))?;
+        }
+        peer.flush().ok();
+        Ok(())
+    }
+
+    /// Receive every other rank's learned cuts after leading [`Pass::Export`].
+    /// Only rank 0 may call it.
+    pub fn recv_cuts(&mut self) -> Result<Vec<super::learned::LearnedCut>> {
+        anyhow::ensure!(
+            self.tp.rank() == 0,
+            "only rank 0 collects learned cuts; rank {} sends its own",
+            self.tp.rank()
+        );
+        let mut cuts = Vec::new();
+        for (index, peer) in self.socks.iter_mut().enumerate() {
+            let mut count = [0u8; 4];
+            peer.read_exact(&mut count)
+                .with_context(|| format!("receive peer {index}'s learned-cut count"))?;
+            let count = u32::from_be_bytes(count) as usize;
+            for i in 0..count {
+                cuts.push(
+                    super::learned::LearnedCut::decode(peer)
+                        .with_context(|| format!("receive peer {index}'s learned cut {i}/{count}"))?,
+                );
+            }
+        }
+        Ok(cuts)
+    }
+
     /// Whether every peer's end of the rank link is still open.
     ///
     /// A zero-timeout `poll` for `POLLHUP`/`POLLERR`, checked at pass
@@ -646,6 +699,10 @@ pub enum Pass {
     Finish,
     /// Rank 0 failed terminally. Stop now rather than wait in a collective.
     Abort,
+    /// Every rank sends rank 0 its cut of every expert the learner has moved
+    /// ([`Group::send_cuts`]); rank 0 joins them back into whole experts.
+    /// Not a pass: no collective, and the reply comes back on this socket.
+    Export,
 }
 
 impl Pass {
@@ -658,6 +715,7 @@ impl Pass {
     const ABORT: u8 = 0x07;
     const PREFILL_SCORED: u8 = 0x08;
     const EXTEND_SCORED: u8 = 0x09;
+    const EXPORT: u8 = 0x0A;
 
     /// `[tag u8][count u32be][count x u32be ids]`.
     ///
@@ -677,6 +735,7 @@ impl Pass {
             Pass::Agree => (Self::AGREE, NONE),
             Pass::Finish => (Self::FINISH, NONE),
             Pass::Abort => (Self::ABORT, NONE),
+            Pass::Export => (Self::EXPORT, NONE),
         };
         let mut frame = Vec::with_capacity(5 + 4 * ids.len());
         frame.push(tag);
@@ -722,6 +781,10 @@ impl Pass {
             Self::ABORT => {
                 empty(&ids, "Abort")?;
                 Pass::Abort
+            }
+            Self::EXPORT => {
+                empty(&ids, "Export")?;
+                Pass::Export
             }
             // An unknown tag is a version skew between two boxes that are
             // supposed to be running the SAME binary. Refusing loudly is the

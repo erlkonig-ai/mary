@@ -1252,6 +1252,18 @@ impl PileSource {
                 cols: c.logical / 2,
             });
         }
+        self.expert_packed_stored(base, e)
+    }
+
+    /// One expert's NVFP4 planes as the PILE stores them, whole and in
+    /// row-major order, whatever this process has copied or learned since.
+    ///
+    /// [`PileSource::expert_packed`] prefers the copied arena, which is the
+    /// live expert -- cut to this rank's share, permuted into fragment order,
+    /// and updated in place by the learner. This is the other side of that:
+    /// the checkpoint the run started from, which is what a learned expert is
+    /// diffed against before it is written back.
+    pub fn expert_packed_stored(&self, base: &str, e: usize) -> Result<PackedSlab> {
         let h = match self
             .experts
             .get(&(base.to_string(), e as i64))

@@ -445,6 +445,17 @@ impl Follower {
                         .context("a follower with no Group cannot agree")?;
                     group.agree(digest)?;
                 }
+                Pass::Export => {
+                    let cuts = self
+                        .session
+                        .export_learned()
+                        .context("export this rank's learned experts")?;
+                    let group = self
+                        .session
+                        .group_mut()
+                        .context("a follower with no Group cannot export")?;
+                    group.send_cuts(&cuts)?;
+                }
                 Pass::Finish => {
                     eprintln!("inkling: rank 0 ended the run; this rank is stopping cleanly");
                     return Ok(());
@@ -553,6 +564,27 @@ impl Engine {
             group.lead(pass)?;
         }
         Ok(())
+    }
+
+    /// Every expert the learner has moved, whole, joined across the ranks.
+    ///
+    /// Rank 0 exports its own cut, every other rank sends its cut over the
+    /// rank link ([`Pass::Export`]), and the cuts are joined back into the
+    /// experts the pile stores. Nothing is published: see
+    /// [`super::learned`] for why the identity of the resulting model is
+    /// still an open decision.
+    pub fn export_learned(&mut self) -> Result<Vec<super::learned::LearnedExpert>> {
+        if self.session.group_mut().is_some() {
+            self.lead(&Pass::Export)?;
+        }
+        let mut cuts = self
+            .session
+            .export_learned()
+            .context("export rank 0's learned experts")?;
+        if let Some(group) = self.session.group_mut() {
+            cuts.extend(group.recv_cuts()?);
+        }
+        super::learned::assemble(cuts)
     }
 
     /// Tell every other rank to do something that is not a pass.

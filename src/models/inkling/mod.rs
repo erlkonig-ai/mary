@@ -140,6 +140,10 @@ pub mod assembly;
 pub mod train;
 #[cfg(feature = "inkling-cuda")]
 pub mod learn;
+// Learned experts on their way back to the pile: this rank's cut of each one
+// the learner moved, the rank link's form of it, and the join back into the
+// whole expert. Host bytes only, so it is not gated on the CUDA lane.
+pub mod learned;
 #[cfg(feature = "inkling-cuda")]
 pub mod train_online;
 pub mod session;
