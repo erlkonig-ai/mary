@@ -491,7 +491,14 @@ impl Group {
             self.tp.rank()
         );
         let frame = pass.encode();
-        for peer in self.socks.iter_mut() {
+        for (i, peer) in self.socks.iter_mut().enumerate() {
+            // A follower that died between passes has closed its socket. Say
+            // so here, before this rank enters a collective that would wait
+            // for it forever: on 2026-09-04 rank 1 refused its weights and
+            // exited after pairing, and rank 0 spun in the first all-reduce
+            // for two hours with a silent log. (A follower dying INSIDE a
+            // collective is still the communicator's to notice.)
+            assert_alive(peer, i + 1)?;
             peer.write_all(&frame).context("send the pass command")?;
             peer.flush().ok();
         }
@@ -679,6 +686,27 @@ impl Group {
 }
 
 /// Connect, retrying, because the peer is usually still loading its pile.
+/// Refuse to lead a rank whose rendezvous socket has reached end of stream.
+/// A one-byte non-blocking peek: data or would-block means alive; zero means
+/// the peer closed; anything else is the link failing.
+fn assert_alive(peer: &TcpStream, rank: usize) -> Result<()> {
+    peer.set_nonblocking(true)
+        .context("probe the rank link")?;
+    let mut byte = [0u8; 1];
+    let probe = peer.peek(&mut byte);
+    peer.set_nonblocking(false)
+        .context("restore the rank link")?;
+    match probe {
+        Ok(0) => anyhow::bail!(
+            "rank {rank} closed its rendezvous socket: its process is gone, so this rank is \
+             stopping rather than waiting in a collective for it forever"
+        ),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("the rank link to rank {rank} failed")),
+    }
+}
+
 fn connect_with_deadline(addr: &str, wait: Duration) -> Result<TcpStream> {
     let start = std::time::Instant::now();
     loop {
