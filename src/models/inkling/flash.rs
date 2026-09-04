@@ -516,6 +516,8 @@ fn flash_kernel<KV: Numeric>(
     vc: &Array<u32>,
     vs: &Array<e4m3>,
     rel: &Array<f32>,
+    gap_rows: &Array<u32>,
+    gap_cums: &Array<u32>,
     po: &mut Array<f32>,
     pml: &mut Array<f32>,
     scaling: f32,
@@ -529,11 +531,14 @@ fn flash_kernel<KV: Numeric>(
     slot0: u32,
     splits: u32,
     slots: u32,
+    ngaps: u32,
+    row0: u32,
     #[comptime] heads: u32,
     #[comptime] kv_heads: u32,
     #[comptime] head_dim: u32,
     #[comptime] rows: u32,
     #[comptime] packed: bool,
+    #[comptime] gapped: bool,
 ) {
     let qt = CUBE_POS_X;
     let kvh = CUBE_POS_Y;
@@ -681,7 +686,20 @@ fn flash_kernel<KV: Numeric>(
         }
 
         let key = t + lane;
-        let key_abs = k0 + key;
+        let mut key_abs = k0 + key;
+        if comptime![gapped] {
+            // Positions evicted before this key: the last gap at or before its
+            // logical row says how many were skipped up to and including it.
+            // Gaps are few (a fold a time), so a scan beats a search here.
+            let r = row0 + key;
+            let mut skipped = 0u32;
+            for g in 0..ngaps {
+                if gap_rows[g as usize] <= r {
+                    skipped = gap_cums[g as usize];
+                }
+            }
+            key_abs += skipped;
+        }
         let visible_key = key < s_hi;
 
         #[unroll]
@@ -928,6 +946,27 @@ pub struct KeyRun<'a> {
     pub lo: usize,
     /// One past the last live row.
     pub hi: usize,
+    /// Logical row (in the cache's own numbering, dead prefix excluded) of
+    /// stored row 0 of this run: what the gap table is indexed by. Zero when
+    /// there is one run and no dead prefix, which is every case but a
+    /// windowed layer's, and windowed layers never carry gaps.
+    pub row0: usize,
+}
+
+/// Where a cache has EVICTED rows, and how far each gap moves the absolute
+/// position of every key after it.
+///
+/// `rows[g]` is the logical row the `g`-th gap begins at (the first surviving
+/// row after it) and `cums[g]` the number of positions skipped up to and
+/// including that gap, non-decreasing in `g`. A key at logical row `r` stands
+/// at `base + r + cums[last g with rows[g] <= r]`, or `base + r` with no such
+/// gap -- so with no gaps at all the kernel computes exactly what it always
+/// has. Both live on the device; `count` is their length.
+#[derive(Debug, Clone, Copy)]
+pub struct Gaps<'a> {
+    pub rows: &'a Handle,
+    pub cums: &'a Handle,
+    pub count: usize,
 }
 
 /// How many cubes the launcher aims for before it stops splitting the key axis.
@@ -1051,6 +1090,7 @@ pub fn flash_attention_launch<R: Runtime>(
     window: Option<usize>,
     scaling: f32,
     rows: usize,
+    gaps: Option<Gaps<'_>>,
 ) -> Handle {
     assert!(nq > 0, "an empty query block has no attention");
     assert!(!runs.is_empty(), "attention over no keys at all");
@@ -1105,6 +1145,14 @@ pub fn flash_attention_launch<R: Runtime>(
     let po = client.empty(po_elems * core::mem::size_of::<f32>());
     let pml = client.empty(pml_elems * core::mem::size_of::<f32>());
 
+    // The gap table, or the relative-bias handle standing in for it: with no
+    // gaps the kernel is compiled without the branch and never reads the
+    // arrays, so any live handle serves as the binding.
+    let gapped = gaps.is_some_and(|g| g.count > 0);
+    let (gap_rows_h, gap_cums_h, gap_count) = match gaps {
+        Some(g) if g.count > 0 => (g.rows.clone(), g.cums.clone(), g.count),
+        _ => (rel.clone(), rel.clone(), 0usize),
+    };
     let mut slot0 = 0usize;
     for (run, splits) in runs.iter().zip(split_of.iter().copied()) {
         let kv_elems = run.rows * kv_heads * head_dim;
@@ -1160,6 +1208,10 @@ pub fn flash_attention_launch<R: Runtime>(
                         ArrayArg::from_raw_parts(run.v.clone(), code_elems),
                         ArrayArg::from_raw_parts(vs.clone(), scale_elems),
                         ArrayArg::from_raw_parts(rel.clone(), rel_elems),
+                        // Bound whether or not the kernel reads them: an array a
+                        // kernel never touches is a constant-bank pointer.
+                        ArrayArg::from_raw_parts(gap_rows_h.clone(), gap_count.max(1)),
+                        ArrayArg::from_raw_parts(gap_cums_h.clone(), gap_count.max(1)),
                         ArrayArg::from_raw_parts(po.clone(), po_elems),
                         ArrayArg::from_raw_parts(pml.clone(), pml_elems),
                         scaling,
@@ -1173,11 +1225,14 @@ pub fn flash_attention_launch<R: Runtime>(
                         slot0 as u32,
                         splits as u32,
                         slots as u32,
+                        gap_count as u32,
+                        run.row0 as u32,
                         heads as u32,
                         kv_heads as u32,
                         head_dim as u32,
                         rows as u32,
                         packed,
+                        gapped,
                     )
                 }
             };
@@ -1349,6 +1404,7 @@ mod device_tests {
                 base: *base,
                 lo: 0,
                 hi: *rows,
+                row0: 0,
             })
             .collect();
         let oh = flash_attention_launch(
@@ -1366,6 +1422,7 @@ mod device_tests {
             sh.window,
             1.0 / sh.head_dim as f32,
             rows,
+            None,
         );
         f32::from_bytes(&client.read_one(oh).expect("read the fused output")).to_vec()
     }
@@ -1474,6 +1531,7 @@ mod device_tests {
                 sh.window,
                 1.0 / sh.head_dim as f32,
                 rows,
+                None,
             );
             f32::from_bytes(&client.read_one(oh).expect("read the fused output")).to_vec()
         };
@@ -1488,6 +1546,7 @@ mod device_tests {
                 base: *base,
                 lo: 0,
                 hi: *rows,
+                row0: 0,
             })
             .collect();
         let packed: Vec<KeyRun<'_>> = held
@@ -1501,6 +1560,7 @@ mod device_tests {
                 base: *base,
                 lo: 0,
                 hi: *rows,
+                row0: 0,
             })
             .collect();
         (launch(&dense, KvElem::Bf16), launch(&packed, KvElem::Nvfp4))

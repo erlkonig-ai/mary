@@ -1483,6 +1483,42 @@ impl Session {
     ///
     /// Refuses on a session with no sequence in flight — position 0 is what
     /// [`Session::reset`] gets you, and it costs nothing to keep.
+    /// EVICT the keys at absolute positions `a..b` from every GLOBAL layer: a
+    /// folded span of the moment leaving the context while the positions of
+    /// everything around it stay exactly what they were.
+    ///
+    /// The windowed layers have long forgotten the span -- a fold is older than
+    /// any window by construction, and this refuses one that is not -- and the
+    /// convolution histories read only the last `kernel - 1` positions, which
+    /// the span must not reach either. The session's position does not move:
+    /// the next token stands where it would have stood. See
+    /// [`super::burn::AttnCache::evict`] for what a global layer does with it.
+    pub fn evict(&mut self, a: usize, b: usize) -> Result<()> {
+        anyhow::ensure!(a < b, "an eviction of no positions ({a}..{b})");
+        anyhow::ensure!(
+            !self.torn,
+            "a pass failed part way through the layer stack; `reset` before evicting"
+        );
+        let hist = self.cfg.text_config.sconv_kernel_size.saturating_sub(1);
+        let window = self.cfg.text_config.sliding_window_size;
+        let keep = hist.max(window);
+        anyhow::ensure!(
+            b + keep <= self.pos,
+            "evicting {a}..{b} reaches into the last {keep} position(s) before {}, which the \
+             windowed layers and the convolution histories still hold; a fold is older than \
+             any window",
+            self.pos
+        );
+        let lo = self.lo;
+        for (i, cache) in self.caches.iter_mut().enumerate() {
+            if self.cfg.text_config.attn_kind(lo + i) == AttnKind::Local {
+                continue;
+            }
+            cache.attn.evict(a, b, &self.dev);
+        }
+        Ok(())
+    }
+
     pub fn checkpoint(&self) -> Result<Checkpoint> {
         anyhow::ensure!(
             !self.torn,

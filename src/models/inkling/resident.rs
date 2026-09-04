@@ -405,6 +405,10 @@ pub enum SenseMedia {
     /// (`super::patches`: little-endian f32, `PATCH_BYTES` each): the
     /// template's image part, one placeholder per patch.
     Patches { patches: Vec<u8> },
+    /// Plain text a sense delivers -- a note from her shell, a transcript a
+    /// faculty already made -- spelled as an ordinary text part of the tool
+    /// message named for its source. No slots: text is its own tokens.
+    Text { text: String },
 }
 
 impl SenseRecord {
@@ -413,6 +417,7 @@ impl SenseRecord {
         match &self.media {
             SenseMedia::Dmel { levels } => heard_frames(levels),
             SenseMedia::Patches { patches } => super::patches::count(patches),
+            SenseMedia::Text { .. } => Ok(0),
         }
     }
 }
@@ -761,10 +766,11 @@ impl InklingContextCodec {
     }
 
     /// The placeholder id a medium stands behind.
-    pub fn slot_of(&self, media: &SenseMedia) -> usize {
+    pub fn slot_of(&self, media: &SenseMedia) -> Option<usize> {
         match media {
-            SenseMedia::Dmel { .. } => self.special_ids.audio_slot as usize,
-            SenseMedia::Patches { .. } => self.special_ids.image_slot as usize,
+            SenseMedia::Dmel { .. } => Some(self.special_ids.audio_slot as usize),
+            SenseMedia::Patches { .. } => Some(self.special_ids.image_slot as usize),
+            SenseMedia::Text { .. } => None,
         }
     }
 
@@ -785,6 +791,10 @@ impl InklingContextCodec {
             SenseMedia::Patches { .. } => {
                 ids.push(self.special_ids.content_image as usize);
                 ids.extend(std::iter::repeat_n(self.special_ids.image_slot as usize, slots));
+            }
+            SenseMedia::Text { text } => {
+                ids.push(self.special_ids.content_text as usize);
+                self.push_content(ids, text)?;
             }
         }
         ids.push(self.special_ids.end_message as usize);
@@ -1565,6 +1575,20 @@ pub trait Model: Send {
     /// A tensor rank whose partner has stopped making collectives blocks in
     /// NCCL with no timeout, so this must reach the peer, not merely drop local
     /// state.
+    /// The absolute position the sequence stands at -- where the next token
+    /// goes -- or `None` for a model that keeps no positions.
+    fn position(&self) -> Option<usize> {
+        None
+    }
+
+    /// EVICT the keys at absolute positions `from..to` from the context: a
+    /// folded span of the moment leaving the cache while the positions of
+    /// everything around it stay exactly what they were, on every rank. The
+    /// sequence's position does not move. A model that cannot says so.
+    fn evict(&mut self, from: usize, to: usize) -> Result<()> {
+        anyhow::bail!("this model keeps no evictable context ({from}..{to})")
+    }
+
     fn kill(&mut self) -> Result<()>;
 
     /// End cleanly: the conversation is over and every rank should stop.

@@ -735,6 +735,92 @@ impl<R: PageRows> Pages<R> {
         self.fill = tail;
     }
 
+    /// Remove `n` logical rows starting at `from` -- an EVICTION from the middle
+    /// of the sequence, the rows a folded span of the moment held.
+    ///
+    /// Every row after the range moves down by `n`. Nothing about the surviving
+    /// rows' content changes and the caller's `base` stays what it was: the
+    /// positions the survivors stand at are the caller's to keep (see
+    /// [`super::burn::AttnCache::evict`], which carries them as a gap table).
+    /// On the reserved arm this is one copy of the tail back into the same
+    /// page -- the buffer does not move, which is what a captured graph wants
+    /// -- and on the grow-on-demand arm the pages the range touches are rebuilt
+    /// from their kept rows and the pages inside it are dropped.
+    pub fn remove(&mut self, from: usize, n: usize) {
+        assert!(
+            from + n <= self.len,
+            "removing rows {from}..{} of {} rows",
+            from + n,
+            self.len
+        );
+        if n == 0 {
+            return;
+        }
+        if from + n == self.len {
+            self.truncate(from);
+            return;
+        }
+        if self.reserved > 0 {
+            let at = self.head + from;
+            let tail = self.pages[0].slice_rows(at + n, self.head + self.len);
+            self.pages[0].write_rows(at, tail);
+            self.len -= n;
+            self.fill = self.head + self.len;
+            return;
+        }
+        let lo = self.head + from;
+        let hi = lo + n;
+        let mut kept: Vec<R> = Vec::with_capacity(self.pages.len());
+        let mut start = 0usize;
+        let mut first_dropped = false;
+        let mut last_touched = false;
+        let count = self.pages.len();
+        for i in 0..count {
+            let rows = self.rows_at(i);
+            let end = start + rows;
+            let page = &self.pages[i];
+            if end <= lo || start >= hi {
+                // By REAL rows: the last page carries capacity past `fill`.
+                kept.push(page.slice_rows(0, rows));
+            } else {
+                let cut_lo = lo.max(start) - start;
+                let cut_hi = hi.min(end) - start;
+                let mut parts = Vec::with_capacity(2);
+                if cut_lo > 0 {
+                    parts.push(page.slice_rows(0, cut_lo));
+                }
+                if cut_hi < rows {
+                    parts.push(page.slice_rows(cut_hi, rows));
+                }
+                if parts.is_empty() {
+                    if i == 0 {
+                        first_dropped = true;
+                    }
+                } else {
+                    kept.push(R::concat(parts));
+                }
+                if i + 1 == count {
+                    last_touched = true;
+                }
+            }
+            start = end;
+        }
+        // One page again. A settled page must be a whole number of `PAGE`s,
+        // and a cut page is not, so the survivors become one page that is
+        // also the last page -- whose size is free -- and `append` opens a
+        // fresh `PAGE` after it. An eviction is a rare, whole-store event; the
+        // copy is the price of keeping every other step's invariants intact.
+        let _ = last_touched;
+        self.len -= n;
+        self.pages = vec![R::concat(kept)];
+        self.fill = self.pages[0].rows();
+        if first_dropped {
+            // The dead prefix went with its page.
+            self.head = 0;
+        }
+        debug_assert_eq!(self.fill, self.head + self.len);
+    }
+
     /// The rows as one value, in order, or `None` while empty.
     ///
     /// Empty is a real state — a fresh cache, or one a rejection emptied — and
@@ -1040,6 +1126,12 @@ impl<B: Backend> PageStore<B> {
     /// Drop `n` rows from the FRONT — the sliding window advancing.
     pub fn drop_front(&mut self, n: usize) {
         self.pages.drop_front(n);
+    }
+
+    /// Remove `n` logical rows starting at `from` — an eviction. See
+    /// [`Pages::remove`].
+    pub fn remove(&mut self, from: usize, n: usize) {
+        self.pages.remove(from, n);
     }
 
     /// Truncate to `keep` logical rows — a speculative batch being rejected.
@@ -1601,6 +1693,12 @@ impl Fp4PageStore {
         self.pages.drop_front(n);
     }
 
+    /// Remove `n` logical rows starting at `from` — an eviction. See
+    /// [`Pages::remove`].
+    pub fn remove(&mut self, from: usize, n: usize) {
+        self.pages.remove(from, n);
+    }
+
     /// Truncate to `keep` logical rows — a speculative batch being rejected.
     pub fn truncate(&mut self, keep: usize) {
         self.pages.truncate(keep);
@@ -1830,6 +1928,15 @@ impl<B: Backend> KvStore<B> {
         match self {
             Self::Wide(s) => s.drop_front(n),
             Self::Fp4(s) => s.drop_front(n),
+        }
+    }
+
+    /// Remove `n` logical rows starting at `from` — an eviction. See
+    /// [`Pages::remove`].
+    pub fn remove(&mut self, from: usize, n: usize) {
+        match self {
+            Self::Wide(s) => s.remove(from, n),
+            Self::Fp4(s) => s.remove(from, n),
         }
     }
 
@@ -2284,6 +2391,53 @@ mod tests {
         assert_eq!(contents(&s).first().copied(), Some(1 + PAGE));
         assert_eq!(s.len(), 3 * PAGE - 1 - PAGE);
         assert_eq!(contents(&s).last().copied(), Some(3 * PAGE - 1));
+    }
+
+    #[test]
+    fn remove_from_the_middle_keeps_order_across_pages() {
+        let mut s = PageStore::<B>::new(W);
+        s.append(rows(0, 3 * PAGE));
+        // A span that starts mid-page and ends mid-page, crossing a boundary.
+        let (from, n) = (PAGE / 2, PAGE);
+        s.remove(from, n);
+        s.assert_sound();
+        let want: Vec<usize> = (0..from).chain(from + n..3 * PAGE).collect();
+        assert_eq!(contents(&s), want);
+        assert_eq!(s.len(), 3 * PAGE - n);
+        // The store keeps working afterwards: appends land after the survivors.
+        s.append(rows(3 * PAGE, 3));
+        s.assert_sound();
+        let want: Vec<usize> = (0..from).chain(from + n..3 * PAGE + 3).collect();
+        assert_eq!(contents(&s), want);
+        // Removing a whole page in the middle, and a range that ends at the end.
+        s.remove(PAGE, PAGE);
+        s.assert_sound();
+        assert_eq!(s.len(), 3 * PAGE + 3 - n - PAGE);
+        let tail = s.len() - 2;
+        s.remove(tail, 2);
+        s.assert_sound();
+        assert_eq!(s.len(), 3 * PAGE + 1 - n - PAGE);
+    }
+
+    #[test]
+    fn remove_on_the_reserved_arm_moves_the_tail_in_place() {
+        let dev = Default::default();
+        let mut s = PageStore::<B>::reserved(W, 64, 16, &dev);
+        s.append(rows(0, 40));
+        s.remove(10, 5);
+        s.assert_sound();
+        let want: Vec<usize> = (0..10).chain(15..40).collect();
+        assert_eq!(contents(&s), want);
+        assert_eq!(s.len(), 35);
+        s.append(rows(40, 3));
+        s.assert_sound();
+        let want: Vec<usize> = (0..10).chain(15..43).collect();
+        assert_eq!(contents(&s), want);
+        // Two evictions compose.
+        s.remove(0, 10);
+        s.assert_sound();
+        let want: Vec<usize> = (15..43).collect();
+        assert_eq!(contents(&s), want);
     }
 
     #[test]

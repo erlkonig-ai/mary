@@ -454,6 +454,11 @@ impl Follower {
                         .push_vision(slot, &patches)
                         .context("stage this rank's patches")?;
                 }
+                Pass::Evict { from, to } => {
+                    self.session
+                        .evict(from, to)
+                        .context("evict this rank's span")?;
+                }
                 Pass::Step => {
                     let token = self.session.step().context("advance one token")?;
                     self.fold(token);
@@ -802,6 +807,16 @@ impl Engine {
             position: self.session.position(),
         })
     }
+
+    /// EVICT absolute positions `from..to` from every global layer's cache, on
+    /// every rank: a folded span of the moment leaving the context while the
+    /// positions around it keep their place. See `Session::evict`.
+    pub fn evict_span(&mut self, from: usize, to: usize) -> Result<()> {
+        self.lead(&Pass::Evict { from, to })?;
+        self.session
+            .evict(from, to)
+            .context("evict the span from rank 0's caches")
+    }
 }
 
 impl Model for Engine {
@@ -820,6 +835,7 @@ impl Model for Engine {
         for record in self.codec.sensed(context) {
             match &record.media {
                 SenseMedia::Dmel { levels } => self.delta_audio.extend_from_slice(levels),
+                SenseMedia::Text { .. } => {}
                 SenseMedia::Patches { patches } => self.delta_vision.extend_from_slice(patches),
             }
         }
@@ -938,6 +954,14 @@ impl Model for Engine {
         // collectives fail.
         self.announce(Pass::Abort)
             .context("release the peer rank after a terminal failure")
+    }
+
+    fn position(&self) -> Option<usize> {
+        Some(self.session.position())
+    }
+
+    fn evict(&mut self, from: usize, to: usize) -> Result<()> {
+        Engine::evict_span(self, from, to)
     }
 
     fn persist_learned(

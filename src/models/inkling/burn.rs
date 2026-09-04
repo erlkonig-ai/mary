@@ -783,6 +783,24 @@ pub struct AttnCache<B: Backend> {
     /// rows a SPECULATIVE batch appended, which may turn out not to have
     /// happened.
     pending: Option<Pending<B>>,
+    /// Absolute positions this cache has EVICTED (see [`AttnCache::evict`]):
+    /// sorted, merged, half-open intervals, all at or after `base`. The rows
+    /// are gone from the stores; the positions of the survivors are kept by
+    /// adding, to every key after a gap, the positions the gaps before it
+    /// skipped -- the kernel's gap table, `gap_dev`, is derived from this.
+    evicted: Vec<(usize, usize)>,
+    /// The gap table on the device (rows, cums, count), rebuilt at each
+    /// eviction and read by every attention launch until the next one.
+    gap_dev: Option<GapDev>,
+}
+
+/// The device half of an [`AttnCache`]'s gap table. See
+/// [`crate::models::inkling::flash::Gaps`].
+#[derive(Clone)]
+pub struct GapDev {
+    rows: cubecl::server::Handle,
+    cums: cubecl::server::Handle,
+    count: usize,
 }
 
 /// What a speculative batch must be able to undo.
@@ -857,6 +875,10 @@ pub struct AttnRewind<B: Backend> {
     len: usize,
     /// Absolute position of logical row 0 at the point.
     base: usize,
+    /// How many evictions the cache had made when the point was taken. A
+    /// rewind across an eviction is not a rewind -- the rows between are gone
+    /// -- so [`AttnCache::rewind_to`] refuses a point from the other side.
+    evictions: usize,
     /// The stores as they stood, for a WINDOWED layer — see above. `None` on a
     /// global layer, where a truncation is exact and keeping a second reference
     /// to the whole context would be the expensive way to say nothing.
@@ -991,6 +1013,69 @@ impl AttnCache<Bk> {
         self.k = k.into_reserved(rows, plan.epoch, dev);
         let v = std::mem::replace(&mut self.v, placeholder());
         self.v = v.into_reserved(rows, plan.epoch, dev);
+    }
+
+    /// Absolute positions this cache has evicted: sorted, merged, half-open.
+    pub fn evicted(&self) -> &[(usize, usize)] {
+        &self.evicted
+    }
+
+    /// Logical rows whose absolute position is below `pos`.
+    fn rows_before(&self, pos: usize) -> usize {
+        rows_before_position(self.base, &self.evicted, self.k.len(), pos)
+    }
+
+    /// The absolute position after the last key this cache holds.
+    fn position_after_last(&self) -> usize {
+        let skipped: usize = self.evicted.iter().map(|&(a, b)| b - a).sum();
+        self.base + self.k.len() + skipped
+    }
+
+    /// EVICT the keys at absolute positions `a..b`: a folded span of the
+    /// moment leaving the cache while everything around it keeps its place.
+    ///
+    /// For a GLOBAL layer only -- a windowed layer forgets by itself, and a
+    /// fold is older than any window by construction. The rows leave both
+    /// stores ([`super::kvpages::KvStore::remove`]); `base` stays what it was;
+    /// the survivors keep their absolute positions through the gap table the
+    /// kernel adds to every key after a gap (see
+    /// [`crate::models::inkling::flash::Gaps`]), so causality and the relative
+    /// distance are computed against the positions the sequence really had.
+    /// Positions already evicted inside `a..b` merge. Refuses under a
+    /// speculative batch, and refuses to reach past the last key.
+    pub fn evict(&mut self, a: usize, b: usize, dev: &burn::backend::cuda::CudaDevice) {
+        assert!(self.pending.is_none(), "evicting under a speculative batch");
+        assert!(a < b, "evicting no positions ({a}..{b})");
+        assert!(
+            a >= self.base,
+            "evicting {a}..{b} below this cache's base {}",
+            self.base
+        );
+        let end = self.position_after_last();
+        assert!(b <= end, "evicting {a}..{b} past the last key at {end}");
+        let ra = self.rows_before(a);
+        let rb = self.rows_before(b);
+        if rb > ra {
+            self.k.remove(ra, rb - ra);
+            self.v.remove(ra, rb - ra);
+        }
+        let mut intervals = std::mem::take(&mut self.evicted);
+        intervals.push((a, b));
+        self.evicted = merge_intervals(intervals);
+        let (rows, cums) = gap_table(self.base, &self.evicted);
+        // Uploaded as `i32` tensors and held by their handles: the kernel reads
+        // them as `u32`, the bits are the same, and a handle keeps its buffer
+        // alive without the tensor.
+        let upload = |v: &[u32]| {
+            let ints: Vec<i32> = v.iter().map(|&x| x as i32).collect();
+            let t = Tensor::<Bk, 1, burn::tensor::Int>::from_ints(ints.as_slice(), dev);
+            crate::models::inkling::seam::int_handle_of(t)
+        };
+        self.gap_dev = Some(GapDev {
+            rows: upload(&rows),
+            cums: upload(&cums),
+            count: rows.len(),
+        });
     }
 
     /// DEBUG: host-side absolute sums of everything this cache carries to the
@@ -1171,6 +1256,7 @@ impl<B: Backend> AttnCache<B> {
         AttnRewind {
             len: self.k.len(),
             base: self.base,
+            evictions: self.evicted.len(),
             kv: window.map(|_| (self.k.clone(), self.v.clone())),
             k_pre: self.k_pre.clone(),
             v_pre: self.v_pre.clone(),
@@ -1198,6 +1284,14 @@ impl<B: Backend> AttnCache<B> {
     ///   since moved, which is a point that cannot restore what was dropped;
     /// * a speculative batch outstanding on either side.
     pub fn rewind_to(&mut self, r: &AttnRewind<B>) {
+        assert_eq!(
+            r.evictions,
+            self.evicted.len(),
+            "a rewind across an eviction: the point was taken with {} eviction(s) and the cache has \
+             made {} -- the rows between are gone",
+            r.evictions,
+            self.evicted.len()
+        );
         assert!(
             self.pending.is_none(),
             "rewinding a cache with an uncommitted speculative batch: commit it first"
@@ -1331,6 +1425,96 @@ impl AttnCache<Bk> {
 /// never more. Without this a local layer's cache grows without bound over a
 /// long generation while the extra rows are masked to `-inf` on every step —
 /// correct, and quadratic in a layer that was chosen to be linear.
+/// Logical rows (of `len`) whose absolute position is below `pos`, in a cache
+/// whose row 0 stands at `base` and which has evicted `evicted` (sorted,
+/// merged, half-open absolute intervals).
+fn rows_before_position(base: usize, evicted: &[(usize, usize)], len: usize, pos: usize) -> usize {
+    if pos <= base {
+        return 0;
+    }
+    let mut skipped = 0usize;
+    for &(a, b) in evicted {
+        if b <= pos {
+            skipped += b - a;
+        } else if a < pos {
+            skipped += pos - a;
+        }
+    }
+    (pos - base).saturating_sub(skipped).min(len)
+}
+
+/// Sort and merge half-open intervals; touching ones join.
+fn merge_intervals(mut intervals: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    intervals.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(intervals.len());
+    for (x, y) in intervals {
+        match merged.last_mut() {
+            Some(last) if x <= last.1 => last.1 = last.1.max(y),
+            _ => merged.push((x, y)),
+        }
+    }
+    merged
+}
+
+/// The kernel's gap table for a cache at `base` with `evicted` intervals: gap
+/// `g` begins at the first surviving logical row after its interval, and
+/// `cums[g]` counts every position skipped up to and including it. See
+/// [`crate::models::inkling::flash::Gaps`].
+fn gap_table(base: usize, evicted: &[(usize, usize)]) -> (Vec<u32>, Vec<u32>) {
+    let mut rows = Vec::with_capacity(evicted.len());
+    let mut cums = Vec::with_capacity(evicted.len());
+    let mut cum = 0usize;
+    for &(x, y) in evicted {
+        let row = x - base - cum;
+        cum += y - x;
+        rows.push(row as u32);
+        cums.push(cum as u32);
+    }
+    (rows, cums)
+}
+
+#[cfg(test)]
+mod gap_tests {
+    use super::*;
+
+    #[test]
+    fn gap_table_places_each_gap_at_the_first_surviving_row() {
+        // base 100; keys at 100..110 kept, 110..115 evicted, 115..120 kept,
+        // 120..122 evicted, 122.. kept.
+        let evicted = merge_intervals(vec![(120, 122), (110, 115)]);
+        assert_eq!(evicted, vec![(110, 115), (120, 122)]);
+        let (rows, cums) = gap_table(100, &evicted);
+        assert_eq!(rows, vec![10, 15]);
+        assert_eq!(cums, vec![5, 7]);
+        // Row 10 is position 115 (100 + 10 + 5); row 15 is 122 (100 + 15 + 7).
+        assert_eq!(100 + 10 + cums[0] as usize, 115);
+        assert_eq!(100 + 15 + cums[1] as usize, 122);
+    }
+
+    #[test]
+    fn rows_before_a_position_skips_what_was_evicted() {
+        let evicted = vec![(110, 115), (120, 122)];
+        let len = 20; // rows 0..20 stand at 100..110, 115..120, 122..132
+        assert_eq!(rows_before_position(100, &evicted, len, 100), 0);
+        assert_eq!(rows_before_position(100, &evicted, len, 105), 5);
+        assert_eq!(rows_before_position(100, &evicted, len, 110), 10);
+        assert_eq!(rows_before_position(100, &evicted, len, 113), 10);
+        assert_eq!(rows_before_position(100, &evicted, len, 115), 10);
+        assert_eq!(rows_before_position(100, &evicted, len, 119), 14);
+        assert_eq!(rows_before_position(100, &evicted, len, 122), 15);
+        assert_eq!(rows_before_position(100, &evicted, len, 132), 20);
+        assert_eq!(rows_before_position(100, &evicted, len, 999), 20);
+    }
+
+    #[test]
+    fn touching_and_overlapping_evictions_merge() {
+        assert_eq!(
+            merge_intervals(vec![(5, 8), (8, 10), (1, 3), (9, 12)]),
+            vec![(1, 3), (5, 12)]
+        );
+    }
+}
+
 fn trim<B: Backend>(c: &mut AttnCache<B>, window: Option<usize>) {
     let Some(w) = window else { return };
     let len = c.k.len();
@@ -1671,6 +1855,7 @@ fn attention_prefill_lane(
                         base: 0,
                         lo: 0,
                         hi: tokens,
+                        row0: 0,
                     }],
                     &rel_h,
                     kv_elem,
@@ -1683,6 +1868,7 @@ fn attention_prefill_lane(
                     mask_window,
                     d.scaling(),
                     rows_tile,
+                    None,
                 );
                 parts.push(tensor_of(
                     client.clone(),
@@ -1853,6 +2039,8 @@ fn attention_prefill_lane(
         v_pre: conv_history(v_pre, d.kernel),
         base: 0,
         pending: None,
+        evicted: Vec::new(),
+        gap_dev: None,
     };
     trim(&mut cache, window);
     // AFTER the trim, so a windowed layer's reservation is sized by its window
@@ -2438,9 +2626,18 @@ fn flash_cached(
             base: base + off - head,
             lo: head.saturating_sub(off).min(h.rows),
             hi: (head + len).saturating_sub(off).min(h.rows),
+            row0: off.saturating_sub(head),
         });
         off += h.rows;
     }
+    let gaps = cache
+        .gap_dev
+        .as_ref()
+        .map(|g| crate::models::inkling::flash::Gaps {
+            rows: &g.rows,
+            cums: &g.cums,
+            count: g.count,
+        });
     let out = flash_attention_launch(
         &client,
         &q_h,
@@ -2456,6 +2653,7 @@ fn flash_cached(
         window,
         d.scaling(),
         flash::decode_rows(d.groups()),
+        gaps,
     );
     tensor_of(client, dev.clone(), out, nq, heads * head_dim)
 }
@@ -3958,6 +4156,8 @@ mod tests {
                 v_pre: Tensor::zeros([d.kernel - 1, kv_w], &dev),
                 base: 0,
                 pending: None,
+                evicted: Vec::new(),
+                gap_dev: None,
             };
             let x: Tensor<B, 2> = Tensor::random(
                 [1, d.hidden],

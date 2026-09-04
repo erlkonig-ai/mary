@@ -771,6 +771,11 @@ pub enum Pass {
     /// ([`Group::send_cuts`]); rank 0 joins them back into whole experts.
     /// Not a pass: no collective, and the reply comes back on this socket.
     Export,
+    /// `Session::evict` on every rank: the keys at absolute positions
+    /// `from..to` leave the global layers' caches, the positions around them
+    /// staying exactly what they were. Both ranks must do it in lockstep or
+    /// their halves of every later attention would disagree.
+    Evict { from: usize, to: usize },
 }
 
 impl Pass {
@@ -786,6 +791,7 @@ impl Pass {
     const EXPORT: u8 = 0x0A;
     const AUDIO: u8 = 0x0B;
     const VISION: u8 = 0x0C;
+    const EVICT: u8 = 0x0D;
 
     /// `[tag u8][count u32be][count x u32be ids]`.
     ///
@@ -810,6 +816,7 @@ impl Pass {
             return frame;
         }
         const NONE: &[usize] = &[];
+        let evict_ids: [usize; 2];
         let (tag, ids): (u8, &[usize]) = match self {
             Pass::Prefill(ids) => (Self::PREFILL, ids.as_slice()),
             Pass::Extend(ids) => (Self::EXTEND, ids.as_slice()),
@@ -821,6 +828,10 @@ impl Pass {
             Pass::Finish => (Self::FINISH, NONE),
             Pass::Abort => (Self::ABORT, NONE),
             Pass::Export => (Self::EXPORT, NONE),
+            Pass::Evict { from, to } => {
+                evict_ids = [*from, *to];
+                (Self::EVICT, &evict_ids[..])
+            }
             Pass::Audio { .. } | Pass::Vision { .. } => unreachable!("encoded above"),
         };
         let mut frame = Vec::with_capacity(5 + 4 * ids.len());
@@ -846,6 +857,17 @@ impl Pass {
         Ok(match tag {
             Self::AUDIO | Self::VISION => {
                 anyhow::bail!("a sense frame is read by Group::follow itself")
+            }
+            Self::EVICT => {
+                anyhow::ensure!(
+                    ids.len() == 2,
+                    "an Evict pass carries exactly a from and a to, but {} id(s) arrived",
+                    ids.len()
+                );
+                Pass::Evict {
+                    from: ids[0],
+                    to: ids[1],
+                }
             }
             Self::PREFILL => Pass::Prefill(ids),
             Self::EXTEND => Pass::Extend(ids),
