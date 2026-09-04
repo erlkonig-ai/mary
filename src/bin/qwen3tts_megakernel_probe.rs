@@ -23,7 +23,7 @@
 
 use burn::prelude::*;
 use mary::models::qwen3tts::config::*;
-use mary::models::qwen3tts::megakernel::{self, TalkerEngine};
+use mary::models::qwen3tts::megakernel::{self, EngineBackend, TalkerEngine};
 use mary::models::qwen3tts::talker::Talker;
 use mary::nn::backend::{BFused, BFusedHalf};
 use mary::nn::weight_loader::WeightLoader;
@@ -82,9 +82,7 @@ fn main() {
     let prefill_len = arg("--prefill", 400);
     let steps = arg("--steps", 16);
     let bench = arg("--bench", 50);
-    let max_seq = 2048;
 
-    let dev: <Raw as burn::tensor::backend::BackendTypes>::Device = Default::default();
     // Weights come from the durable qwen3tts pile (same source as qwen3tts_say;
     // pile-vs-safetensors is bit-identical per qwen3tts_pile_test).
     let pile = mary::paths::model(
@@ -97,9 +95,24 @@ fn main() {
     });
     let loader = mary::persist::load_aliased_loader_from_pile(&pile, "talker_f16")
         .unwrap_or_else(|e| panic!("load qwen3tts pile {}: {e:?}", pile.display()));
-    println!("loading talker (raw f32 backend)...");
+    // `--f16`: the half lane (what `mary::speak` runs by default) — the engine
+    // then streams f16 weights; otherwise the f32 raw lane.
+    if flag("--f16") {
+        println!("talker lane: RawHalf (f16 weights)");
+        run::<megakernel::RawHalf>(&loader, prefill_len, steps, bench);
+    } else {
+        println!("talker lane: Raw (f32 weights)");
+        run::<Raw>(&loader, prefill_len, steps, bench);
+    }
+}
+
+/// Parity + bench of the engine against the Burn loop on one talker lane.
+fn run<B: EngineBackend>(loader: &WeightLoader, prefill_len: usize, steps: usize, bench: usize) {
+    let max_seq = 2048;
+    let dev: <B as burn::tensor::backend::BackendTypes>::Device = Default::default();
+    println!("loading talker...");
     let t0 = Instant::now();
-    let talker = Talker::<Raw>::load(&loader, &dev);
+    let talker = Talker::<B>::load(loader, &dev);
     println!("  {:.1}s", t0.elapsed().as_secs_f32());
 
     // ---- prefill (Burn path) --------------------------------------------
@@ -130,7 +143,7 @@ fn main() {
         let row = talker.codec_row(id).to_vec();
 
         // Burn path
-        let e = Tensor::<Raw, 1>::from_floats(row.as_slice(), &dev).reshape([1, 1, TALKER_HIDDEN]);
+        let e = Tensor::<B, 1>::from_floats(row.as_slice(), &dev).reshape([1, 1, TALKER_HIDDEN]);
         let h_ref = talker.last_hidden(talker.forward(e, &mut caches, &dev));
         // engine path
         let h_eng = engine.step(&row);
@@ -178,7 +191,7 @@ fn main() {
     } else {
         println!("  loading talker again on BFused (production baseline)...");
         let fdev: <BFused as burn::tensor::backend::BackendTypes>::Device = Default::default();
-        let ftalker = Talker::<BFused>::load(&loader, &fdev);
+        let ftalker = Talker::<BFused>::load(loader, &fdev);
         let fids = synth_ids(prefill_len, 7);
         let fembeds = ftalker.embed_codec(&fids, &fdev);
         let mut fcaches = ftalker.new_caches();
@@ -216,7 +229,7 @@ fn main() {
             let row = talker.codec_row(id).to_vec();
             let t0 = Instant::now();
             let e =
-                Tensor::<Raw, 1>::from_floats(row.as_slice(), &dev).reshape([1, 1, TALKER_HIDDEN]);
+                Tensor::<B, 1>::from_floats(row.as_slice(), &dev).reshape([1, 1, TALKER_HIDDEN]);
             let h = talker.forward(e, &mut caches, &dev);
             let t1 = t0.elapsed().as_secs_f64();
             let _ = talker.last_hidden(h);
@@ -287,7 +300,7 @@ fn main() {
     if flag("--fused-f16") {
         println!("\nfused-f16 (BFusedHalf, the production talker):");
         let fids = synth_ids(prefill_len, 7);
-        let meds = bench_fused::<BFusedHalf>(&loader, &fids, &step_ids, &bench_ids, rounds);
+        let meds = bench_fused::<BFusedHalf>(loader, &fids, &step_ids, &bench_ids, rounds);
         let mut best = (f64::MAX, f64::MAX);
         for (r, m) in meds.iter().enumerate() {
             println!(
