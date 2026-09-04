@@ -345,8 +345,17 @@ pub enum InklingContext {
         system: String,
         history: Vec<InklingHistoryResponse>,
     },
-    /// Result of the native call already present in the retained KV sequence.
-    ToolResult { result: ExecResultContext },
+    /// Result of the native call already present in the retained KV sequence,
+    /// and whatever was heard while it ran: the result's tool message, then
+    /// the heard record's (the order the world released them), then the
+    /// generation prompt. Hearing rides with a result rather than waiting
+    /// behind it, because a mind that acts every turn would otherwise never
+    /// hear at all.
+    ToolResult {
+        result: ExecResultContext,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        heard: Option<HeardRecord>,
+    },
     /// A complete response which predates this live `InklingMind` (for example
     /// a Drive memory-cover response). Its model parts and optional result are
     /// inserted together.
@@ -362,6 +371,15 @@ pub enum InklingContext {
     /// cannot smuggle the structural markers in. Ends with the generation
     /// prompt, like a tool result: the world spoke, now she thinks.
     Heard { source: String, levels: Vec<u8> },
+}
+
+/// What an ear delivered: `levels` is `frames * DMEL_BINS` dMel levels (each
+/// below `DMEL_LEVELS`, 50 ms a frame), from the faculty named `source`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HeardRecord {
+    pub source: String,
+    pub levels: Vec<u8>,
 }
 
 /// Where a typed context would be placed if its preflight succeeds.
@@ -667,8 +685,11 @@ impl InklingContextCodec {
                 }
                 ids.push(self.special_ids.message_model as usize);
             }
-            InklingContext::ToolResult { result } => {
+            InklingContext::ToolResult { result, heard } => {
                 self.push_tool_result(&mut ids, result)?;
+                if let Some(heard) = heard {
+                    self.push_heard_part(&mut ids, &heard.source, &heard.levels)?;
+                }
                 ids.push(self.special_ids.message_model as usize);
             }
             InklingContext::HistoricalResponse { response } => {
@@ -679,13 +700,7 @@ impl InklingContextCodec {
                 ids.push(self.special_ids.message_model as usize);
             }
             InklingContext::Heard { source, levels } => {
-                let frames = heard_frames(levels)?;
-                ids.push(self.special_ids.message_tool as usize);
-                self.push_content(&mut ids, source)?;
-                ids.push(self.special_ids.content_audio_input as usize);
-                ids.extend(std::iter::repeat_n(self.special_ids.audio_slot as usize, frames));
-                ids.push(self.special_ids.audio_end as usize);
-                ids.push(self.special_ids.end_message as usize);
+                self.push_heard_part(&mut ids, source, levels)?;
                 ids.push(self.special_ids.message_model as usize);
             }
         }
@@ -697,8 +712,24 @@ impl InklingContextCodec {
     pub fn audio_levels(&self, context: &InklingContext) -> Vec<u8> {
         match context {
             InklingContext::Heard { levels, .. } => levels.clone(),
+            InklingContext::ToolResult {
+                heard: Some(heard), ..
+            } => heard.levels.clone(),
             _ => Vec::new(),
         }
+    }
+
+    /// One tool message named `source` whose content part is the template's
+    /// audio part: `content_audio_input`, one slot per frame, `audio_end`.
+    fn push_heard_part(&self, ids: &mut Vec<usize>, source: &str, levels: &[u8]) -> Result<()> {
+        let frames = heard_frames(levels)?;
+        ids.push(self.special_ids.message_tool as usize);
+        self.push_content(ids, source)?;
+        ids.push(self.special_ids.content_audio_input as usize);
+        ids.extend(std::iter::repeat_n(self.special_ids.audio_slot as usize, frames));
+        ids.push(self.special_ids.audio_end as usize);
+        ids.push(self.special_ids.end_message as usize);
+        Ok(())
     }
 
     fn push_historical_response(
