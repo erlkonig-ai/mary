@@ -1111,9 +1111,9 @@ fn fused_engine<B: EngineBackend>(talker: &Talker<B>) -> Option<TalkerEngine> {
     let t = Instant::now();
     let engine = TalkerEngine::new(talker, MAX_SCORES as usize);
     eprintln!(
-        "[timing] talker → fused engine ({} dispatches/frame, {} weights, ring {} positions): {:.2}s",
+        "[timing] talker → fused engine ({} dispatches/frame, {:?} lane, ring {} positions): {:.2}s",
         TalkerEngine::DISPATCHES_PER_STEP,
-        if engine.half_weights() { "f16" } else { "f32" },
+        engine.lane(),
         MAX_SCORES,
         t.elapsed().as_secs_f32()
     );
