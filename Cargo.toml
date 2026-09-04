@@ -153,6 +153,9 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # UNCONDITIONALLY and without the CUDA lane (see the shim in `models/mod.rs`),
 # which is what keeps the turn logic testable where a kernel cannot be compiled.
 inkling-resident = ["inkling-cuda", "tokenizer"]
+# The dMel front end alone -- an FFT and a filterbank, no backend. The ear
+# faculty builds mary with this and nothing else of Inkling.
+dmel = ["dep:rustfft"]
 # CUDA/sm_121 lane for the PersonaPlex realtime stack. Selects cubecl-cuda for
 # the q4 + temporal kernels; deliberately does NOT touch the `burn` dep, since
 # the realtime lane never instantiates a burn backend (RealtimePipeline has no

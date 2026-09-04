@@ -172,6 +172,16 @@ const CONTENT_INVOKE_TOOL_JSON: &str = "<|content_invoke_tool_json|>";
 const CONTENT_MODEL_END_SAMPLING: &str = "<|content_model_end_sampling|>";
 #[cfg(any(feature = "tokenizer", test))]
 const END_MESSAGE: &str = "<|end_message|>";
+/// The dMel audio input, as the shipped template renders an audio content
+/// part: `<|content_audio_input|>`, one placeholder per 50 ms frame, then
+/// `<|audio_end|>` (`processor_config.json`: `audio_bos_token`, `audio_token`).
+const CONTENT_AUDIO_INPUT: &str = "<|content_audio_input|>";
+const AUDIO_SLOT: &str = "<|unused_200053|>";
+const AUDIO_END: &str = "<|audio_end|>";
+/// One dMel frame is this many levels, each below `DMEL_LEVELS`
+/// (`audio_config`: `n_mel_bins`, `mel_vocab_size`).
+pub const DMEL_BINS: usize = 80;
+pub const DMEL_LEVELS: usize = 16;
 
 /// The single tool exposed to Inkling, in the exact compact/sorted JSON shape
 /// produced by the checkpoint's shipped `chat_template.jinja`.
@@ -208,6 +218,10 @@ pub struct InklingSpecialIds {
     pub content_invoke_tool_json: u32,
     pub content_model_end_sampling: u32,
     pub end_message: u32,
+    /// The three the audio input is spelled with; see [`InklingContext::Heard`].
+    pub content_audio_input: u32,
+    pub audio_slot: u32,
+    pub audio_end: u32,
     /// Every added token marked `special` by this tokenizer, including kinds
     /// this minimal vocabulary does not support. Generated unknown specials are
     /// rejected rather than leaked into visible text.
@@ -340,6 +354,14 @@ pub enum InklingContext {
     /// Start another autonomous assistant response after a completed text-only
     /// response. A tool result already carries this prompt itself.
     GenerationPrompt,
+    /// Something was heard: `levels` is `frames * DMEL_BINS` dMel levels
+    /// (each below `DMEL_LEVELS`, 50 ms a frame, from the ear's front end),
+    /// entering the context the way a tool result does -- a tool message
+    /// named `source` whose content part is the template's audio part. The
+    /// levels are numbers inside a typed record and never text, so free text
+    /// cannot smuggle the structural markers in. Ends with the generation
+    /// prompt, like a tool result: the world spoke, now she thinks.
+    Heard { source: String, levels: Vec<u8> },
 }
 
 /// Where a typed context would be placed if its preflight succeeds.
@@ -492,6 +514,19 @@ pub struct InklingContextCodec {
     special_ids: InklingSpecialIds,
 }
 
+/// How many frames `levels` is, refusing a ragged or out-of-range record.
+pub fn heard_frames(levels: &[u8]) -> Result<usize> {
+    anyhow::ensure!(
+        !levels.is_empty() && levels.len() % DMEL_BINS == 0,
+        "a heard record is {DMEL_BINS} dMel levels per frame; {} arrived",
+        levels.len()
+    );
+    if let Some(bad) = levels.iter().find(|&&l| usize::from(l) >= DMEL_LEVELS) {
+        anyhow::bail!("dMel level {bad} is not below {DMEL_LEVELS}");
+    }
+    Ok(levels.len() / DMEL_BINS)
+}
+
 #[cfg(feature = "tokenizer")]
 impl InklingContextCodec {
     /// Build both tokenizer views and resolve every structural id by spelling.
@@ -531,6 +566,9 @@ impl InklingContextCodec {
             content_invoke_tool_json: required(CONTENT_INVOKE_TOOL_JSON)?,
             content_model_end_sampling: required(CONTENT_MODEL_END_SAMPLING)?,
             end_message: required(END_MESSAGE)?,
+            content_audio_input: required(CONTENT_AUDIO_INPUT)?,
+            audio_slot: required(AUDIO_SLOT)?,
+            audio_end: required(AUDIO_END)?,
             all_special,
             decoded_special,
         };
@@ -544,6 +582,9 @@ impl InklingContextCodec {
             special_ids.content_invoke_tool_json,
             special_ids.content_model_end_sampling,
             special_ids.end_message,
+            special_ids.content_audio_input,
+            special_ids.audio_slot,
+            special_ids.audio_end,
         ] {
             anyhow::ensure!(
                 special_ids.is_special(id),
@@ -637,8 +678,27 @@ impl InklingContextCodec {
             InklingContext::GenerationPrompt => {
                 ids.push(self.special_ids.message_model as usize);
             }
+            InklingContext::Heard { source, levels } => {
+                let frames = heard_frames(levels)?;
+                ids.push(self.special_ids.message_tool as usize);
+                self.push_content(&mut ids, source)?;
+                ids.push(self.special_ids.content_audio_input as usize);
+                ids.extend(std::iter::repeat_n(self.special_ids.audio_slot as usize, frames));
+                ids.push(self.special_ids.audio_end as usize);
+                ids.push(self.special_ids.end_message as usize);
+                ids.push(self.special_ids.message_model as usize);
+            }
         }
         Ok(ids)
+    }
+
+    /// The dMel levels a context carries, to stage behind the audio slots
+    /// [`Self::encode`] emitted for it: empty for everything but `Heard`.
+    pub fn audio_levels(&self, context: &InklingContext) -> Vec<u8> {
+        match context {
+            InklingContext::Heard { levels, .. } => levels.clone(),
+            _ => Vec::new(),
+        }
     }
 
     fn push_historical_response(

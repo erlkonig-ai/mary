@@ -508,6 +508,18 @@ impl Group {
             Err(error) => return Err(error).context("read the next pass command"),
         }
         let count = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if header[0] == Pass::AUDIO {
+            let mut slot = [0u8; 4];
+            peer.read_exact(&mut slot)
+                .context("read an audio frame's slot id")?;
+            let mut levels = vec![0u8; count];
+            peer.read_exact(&mut levels)
+                .context("read an audio frame's dMel levels")?;
+            return Ok(Pass::Audio {
+                slot: u32::from_be_bytes(slot) as usize,
+                levels,
+            });
+        }
         let mut ids = Vec::with_capacity(count);
         let mut word = [0u8; 4];
         for _ in 0..count {
@@ -699,6 +711,10 @@ pub enum Pass {
     Finish,
     /// Rank 0 failed terminally. Stop now rather than wait in a collective.
     Abort,
+    /// `Session::push_audio` on every rank before the next pass: the dMel
+    /// levels behind that pass's audio slot ids, one frame after another. Not
+    /// a pass and not a collective; it carries the bytes the ids alone do not.
+    Audio { slot: usize, levels: Vec<u8> },
     /// Every rank sends rank 0 its cut of every expert the learner has moved
     /// ([`Group::send_cuts`]); rank 0 joins them back into whole experts.
     /// Not a pass: no collective, and the reply comes back on this socket.
@@ -716,6 +732,7 @@ impl Pass {
     const PREFILL_SCORED: u8 = 0x08;
     const EXTEND_SCORED: u8 = 0x09;
     const EXPORT: u8 = 0x0A;
+    const AUDIO: u8 = 0x0B;
 
     /// `[tag u8][count u32be][count x u32be ids]`.
     ///
@@ -724,6 +741,16 @@ impl Pass {
     /// generated token after the first costs — is NINE bytes: one tag, one
     /// u32be count, one u32be id.
     fn encode(&self) -> Vec<u8> {
+        // `[tag][count u32be][slot u32be][count bytes]`: the count is the
+        // byte count here, and the reader knows the tag before it reads on.
+        if let Pass::Audio { slot, levels } = self {
+            let mut frame = Vec::with_capacity(9 + levels.len());
+            frame.push(Self::AUDIO);
+            frame.extend_from_slice(&(levels.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&(*slot as u32).to_be_bytes());
+            frame.extend_from_slice(levels);
+            return frame;
+        }
         const NONE: &[usize] = &[];
         let (tag, ids): (u8, &[usize]) = match self {
             Pass::Prefill(ids) => (Self::PREFILL, ids.as_slice()),
@@ -736,6 +763,7 @@ impl Pass {
             Pass::Finish => (Self::FINISH, NONE),
             Pass::Abort => (Self::ABORT, NONE),
             Pass::Export => (Self::EXPORT, NONE),
+            Pass::Audio { .. } => unreachable!("encoded above"),
         };
         let mut frame = Vec::with_capacity(5 + 4 * ids.len());
         frame.push(tag);
@@ -758,6 +786,7 @@ impl Pass {
             Ok(())
         }
         Ok(match tag {
+            Self::AUDIO => anyhow::bail!("an Audio frame is read by Group::follow itself"),
             Self::PREFILL => Pass::Prefill(ids),
             Self::EXTEND => Pass::Extend(ids),
             Self::PREFILL_SCORED => Pass::PrefillScored(ids),

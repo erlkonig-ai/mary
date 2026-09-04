@@ -117,7 +117,7 @@ use super::config::{AttnKind, InklingConfig};
 use super::pile::Elem;
 use super::pool::{CleanupGate, CleanupPolicy};
 use super::source::Weights;
-use super::stack::embed_and_norm_bf16;
+use super::stack::{embed_and_norm_bf16, embed_row_bf16};
 use super::target::{
     Boundary as TargetBoundary, DEFAULT_TARGET_BUDGET, PrefixCache, Settlement as TargetSettlement,
     WidthAdmission as TargetWidthAdmission,
@@ -359,6 +359,11 @@ pub struct Session {
     embed: Vec<u8>,
     /// The embedding norm's gain, on the host: the embed is a host gather.
     embed_norm: Vec<f32>,
+    /// The dMel input: the 1,280-row table as the BF16 the pile stores, its
+    /// norm gain, and the levels staged for the next pass. Loaded beside the
+    /// embedding, on the same rank, for the same reason: an audio row is an
+    /// embedding row that happens to be a sum of eighty. See [`Self::push_audio`].
+    audio: Option<AudioInput>,
     /// The final norm's gain, uploaded once.
     final_norm: BT<Bk, 1>,
     /// The unembedding, bound W4A16 — the weight stays four bits and the
@@ -951,6 +956,7 @@ impl Session {
             leaf.bytes.to_vec()
         };
         let embed_norm = src.held("model.llm.embed_norm.weight")?.data.clone();
+        let audio = AudioInput::load(&src, &conf);
 
         let (final_norm, unembed, learner) = {
             let fnorm = src.held("model.llm.norm.weight")?;
@@ -1057,6 +1063,7 @@ impl Session {
             shared_halved: super::load::shared_w13_halved(),
             embed,
             embed_norm,
+            audio,
             final_norm,
             unembed,
             #[cfg(feature = "inkling-cuda")]
@@ -1432,6 +1439,9 @@ impl Session {
         self.caches.clear();
         self.pos = 0;
         self.last = None;
+        if let Some(audio) = &mut self.audio {
+            audio.pending.clear();
+        }
         // Throwing the caches away is what un-tears a torn session: there is
         // nothing left for the layers to disagree about.
         self.torn = false;
@@ -1796,6 +1806,7 @@ impl Session {
              anything. `reset` to start over, or `rewind` to a checkpoint taken before the \
              failure -- which restores every layer from one instant and is a real repair."
         );
+        self.check_audio(ids)?;
         // Everything from here MUTATES, and the mutation is per layer. An error
         // out of the loop below leaves the stack half advanced, which no
         // caller can detect and none should have to; poison the session and
@@ -1856,6 +1867,12 @@ impl Session {
             t.vocab_size,
             h,
         );
+        // Every audio slot in the pass takes the next staged dMel frame's row
+        // instead of the placeholder's text row.
+        let x_in = match self.audio.as_mut() {
+            Some(audio) => audio_rows(audio, ids, x_in, h)?,
+            None => x_in,
+        };
         let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &self.dev));
 
         // Read once per pass, exactly as the binary does: `RouterArm::from_env`
@@ -2579,5 +2596,168 @@ mod tests {
                 .to_string();
             assert!(err.contains("every rank runs every layer"), "{err}");
         }
+    }
+}
+
+// ── hearing: the dMel rows ──────────────────────────────────────────────────
+
+/// The Session's dMel input side; see [`Session::push_audio`].
+struct AudioInput {
+    /// `[bins * levels, hidden]` BF16: bin `b`'s codebook is rows
+    /// `b * levels .. (b + 1) * levels`, as the reference's index arithmetic
+    /// (`code + arange(bins) * levels`) says.
+    table: Vec<u8>,
+    /// The audio module's own final norm gain (`model.audio.final_norm.weight`).
+    norm: Vec<f32>,
+    bins: usize,
+    levels: usize,
+    /// Levels staged for the next pass, `bins` per frame, taken in order.
+    pending: std::collections::VecDeque<u8>,
+    /// The placeholder id the frames stand behind, fixed at the first push.
+    slot: Option<usize>,
+}
+
+impl AudioInput {
+    /// Absent, with a line to say so, when the pile carries no audio table:
+    /// a mind that cannot hear still serves text.
+    fn load(src: &Weights, cfg: &InklingConfig) -> Option<Self> {
+        let a = &cfg.audio_config;
+        let table = match src.stored("model.audio.encoder.weight") {
+            Ok(leaf) if leaf.elem == Elem::Bf16 => leaf.bytes.to_vec(),
+            Ok(leaf) => {
+                eprintln!(
+                    "inkling: model.audio.encoder.weight is {:?}, not the BF16 this lane reads; \
+                     no hearing",
+                    leaf.elem
+                );
+                return None;
+            }
+            Err(error) => {
+                eprintln!("inkling: no dMel table in this pile ({error:#}); no hearing");
+                return None;
+            }
+        };
+        let norm = match src.held("model.audio.final_norm.weight") {
+            Ok(held) => held.data.clone(),
+            Err(error) => {
+                eprintln!("inkling: no audio final norm in this pile ({error:#}); no hearing");
+                return None;
+            }
+        };
+        let hidden = cfg.text_config.hidden_size;
+        if table.len() != a.encoder_rows() * hidden * 2 || norm.len() != hidden {
+            eprintln!(
+                "inkling: the dMel table is {} bytes and its norm {} wide; expected {} rows of {} \
+                 BF16; no hearing",
+                table.len(),
+                norm.len(),
+                a.encoder_rows(),
+                hidden
+            );
+            return None;
+        }
+        Some(Self {
+            table,
+            norm,
+            bins: a.n_mel_bins,
+            levels: a.mel_vocab_size,
+            pending: std::collections::VecDeque::new(),
+            slot: None,
+        })
+    }
+
+    /// One frame's row: the sum of its `bins` codebook rows, RMS-normed with
+    /// the audio norm at the module's own eps (1e-6), and NOT embed-normed --
+    /// the reference folds `embed_norm` into the text table alone.
+    fn row(&self, frame: &[u8], hidden: usize) -> Vec<f32> {
+        let mut out = vec![0f32; hidden];
+        let vocab = self.bins * self.levels;
+        for (b, &lvl) in frame.iter().enumerate() {
+            let r = embed_row_bf16(&self.table, b * self.levels + usize::from(lvl), vocab, hidden);
+            for (o, v) in out.iter_mut().zip(&r) {
+                *o += v;
+            }
+        }
+        super::block::rms_norm(&out, &self.norm, 1e-6, 1, hidden)
+    }
+}
+
+/// Replace the row of every audio slot in `ids` with the next staged frame's.
+fn audio_rows(audio: &mut AudioInput, ids: &[usize], mut x: Vec<f32>, hidden: usize) -> Result<Vec<f32>> {
+    let Some(slot) = audio.slot else {
+        return Ok(x);
+    };
+    let mut frame = vec![0u8; audio.bins];
+    for (i, &id) in ids.iter().enumerate() {
+        if id != slot {
+            continue;
+        }
+        anyhow::ensure!(
+            audio.pending.len() >= audio.bins,
+            "audio slot at row {i} has no staged dMel frame behind it"
+        );
+        for l in frame.iter_mut() {
+            *l = audio.pending.pop_front().expect("length checked");
+        }
+        x[i * hidden..(i + 1) * hidden].copy_from_slice(&audio.row(&frame, hidden));
+    }
+    Ok(x)
+}
+
+impl Session {
+    /// Stage the dMel levels behind the audio slots of the NEXT pass.
+    ///
+    /// `levels` is `frames * bins` entries, each below the table's level count;
+    /// the pass that follows must contain exactly `frames` ids equal to `slot`,
+    /// and each takes the next frame in order. A pass whose slot count disagrees
+    /// with what is staged is refused before it touches a layer, so nothing
+    /// tears. Under tensor parallelism every rank stages the same frames: the
+    /// leader sends them over the rank link ahead of the pass.
+    pub fn push_audio(&mut self, slot: usize, levels: &[u8]) -> Result<()> {
+        let audio = self.audio.as_mut().context(
+            "this Session loaded no dMel table (model.audio.encoder.weight), so it cannot hear",
+        )?;
+        anyhow::ensure!(
+            !levels.is_empty() && levels.len() % audio.bins == 0,
+            "dMel levels come {} per frame; {} arrived",
+            audio.bins,
+            levels.len()
+        );
+        if let Some(&bad) = levels.iter().find(|&&l| usize::from(l) >= audio.levels) {
+            anyhow::bail!("dMel level {bad} is not below {}", audio.levels);
+        }
+        if let Some(prev) = audio.slot {
+            anyhow::ensure!(
+                prev == slot,
+                "the audio slot id changed from {prev} to {slot} within one Session"
+            );
+        }
+        audio.slot = Some(slot);
+        audio.pending.extend(levels.iter().copied());
+        Ok(())
+    }
+
+    /// Whether this Session can take audio at all.
+    pub fn hears(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    /// The pass's audio slots must match what is staged, exactly, before
+    /// anything mutates.
+    fn check_audio(&self, ids: &[usize]) -> Result<()> {
+        let Some(audio) = &self.audio else {
+            return Ok(());
+        };
+        let staged = audio.pending.len() / audio.bins;
+        let slots = match audio.slot {
+            Some(slot) => ids.iter().filter(|&&id| id == slot).count(),
+            None => 0,
+        };
+        anyhow::ensure!(
+            staged == slots,
+            "this pass has {slots} audio slot id(s) and {staged} dMel frame(s) staged for them; \
+             push_audio exactly what the pass consumes"
+        );
+        Ok(())
     }
 }

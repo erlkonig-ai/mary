@@ -67,6 +67,11 @@ pub mod inkling {
     #[path = "resident.rs"]
     pub mod resident;
 
+    // The dMel front end is a tokenizer and runs where the microphone is.
+    #[cfg(feature = "dmel")]
+    #[path = "dmel.rs"]
+    pub mod dmel;
+
     // Native READY/TurnEnd evidence, in the same reconstructed module as
     // `resident` for the same reason: durable turn exhaust is a fact about a
     // turn, not about a kernel.

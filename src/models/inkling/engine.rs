@@ -125,6 +125,9 @@ pub struct Engine {
     context_budget: usize,
     /// Context tokenized and waiting for the next consult to attend to it.
     delta: Vec<usize>,
+    /// The dMel levels behind the audio slots in `delta`, in order; staged
+    /// into every rank's Session ahead of the pass that consumes them.
+    delta_audio: Vec<u8>,
     /// The token the previous turn EMITTED and never fed back, waiting for the
     /// next pass to put it in the cache. `None` is also "no turn has run yet",
     /// which is the same fact as "nothing is prefilled".
@@ -348,6 +351,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         ready,
         context_budget,
         delta: Vec::new(),
+        delta_audio: Vec::new(),
         carry: None,
         turn: 0,
         digest: blake3::Hasher::new(),
@@ -436,6 +440,11 @@ impl Follower {
                         .extend_scored(&ids)
                         .context("extend and score this rank's sequence")?;
                     self.fold(token);
+                }
+                Pass::Audio { slot, levels } => {
+                    self.session
+                        .push_audio(slot, &levels)
+                        .context("stage this rank's dMel frames")?;
                 }
                 Pass::Step => {
                     let token = self.session.step().context("advance one token")?;
@@ -650,6 +659,19 @@ impl Engine {
         on_token: &mut dyn FnMut(&str) -> Result<()>,
     ) -> Result<TurnEnd> {
         let delta_ids = std::mem::take(&mut self.delta);
+        // The frames go to every rank BEFORE the pass that consumes them, on
+        // the same link and in order, so the follower stages them first too.
+        let delta_audio = std::mem::take(&mut self.delta_audio);
+        if !delta_audio.is_empty() {
+            let slot = self.codec.special_ids().audio_slot as usize;
+            self.lead(&Pass::Audio {
+                slot,
+                levels: delta_audio.clone(),
+            })?;
+            self.session
+                .push_audio(slot, &delta_audio)
+                .context("stage the delta's dMel frames")?;
+        }
         // Context participates in decoding even though it is not speech.
         // Advancing and discarding here makes the next generated id see its
         // real predecessor without ever echoing a tool result. `carry` is
@@ -774,6 +796,7 @@ impl Model for Engine {
             .encode(context)
             .context("encode typed Inkling context")?;
         self.delta.extend(ids);
+        self.delta_audio.extend(self.codec.audio_levels(context));
         Ok(())
     }
 
@@ -839,6 +862,7 @@ impl Model for Engine {
         // state.
         self.decode = detokenizer(self.tokenizer);
         self.delta = replacement;
+        self.delta_audio.clear();
         self.carry = None;
         self.turn = 0;
 

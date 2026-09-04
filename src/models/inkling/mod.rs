@@ -22,6 +22,8 @@ pub mod attn;
 pub mod block;
 pub mod burn;
 pub mod config;
+#[cfg(feature = "dmel")]
+pub mod dmel;
 // The NVFP4 ACTIVATION quantiser, on the device. The routed-expert lane calls
 // it twice per expert; there is no host twin in the data plane to select
 // between, so there is nothing to gate.
