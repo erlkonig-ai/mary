@@ -71,6 +71,7 @@ pub mod inkling {
     #[cfg(feature = "dmel")]
     #[path = "dmel.rs"]
     pub mod dmel;
+    pub mod patches;
 
     // Native READY/TurnEnd evidence, in the same reconstructed module as
     // `resident` for the same reason: durable turn exhaust is a fact about a

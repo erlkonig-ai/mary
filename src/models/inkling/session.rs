@@ -364,6 +364,10 @@ pub struct Session {
     /// embedding, on the same rank, for the same reason: an audio row is an
     /// embedding row that happens to be a sum of eighty. See [`Self::push_audio`].
     audio: Option<AudioInput>,
+    /// The patch input: the HMLP pyramid on the device and the patches staged
+    /// for the next pass. An image row is model math -- four projections --
+    /// so unlike the dMel sum it runs on the device; see [`Self::push_vision`].
+    vision: Option<VisionInput>,
     /// The final norm's gain, uploaded once.
     final_norm: BT<Bk, 1>,
     /// The unembedding, bound W4A16 — the weight stays four bits and the
@@ -960,6 +964,7 @@ impl Session {
         };
         let embed_norm = src.held("model.llm.embed_norm.weight")?.data.clone();
         let audio = AudioInput::load(&src, &conf);
+        let vision = VisionInput::load(&src, &conf, &dev);
 
         let (final_norm, unembed, learner) = {
             let fnorm = src.held("model.llm.norm.weight")?;
@@ -1067,6 +1072,7 @@ impl Session {
             embed,
             embed_norm,
             audio,
+            vision,
             final_norm,
             unembed,
             #[cfg(feature = "inkling-cuda")]
@@ -1444,7 +1450,10 @@ impl Session {
         self.pos = 0;
         self.last = None;
         if let Some(audio) = &mut self.audio {
-            audio.pending.clear();
+            audio.queue.pending.clear();
+        }
+        if let Some(vision) = &mut self.vision {
+            vision.queue.pending.clear();
         }
         // Throwing the caches away is what un-tears a torn session: there is
         // nothing left for the layers to disagree about.
@@ -1615,7 +1624,7 @@ impl Session {
         for chunk in ids.chunks(self.prefill_budget) {
             out = self.forward(chunk)?;
         }
-        self.audio_drained()?;
+        self.senses_drained()?;
         Ok(out)
     }
 
@@ -1634,7 +1643,7 @@ impl Session {
         );
         anyhow::ensure!(!ids.is_empty(), "a prefill with no tokens would be vacuous");
         let out = self.chunked_scored(ids, self.prefill_budget)?;
-        self.audio_drained()?;
+        self.senses_drained()?;
         Ok(out)
     }
 
@@ -1651,7 +1660,7 @@ impl Session {
             true => self.chunked_scored(ids, self.prefill_budget)?,
             false => self.chunked_scored(ids, self.extend_batch)?,
         };
-        self.audio_drained()?;
+        self.senses_drained()?;
         Ok(out)
     }
 
@@ -1749,7 +1758,7 @@ impl Session {
         if self.caches.is_empty() {
             // Nothing cached yet: this IS a prefill, and a prefill batches.
             let out = self.forward(ids)?;
-            self.audio_drained()?;
+            self.senses_drained()?;
             return Ok(out);
         }
         let mut out = 0;
@@ -1760,7 +1769,7 @@ impl Session {
         for chunk in ids.chunks(self.extend_batch) {
             out = self.forward(chunk)?;
         }
-        self.audio_drained()?;
+        self.senses_drained()?;
         Ok(out)
     }
 
@@ -1818,7 +1827,7 @@ impl Session {
              anything. `reset` to start over, or `rewind` to a checkpoint taken before the \
              failure -- which restores every layer from one instant and is a real repair."
         );
-        self.check_audio(ids)?;
+        self.check_senses(ids)?;
         // Everything from here MUTATES, and the mutation is per layer. An error
         // out of the loop below leaves the stack half advanced, which no
         // caller can detect and none should have to; poison the session and
@@ -1883,6 +1892,12 @@ impl Session {
         // instead of the placeholder's text row.
         let x_in = match self.audio.as_mut() {
             Some(audio) => audio_rows(audio, ids, x_in, h)?,
+            None => x_in,
+        };
+        // And every image slot takes the next staged patch's row, computed on
+        // the device by the vision pyramid and read back into the same input.
+        let x_in = match self.vision.as_mut() {
+            Some(vision) => vision_rows(vision, ids, x_in, h, dev)?,
             None => x_in,
         };
         let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &self.dev));
@@ -2267,14 +2282,16 @@ impl Session {
                 // slice also yields the committed token.
                 let mut targets: Vec<usize> = ids[1..].to_vec();
                 targets.extend(next);
-                // A row whose target is the audio slot is not scored and not
-                // learned from: every audio frame stands behind the same
-                // placeholder id, so its "next token" is free to predict and
+                // A row whose target is a sense placeholder is not scored and
+                // not learned from: every frame and every patch stands behind
+                // the same id, so its "next token" is free to predict and
                 // means nothing. Those rows read NaN in the score.
-                let skip: Vec<bool> = match self.audio.as_ref().and_then(|a| a.slot) {
-                    Some(slot) => targets.iter().map(|&t| t == slot).collect(),
-                    None => vec![false; targets.len()],
-                };
+                let audio_slot = self.audio.as_ref().and_then(|a| a.queue.slot);
+                let image_slot = self.vision.as_ref().and_then(|v| v.queue.slot);
+                let skip: Vec<bool> = targets
+                    .iter()
+                    .map(|&t| Some(t) == audio_slot || Some(t) == image_slot)
+                    .collect();
                 let mut nll = Vec::with_capacity(targets.len());
                 let mut best = None;
                 let mut lo = 0;
@@ -2634,7 +2651,97 @@ mod tests {
     }
 }
 
-// ── hearing: the dMel rows ──────────────────────────────────────────────────
+// ── the senses: dMel rows and patch rows ────────────────────────────────────
+
+/// What a sense stages behind its placeholder slots: `unit` bytes per slot,
+/// taken in order by the passes that carry the slot id. One per medium; the
+/// accounting is the same for both, and it is what keeps a pass from tearing:
+/// a pass may take at most what is staged, and the whole delta must drain it.
+struct SlotQueue {
+    what: &'static str,
+    unit: usize,
+    pending: std::collections::VecDeque<u8>,
+    /// The placeholder id the units stand behind, fixed at the first push.
+    slot: Option<usize>,
+}
+
+impl SlotQueue {
+    fn new(what: &'static str, unit: usize) -> Self {
+        Self {
+            what,
+            unit,
+            pending: std::collections::VecDeque::new(),
+            slot: None,
+        }
+    }
+
+    fn stage(&mut self, slot: usize, bytes: &[u8]) -> Result<()> {
+        anyhow::ensure!(
+            !bytes.is_empty() && bytes.len() % self.unit == 0,
+            "{} come {} bytes per slot; {} arrived",
+            self.what,
+            self.unit,
+            bytes.len()
+        );
+        if let Some(prev) = self.slot {
+            anyhow::ensure!(
+                prev == slot,
+                "the {} slot id changed from {prev} to {slot} within one Session",
+                self.what
+            );
+        }
+        self.slot = Some(slot);
+        self.pending.extend(bytes.iter().copied());
+        Ok(())
+    }
+
+    fn staged(&self) -> usize {
+        self.pending.len() / self.unit
+    }
+
+    fn slots_in(&self, ids: &[usize]) -> usize {
+        match self.slot {
+            Some(slot) => ids.iter().filter(|&&id| id == slot).count(),
+            None => 0,
+        }
+    }
+
+    /// A delta is split into passes of `extend_batch` rows, so one pass may
+    /// meet none of the slots while units wait for a later one; a pass may
+    /// never need MORE than is staged. Whether everything staged was taken
+    /// is checked once the whole delta is in ([`Self::drained`]).
+    fn check(&self, ids: &[usize]) -> Result<()> {
+        let (slots, staged) = (self.slots_in(ids), self.staged());
+        anyhow::ensure!(
+            slots <= staged,
+            "this pass has {slots} {} slot id(s) but only {staged} staged; stage what the \
+             pass consumes before it",
+            self.what
+        );
+        Ok(())
+    }
+
+    /// The next `n` units, in order; the caller has checked they are there.
+    fn take(&mut self, n: usize) -> Vec<u8> {
+        self.pending.drain(..n * self.unit).collect()
+    }
+
+    /// After a whole delta: every staged unit must have found its slot.
+    /// Leftovers are dropped so they cannot land under the NEXT delta's
+    /// slots, and the disagreement is reported.
+    fn drained(&mut self) -> Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let left = self.staged();
+        self.pending.clear();
+        anyhow::bail!(
+            "{left} {} were staged and no slot in the delta consumed them; the units and the \
+             ids disagree",
+            self.what
+        )
+    }
+}
 
 /// The Session's dMel input side; see [`Session::push_audio`].
 struct AudioInput {
@@ -2646,10 +2753,8 @@ struct AudioInput {
     norm: Vec<f32>,
     bins: usize,
     levels: usize,
-    /// Levels staged for the next pass, `bins` per frame, taken in order.
-    pending: std::collections::VecDeque<u8>,
-    /// The placeholder id the frames stand behind, fixed at the first push.
-    slot: Option<usize>,
+    /// Frames staged for the next pass, `bins` levels each.
+    queue: SlotQueue,
 }
 
 impl AudioInput {
@@ -2696,8 +2801,7 @@ impl AudioInput {
             norm,
             bins: a.n_mel_bins,
             levels: a.mel_vocab_size,
-            pending: std::collections::VecDeque::new(),
-            slot: None,
+            queue: SlotQueue::new("dMel frames", a.n_mel_bins),
         })
     }
 
@@ -2719,22 +2823,202 @@ impl AudioInput {
 
 /// Replace the row of every audio slot in `ids` with the next staged frame's.
 fn audio_rows(audio: &mut AudioInput, ids: &[usize], mut x: Vec<f32>, hidden: usize) -> Result<Vec<f32>> {
-    let Some(slot) = audio.slot else {
+    let Some(slot) = audio.queue.slot else {
         return Ok(x);
     };
-    let mut frame = vec![0u8; audio.bins];
     for (i, &id) in ids.iter().enumerate() {
         if id != slot {
             continue;
         }
         anyhow::ensure!(
-            audio.pending.len() >= audio.bins,
+            audio.queue.staged() >= 1,
             "audio slot at row {i} has no staged dMel frame behind it"
         );
-        for l in frame.iter_mut() {
-            *l = audio.pending.pop_front().expect("length checked");
-        }
+        let frame = audio.queue.take(1);
         x[i * hidden..(i + 1) * hidden].copy_from_slice(&audio.row(&frame, hidden));
+    }
+    Ok(x)
+}
+
+/// One stage of the vision pyramid on the device: fold, project, and --
+/// except on the last -- norm then GELU. The projection is held transposed,
+/// `[in, out]`, so a stage is one `matmul`.
+struct VisionDevStage {
+    t_fold: usize,
+    hw_fold: usize,
+    in_dim: usize,
+    out_dim: usize,
+    w_t: BT<Bk, 2>,
+    norm: Option<BT<Bk, 1>>,
+}
+
+/// The Session's patch input side; see [`Session::push_vision`].
+///
+/// The pyramid is `super::vision`'s plan -- the same `plan_out_scales` and
+/// `vision_stages` the f32 reference lane derives its shapes from -- with the
+/// projections uploaded once as f32 (about 240 MB) and every fold done by
+/// reshape and permute on the device, exactly as the reference's
+/// `fold_timespace_to_depth` orders the axes.
+struct VisionInput {
+    stages: Vec<VisionDevStage>,
+    final_norm: BT<Bk, 1>,
+    /// The grid one patch starts as: `(temporal, patch, patch, channels)`.
+    grid: (usize, usize, usize, usize),
+    eps: f64,
+    /// Patches staged for the next pass, `PATCH_BYTES` each.
+    queue: SlotQueue,
+}
+
+impl VisionInput {
+    /// Absent, with a line to say so, when the pile carries no vision
+    /// pyramid: a mind that cannot see still serves text.
+    fn load(src: &Weights, cfg: &InklingConfig, dev: &burn::backend::cuda::CudaDevice) -> Option<Self> {
+        use super::patches::{CHANNELS, PATCH, PATCH_BYTES, TEMPORAL};
+        use super::vision::{plan_out_scales, vision_stages};
+        let vc = &cfg.vision_config;
+        let hidden = cfg.text_config.hidden_size;
+        if (vc.temporal_patch_size, vc.patch_size, vc.n_channels) != (TEMPORAL, PATCH, CHANNELS)
+            || vc.decoder_dmodel != hidden
+        {
+            eprintln!(
+                "inkling: the vision config (temporal {}, patch {}, channels {}, decoder {}) is not \
+                 the geometry the patch front end cuts ({TEMPORAL}, {PATCH}, {CHANNELS}, {hidden}); \
+                 no sight",
+                vc.temporal_patch_size, vc.patch_size, vc.n_channels, vc.decoder_dmodel
+            );
+            return None;
+        }
+        let scales = plan_out_scales(vc.temporal_patch_size, vc.patch_size, vc.n_layers, vc.n_channels);
+        let plan = vision_stages(&scales, vc.n_layers, hidden);
+        let mut stages = Vec::with_capacity(plan.len());
+        for (i, st) in plan.iter().enumerate() {
+            let w = match src.tensor(&format!("model.visual.layers.linear_{i}.weight")) {
+                Ok(w) => w,
+                Err(error) => {
+                    eprintln!("inkling: no vision projection {i} in this pile ({error:#}); no sight");
+                    return None;
+                }
+            };
+            if w.data.len() != st.output_dim * st.input_dim {
+                eprintln!(
+                    "inkling: vision projection {i} is {} values, not [{}, {}]; no sight",
+                    w.data.len(),
+                    st.output_dim,
+                    st.input_dim
+                );
+                return None;
+            }
+            let w_t = up2::<Bk>(w.data, st.output_dim, st.input_dim, dev).transpose();
+            let norm = if st.add_norm {
+                match src.held(&format!("model.visual.layers.norm_{i}.weight")) {
+                    Ok(g) if g.data.len() == st.output_dim => Some(up1r::<Bk>(&g.data, st.output_dim, dev)),
+                    Ok(g) => {
+                        eprintln!("inkling: vision norm {i} is {} wide, not {}; no sight", g.data.len(), st.output_dim);
+                        return None;
+                    }
+                    Err(error) => {
+                        eprintln!("inkling: no vision norm {i} in this pile ({error:#}); no sight");
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            stages.push(VisionDevStage {
+                t_fold: st.t_fold,
+                hw_fold: st.hw_fold,
+                in_dim: st.input_dim,
+                out_dim: st.output_dim,
+                w_t,
+                norm,
+            });
+        }
+        let final_norm = match src.held("model.visual.final_norm.weight") {
+            Ok(g) if g.data.len() == hidden => up1r::<Bk>(&g.data, hidden, dev),
+            Ok(g) => {
+                eprintln!("inkling: the vision final norm is {} wide, not {hidden}; no sight", g.data.len());
+                return None;
+            }
+            Err(error) => {
+                eprintln!("inkling: no vision final norm in this pile ({error:#}); no sight");
+                return None;
+            }
+        };
+        Some(Self {
+            stages,
+            final_norm,
+            grid: (vc.temporal_patch_size, vc.patch_size, vc.patch_size, vc.n_channels),
+            // `InklingRMSNorm`'s default, which is what the pyramid constructs.
+            eps: 1e-6,
+            queue: SlotQueue::new("patches", PATCH_BYTES),
+        })
+    }
+
+    /// `n` patches' rows, `[n, hidden]` row-major, through the pyramid on the
+    /// device and read back once: `patches` is `n * PATCH_VALUES` f32s in the
+    /// front end's `[t][y][x][c]` order.
+    fn rows(&self, patches: Vec<f32>, n: usize, hidden: usize, dev: &burn::backend::cuda::CudaDevice) -> Vec<f32> {
+        let (t0, h0, w0, c0) = self.grid;
+        assert_eq!(patches.len(), n * t0 * h0 * w0 * c0);
+        let (mut t, mut hh, mut ww, mut c) = (t0, h0, w0, c0);
+        let mut x: BT<Bk, 2> = up2::<Bk>(patches, n * t * hh * ww, c, dev);
+        for st in &self.stages {
+            if st.t_fold > 1 || st.hw_fold > 1 {
+                let (tn, hn, wn) = (t / st.t_fold, hh / st.hw_fold, ww / st.hw_fold);
+                let folded: BT<Bk, 7> = x
+                    .reshape([n * tn, st.t_fold, hn, st.hw_fold, wn, st.hw_fold, c])
+                    .permute([0, 2, 4, 1, 3, 5, 6]);
+                c *= st.t_fold * st.hw_fold * st.hw_fold;
+                x = folded.reshape([n * tn * hn * wn, c]);
+                (t, hh, ww) = (tn, hn, wn);
+            }
+            assert_eq!(c, st.in_dim, "vision stage input width");
+            x = x.matmul(st.w_t.clone());
+            c = st.out_dim;
+            if let Some(g) = &st.norm {
+                x = burn::tensor::activation::gelu(rms_norm_dev(x, g, self.eps));
+            }
+        }
+        assert_eq!((t, hh, ww, c), (1, 1, 1, hidden), "the pyramid ends at one row per patch");
+        let out = rms_norm_dev(x, &self.final_norm, self.eps);
+        out.into_data().to_vec::<f32>().expect("vision rows read back")
+    }
+}
+
+/// RMS norm over the last axis of `[rows, d]`, the reference's formula
+/// (`x * rsqrt(mean(x^2) + eps) * gain`), in f32 on the device.
+fn rms_norm_dev(x: BT<Bk, 2>, gain: &BT<Bk, 1>, eps: f64) -> BT<Bk, 2> {
+    let scale = x.clone().powf_scalar(2.0).mean_dim(1).add_scalar(eps as f32).sqrt().recip();
+    x.mul(scale).mul(gain.clone().unsqueeze())
+}
+
+/// Replace the row of every image slot in `ids` with the next staged patch's,
+/// all of this pass's patches through the pyramid in one device forward.
+fn vision_rows(
+    vision: &mut VisionInput,
+    ids: &[usize],
+    mut x: Vec<f32>,
+    hidden: usize,
+    dev: &burn::backend::cuda::CudaDevice,
+) -> Result<Vec<f32>> {
+    let Some(slot) = vision.queue.slot else {
+        return Ok(x);
+    };
+    let at: Vec<usize> = ids.iter().enumerate().filter(|&(_, &id)| id == slot).map(|(i, _)| i).collect();
+    if at.is_empty() {
+        return Ok(x);
+    }
+    anyhow::ensure!(
+        vision.queue.staged() >= at.len(),
+        "{} image slots in this pass but only {} patch(es) staged",
+        at.len(),
+        vision.queue.staged()
+    );
+    let bytes = vision.queue.take(at.len());
+    let patches = super::patches::from_bytes(&bytes)?;
+    let rows = vision.rows(patches, at.len(), hidden, dev);
+    for (k, &i) in at.iter().enumerate() {
+        x[i * hidden..(i + 1) * hidden].copy_from_slice(&rows[k * hidden..(k + 1) * hidden]);
     }
     Ok(x)
 }
@@ -2752,24 +3036,20 @@ impl Session {
         let audio = self.audio.as_mut().context(
             "this Session loaded no dMel table (model.audio.encoder.weight), so it cannot hear",
         )?;
-        anyhow::ensure!(
-            !levels.is_empty() && levels.len() % audio.bins == 0,
-            "dMel levels come {} per frame; {} arrived",
-            audio.bins,
-            levels.len()
-        );
         if let Some(&bad) = levels.iter().find(|&&l| usize::from(l) >= audio.levels) {
             anyhow::bail!("dMel level {bad} is not below {}", audio.levels);
         }
-        if let Some(prev) = audio.slot {
-            anyhow::ensure!(
-                prev == slot,
-                "the audio slot id changed from {prev} to {slot} within one Session"
-            );
-        }
-        audio.slot = Some(slot);
-        audio.pending.extend(levels.iter().copied());
-        Ok(())
+        audio.queue.stage(slot, levels)
+    }
+
+    /// Stage the patches behind the image slots of the NEXT pass: `patches`
+    /// is `PATCH_BYTES` per patch, the front end's wire form; everything
+    /// [`Self::push_audio`] says about slots and ranks holds here too.
+    pub fn push_vision(&mut self, slot: usize, patches: &[u8]) -> Result<()> {
+        let vision = self.vision.as_mut().context(
+            "this Session loaded no vision pyramid (model.visual.*), so it cannot see",
+        )?;
+        vision.queue.stage(slot, patches)
     }
 
     /// Whether this Session can take audio at all.
@@ -2777,44 +3057,32 @@ impl Session {
         self.audio.is_some()
     }
 
-    /// The pass's audio slots must match what is staged, exactly, before
+    /// Whether this Session can take patches at all.
+    pub fn sees(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// The pass's sense slots must match what is staged, exactly, before
     /// anything mutates.
-    fn check_audio(&self, ids: &[usize]) -> Result<()> {
-        let Some(audio) = &self.audio else {
-            return Ok(());
-        };
-        let staged = audio.pending.len() / audio.bins;
-        let slots = match audio.slot {
-            Some(slot) => ids.iter().filter(|&&id| id == slot).count(),
-            None => 0,
-        };
-        // A delta is split into passes of `extend_batch` rows, so one pass may
-        // meet none of the slots while frames wait for a later one; a pass may
-        // never need MORE than is staged. Whether everything staged was taken
-        // is checked once the whole delta is in ([`Self::audio_drained`]).
-        anyhow::ensure!(
-            slots <= staged,
-            "this pass has {slots} audio slot id(s) but only {staged} dMel frame(s) staged; \
-             push_audio what the pass consumes before it"
-        );
+    fn check_senses(&self, ids: &[usize]) -> Result<()> {
+        if let Some(audio) = &self.audio {
+            audio.queue.check(ids)?;
+        }
+        if let Some(vision) = &self.vision {
+            vision.queue.check(ids)?;
+        }
         Ok(())
     }
 
-    /// After a whole delta: every staged frame must have found its slot.
-    /// Leftover frames are dropped so they cannot land under the NEXT delta's
-    /// slots, and the disagreement is reported.
-    fn audio_drained(&mut self) -> Result<()> {
-        let Some(audio) = &mut self.audio else {
-            return Ok(());
-        };
-        if audio.pending.is_empty() {
-            return Ok(());
+    /// After a whole delta: every staged frame and patch must have found its
+    /// slot.
+    fn senses_drained(&mut self) -> Result<()> {
+        if let Some(audio) = &mut self.audio {
+            audio.queue.drained()?;
         }
-        let left = audio.pending.len() / audio.bins;
-        audio.pending.clear();
-        anyhow::bail!(
-            "{left} dMel frame(s) were staged and no audio slot in the delta consumed them; \
-             the frames and the ids disagree"
-        )
+        if let Some(vision) = &mut self.vision {
+            vision.queue.drained()?;
+        }
+        Ok(())
     }
 }

@@ -178,6 +178,12 @@ const END_MESSAGE: &str = "<|end_message|>";
 const CONTENT_AUDIO_INPUT: &str = "<|content_audio_input|>";
 const AUDIO_SLOT: &str = "<|unused_200053|>";
 const AUDIO_END: &str = "<|audio_end|>";
+/// The template's image part: `<|content_image|>`, one placeholder per
+/// patch, then `<|end_message|>` -- there is no image end token
+/// (`processor_config.json`: `image_bos_token`, `image_token`; the template's
+/// `image` branch).
+const CONTENT_IMAGE: &str = "<|content_image|>";
+const IMAGE_SLOT: &str = "<|unused_200054|>";
 /// One dMel frame is this many levels, each below `DMEL_LEVELS`
 /// (`audio_config`: `n_mel_bins`, `mel_vocab_size`).
 pub const DMEL_BINS: usize = 80;
@@ -218,10 +224,13 @@ pub struct InklingSpecialIds {
     pub content_invoke_tool_json: u32,
     pub content_model_end_sampling: u32,
     pub end_message: u32,
-    /// The three the audio input is spelled with; see [`InklingContext::Heard`].
+    /// The three the audio input is spelled with; see [`SenseMedia::Dmel`].
     pub content_audio_input: u32,
     pub audio_slot: u32,
     pub audio_end: u32,
+    /// The two the image input is spelled with; see [`SenseMedia::Patches`].
+    pub content_image: u32,
+    pub image_slot: u32,
     /// Every added token marked `special` by this tokenizer, including kinds
     /// this minimal vocabulary does not support. Generated unknown specials are
     /// rejected rather than leaked into visible text.
@@ -346,15 +355,15 @@ pub enum InklingContext {
         history: Vec<InklingHistoryResponse>,
     },
     /// Result of the native call already present in the retained KV sequence,
-    /// and whatever was heard while it ran: the result's tool message, then
-    /// the heard record's (the order the world released them), then the
-    /// generation prompt. Hearing rides with a result rather than waiting
-    /// behind it, because a mind that acts every turn would otherwise never
-    /// hear at all.
+    /// and whatever was sensed while it ran: the result's tool message, then
+    /// one tool message per sense record (the order the world released
+    /// them), then the generation prompt. Sensing rides with a result rather
+    /// than waiting behind it, because a mind that acts every turn would
+    /// otherwise never hear or see at all.
     ToolResult {
         result: ExecResultContext,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        heard: Option<HeardRecord>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        sensed: Vec<SenseRecord>,
     },
     /// A complete response which predates this live `InklingMind` (for example
     /// a Drive memory-cover response). Its model parts and optional result are
@@ -363,23 +372,49 @@ pub enum InklingContext {
     /// Start another autonomous assistant response after a completed text-only
     /// response. A tool result already carries this prompt itself.
     GenerationPrompt,
-    /// Something was heard: `levels` is `frames * DMEL_BINS` dMel levels
-    /// (each below `DMEL_LEVELS`, 50 ms a frame, from the ear's front end),
-    /// entering the context the way a tool result does -- a tool message
-    /// named `source` whose content part is the template's audio part. The
-    /// levels are numbers inside a typed record and never text, so free text
-    /// cannot smuggle the structural markers in. Ends with the generation
-    /// prompt, like a tool result: the world spoke, now she thinks.
-    Heard { source: String, levels: Vec<u8> },
+    /// Something was sensed and nothing else happened: one tool message per
+    /// record, each named for the faculty that sensed it and holding the
+    /// template's own part for its medium (the audio part for dMel levels,
+    /// the image part for patches). The payloads are numbers inside typed
+    /// records and never text, so free text cannot smuggle the structural
+    /// markers in. Ends with the generation prompt, like a tool result: the
+    /// world spoke or moved, now she thinks.
+    Sensed { records: Vec<SenseRecord> },
 }
 
-/// What an ear delivered: `levels` is `frames * DMEL_BINS` dMel levels (each
-/// below `DMEL_LEVELS`, 50 ms a frame), from the faculty named `source`.
+/// What a sense delivered: one record from the faculty named `source`, in
+/// one of the media the model can embed.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct HeardRecord {
+pub struct SenseRecord {
     pub source: String,
-    pub levels: Vec<u8>,
+    pub media: SenseMedia,
+}
+
+/// The media a sense record can carry, one per content type on the stream.
+/// A new medium is a new variant here, a session input to embed it, and a
+/// content type for the faculties that produce it; a new SOURCE of an
+/// existing medium (a video call, a file) needs nothing here at all.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum SenseMedia {
+    /// `frames * DMEL_BINS` dMel levels (each below `DMEL_LEVELS`, 50 ms a
+    /// frame, from the ear's front end): the template's audio part.
+    Dmel { levels: Vec<u8> },
+    /// Whole patches as the eye's front end lays them out
+    /// (`super::patches`: little-endian f32, `PATCH_BYTES` each): the
+    /// template's image part, one placeholder per patch.
+    Patches { patches: Vec<u8> },
+}
+
+impl SenseRecord {
+    /// How many placeholder slots this record spells: frames or patches.
+    pub fn slots(&self) -> Result<usize> {
+        match &self.media {
+            SenseMedia::Dmel { levels } => heard_frames(levels),
+            SenseMedia::Patches { patches } => super::patches::count(patches),
+        }
+    }
 }
 
 /// Where a typed context would be placed if its preflight succeeds.
@@ -587,6 +622,8 @@ impl InklingContextCodec {
             content_audio_input: required(CONTENT_AUDIO_INPUT)?,
             audio_slot: required(AUDIO_SLOT)?,
             audio_end: required(AUDIO_END)?,
+            content_image: required(CONTENT_IMAGE)?,
+            image_slot: required(IMAGE_SLOT)?,
             all_special,
             decoded_special,
         };
@@ -603,6 +640,8 @@ impl InklingContextCodec {
             special_ids.content_audio_input,
             special_ids.audio_slot,
             special_ids.audio_end,
+            special_ids.content_image,
+            special_ids.image_slot,
         ] {
             anyhow::ensure!(
                 special_ids.is_special(id),
@@ -685,10 +724,10 @@ impl InklingContextCodec {
                 }
                 ids.push(self.special_ids.message_model as usize);
             }
-            InklingContext::ToolResult { result, heard } => {
+            InklingContext::ToolResult { result, sensed } => {
                 self.push_tool_result(&mut ids, result)?;
-                if let Some(heard) = heard {
-                    self.push_heard_part(&mut ids, &heard.source, &heard.levels)?;
+                for record in sensed {
+                    self.push_sense_part(&mut ids, record)?;
                 }
                 ids.push(self.special_ids.message_model as usize);
             }
@@ -699,35 +738,55 @@ impl InklingContextCodec {
             InklingContext::GenerationPrompt => {
                 ids.push(self.special_ids.message_model as usize);
             }
-            InklingContext::Heard { source, levels } => {
-                self.push_heard_part(&mut ids, source, levels)?;
+            InklingContext::Sensed { records } => {
+                anyhow::ensure!(!records.is_empty(), "a Sensed context with no records");
+                for record in records {
+                    self.push_sense_part(&mut ids, record)?;
+                }
                 ids.push(self.special_ids.message_model as usize);
             }
         }
         Ok(ids)
     }
 
-    /// The dMel levels a context carries, to stage behind the audio slots
-    /// [`Self::encode`] emitted for it: empty for everything but `Heard`.
-    pub fn audio_levels(&self, context: &InklingContext) -> Vec<u8> {
+    /// The sense records a context carries, in the order [`Self::encode`]
+    /// emitted their slots: what the Session stages behind those slots.
+    /// Empty for everything but `Sensed` and a `ToolResult` with senses.
+    pub fn sensed<'a>(&self, context: &'a InklingContext) -> &'a [SenseRecord] {
         match context {
-            InklingContext::Heard { levels, .. } => levels.clone(),
-            InklingContext::ToolResult {
-                heard: Some(heard), ..
-            } => heard.levels.clone(),
-            _ => Vec::new(),
+            InklingContext::Sensed { records } => records,
+            InklingContext::ToolResult { sensed, .. } => sensed,
+            _ => &[],
         }
     }
 
-    /// One tool message named `source` whose content part is the template's
-    /// audio part: `content_audio_input`, one slot per frame, `audio_end`.
-    fn push_heard_part(&self, ids: &mut Vec<usize>, source: &str, levels: &[u8]) -> Result<()> {
-        let frames = heard_frames(levels)?;
+    /// The placeholder id a medium stands behind.
+    pub fn slot_of(&self, media: &SenseMedia) -> usize {
+        match media {
+            SenseMedia::Dmel { .. } => self.special_ids.audio_slot as usize,
+            SenseMedia::Patches { .. } => self.special_ids.image_slot as usize,
+        }
+    }
+
+    /// One tool message named for the record's source whose content part is
+    /// the template's part for its medium: the audio part
+    /// (`content_audio_input`, one slot per frame, `audio_end`) or the image
+    /// part (`content_image`, one slot per patch, no end token).
+    fn push_sense_part(&self, ids: &mut Vec<usize>, record: &SenseRecord) -> Result<()> {
+        let slots = record.slots()?;
         ids.push(self.special_ids.message_tool as usize);
-        self.push_content(ids, source)?;
-        ids.push(self.special_ids.content_audio_input as usize);
-        ids.extend(std::iter::repeat_n(self.special_ids.audio_slot as usize, frames));
-        ids.push(self.special_ids.audio_end as usize);
+        self.push_content(ids, &record.source)?;
+        match &record.media {
+            SenseMedia::Dmel { .. } => {
+                ids.push(self.special_ids.content_audio_input as usize);
+                ids.extend(std::iter::repeat_n(self.special_ids.audio_slot as usize, slots));
+                ids.push(self.special_ids.audio_end as usize);
+            }
+            SenseMedia::Patches { .. } => {
+                ids.push(self.special_ids.content_image as usize);
+                ids.extend(std::iter::repeat_n(self.special_ids.image_slot as usize, slots));
+            }
+        }
         ids.push(self.special_ids.end_message as usize);
         Ok(())
     }

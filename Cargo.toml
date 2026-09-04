@@ -155,7 +155,7 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 inkling-resident = ["inkling-cuda", "tokenizer"]
 # The dMel front end alone -- an FFT and a filterbank, no backend. The ear
 # faculty builds mary with this and nothing else of Inkling.
-dmel = ["dep:rustfft"]
+dmel = ["dep:rustfft", "dep:rubato"]
 # CUDA/sm_121 lane for the PersonaPlex realtime stack. Selects cubecl-cuda for
 # the q4 + temporal kernels; deliberately does NOT touch the `burn` dep, since
 # the realtime lane never instantiates a burn backend (RealtimePipeline has no

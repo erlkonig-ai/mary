@@ -318,6 +318,8 @@ mod tests {
                 content_audio_input: 10,
                 audio_slot: 11,
                 audio_end: 12,
+                content_image: 13,
+                image_slot: 14,
                 all_special: (1..=12).collect(),
                 decoded_special: Vec::new(),
             },

@@ -65,7 +65,7 @@ use anyhow::{Context, Result};
 
 use super::resident::{
     Consult, ContextPlacement, ContextPreflight, ContextPreflighted, ExecutionManifest,
-    InklingContext, InklingContextCodec, Model, Ready, Reinitialized, TurnEnd, context_preflight,
+    InklingContext, InklingContextCodec, Model, Ready, Reinitialized, TurnEnd, context_preflight, SenseMedia,
 };
 use super::session::{Session, SessionConfig};
 use super::tp::Tp;
@@ -128,6 +128,8 @@ pub struct Engine {
     /// The dMel levels behind the audio slots in `delta`, in order; staged
     /// into every rank's Session ahead of the pass that consumes them.
     delta_audio: Vec<u8>,
+    /// The patches behind the image slots in `delta`, likewise.
+    delta_vision: Vec<u8>,
     /// The token the previous turn EMITTED and never fed back, waiting for the
     /// next pass to put it in the cache. `None` is also "no turn has run yet",
     /// which is the same fact as "nothing is prefilled".
@@ -352,6 +354,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         context_budget,
         delta: Vec::new(),
         delta_audio: Vec::new(),
+        delta_vision: Vec::new(),
         carry: None,
         turn: 0,
         digest: blake3::Hasher::new(),
@@ -445,6 +448,11 @@ impl Follower {
                     self.session
                         .push_audio(slot, &levels)
                         .context("stage this rank's dMel frames")?;
+                }
+                Pass::Vision { slot, patches } => {
+                    self.session
+                        .push_vision(slot, &patches)
+                        .context("stage this rank's patches")?;
                 }
                 Pass::Step => {
                     let token = self.session.step().context("advance one token")?;
@@ -672,6 +680,17 @@ impl Engine {
                 .push_audio(slot, &delta_audio)
                 .context("stage the delta's dMel frames")?;
         }
+        let delta_vision = std::mem::take(&mut self.delta_vision);
+        if !delta_vision.is_empty() {
+            let slot = self.codec.special_ids().image_slot as usize;
+            self.lead(&Pass::Vision {
+                slot,
+                patches: delta_vision.clone(),
+            })?;
+            self.session
+                .push_vision(slot, &delta_vision)
+                .context("stage the delta's patches")?;
+        }
         // Context participates in decoding even though it is not speech.
         // Advancing and discarding here makes the next generated id see its
         // real predecessor without ever echoing a tool result. `carry` is
@@ -796,7 +815,14 @@ impl Model for Engine {
             .encode(context)
             .context("encode typed Inkling context")?;
         self.delta.extend(ids);
-        self.delta_audio.extend(self.codec.audio_levels(context));
+        // The payloads behind the slots just emitted, each medium to its own
+        // queue, in the order the slots were emitted.
+        for record in self.codec.sensed(context) {
+            match &record.media {
+                SenseMedia::Dmel { levels } => self.delta_audio.extend_from_slice(levels),
+                SenseMedia::Patches { patches } => self.delta_vision.extend_from_slice(patches),
+            }
+        }
         Ok(())
     }
 
@@ -863,6 +889,7 @@ impl Model for Engine {
         self.decode = detokenizer(self.tokenizer);
         self.delta = replacement;
         self.delta_audio.clear();
+        self.delta_vision.clear();
         self.carry = None;
         self.turn = 0;
 

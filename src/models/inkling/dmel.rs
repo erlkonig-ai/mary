@@ -15,14 +15,63 @@
 //! explicit), and the level is `argmin |mel - centre|` over
 //! `linspace(-7, 2, 16)`, ties to the lower centre.
 //!
-//! What it deliberately does not do: resample. The body records at 24 kHz;
-//! the ear side owns the 24 -> 16 kHz step.
+//! Resampling is here too, because the body records at 24 kHz and the ear
+//! delivers what the body records (raw, never derived); the mind brings the
+//! sound to the front end's 16 kHz with [`resample`] before [`DmelFrontEnd::levels`].
 
 use super::resident::{DMEL_BINS, DMEL_LEVELS};
 use rustfft::{num_complex::Complex, Fft, FftPlanner};
 use std::sync::Arc;
 
 pub const SAMPLE_RATE: usize = 16_000;
+
+/// Mono samples at `from` Hz to `SAMPLE_RATE`, with the same windowed-sinc
+/// resampler the Gemma ear uses (`rubato`, 256-tap, Blackman-Harris),
+/// delay-compensated and trimmed to the expected length. Identity at 16 kHz.
+pub fn resample(mono: Vec<f32>, from: usize) -> anyhow::Result<Vec<f32>> {
+    use rubato::{
+        Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    };
+    if from == SAMPLE_RATE {
+        return Ok(mono);
+    }
+    if mono.is_empty() {
+        return Ok(Vec::new());
+    }
+    let ratio = SAMPLE_RATE as f64 / from as f64;
+    let params = SincInterpolationParameters {
+        sinc_len: 256,
+        f_cutoff: 0.95,
+        interpolation: SincInterpolationType::Linear,
+        oversampling_factor: 256,
+        window: WindowFunction::BlackmanHarris2,
+    };
+    let chunk = 4096usize;
+    let mut resampler = SincFixedIn::<f32>::new(ratio, 2.0, params, chunk, 1)
+        .map_err(|e| anyhow::anyhow!("rubato init: {e}"))?;
+    let delay = resampler.output_delay();
+    let mut out = Vec::with_capacity((mono.len() as f64 * ratio) as usize + 1024);
+    let mut i = 0;
+    while i + chunk <= mono.len() {
+        let waves_out = resampler
+            .process(&[mono[i..i + chunk].to_vec()], None)
+            .map_err(|e| anyhow::anyhow!("rubato process: {e}"))?;
+        out.extend_from_slice(&waves_out[0]);
+        i += chunk;
+    }
+    if i < mono.len() {
+        // The last partial chunk, zero-padded to the fixed size and trimmed.
+        let mut tail = vec![0.0f32; chunk];
+        tail[..mono.len() - i].copy_from_slice(&mono[i..]);
+        let waves_out = resampler
+            .process(&[tail], None)
+            .map_err(|e| anyhow::anyhow!("rubato process tail: {e}"))?;
+        let valid = ((mono.len() - i) as f64 * ratio).ceil() as usize;
+        out.extend(waves_out[0].iter().take(valid));
+    }
+    let expected = (mono.len() as f64 * ratio).round() as usize;
+    Ok(out.into_iter().skip(delay).take(expected).collect())
+}
 pub const N_FFT: usize = 1600;
 pub const HOP: usize = 800;
 pub const DMEL_MIN: f32 = -7.0;

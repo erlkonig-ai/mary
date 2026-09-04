@@ -177,7 +177,7 @@ fn main() -> Result<()> {
                 command: "message poll".to_string(),
                 content: line.clone(),
             },
-            heard: None,
+            sensed: Vec::new(),
         })?;
         let mut said = String::new();
         let end = engine.consult(&Consult::new(want), &mut |text| {
