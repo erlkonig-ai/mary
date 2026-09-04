@@ -66,6 +66,7 @@ use crate::models::qwen3tts::config::{
     LANG_ENGLISH, NUM_CODE_GROUPS, SAMPLE_RATE, SAMPLES_PER_FRAME,
 };
 use crate::models::qwen3tts::pipeline::{self, ClonePrompt, SamplingParams};
+use crate::models::qwen3tts::megakernel::{EngineBackend, EngineStepper, TalkerEngine, MAX_SCORES};
 use crate::models::qwen3tts::predictor::CodePredictor;
 use crate::models::qwen3tts::speaker::{SpeakerEncoder, SpeakerMel};
 use crate::models::qwen3tts::talker::Talker;
@@ -487,11 +488,9 @@ impl Synthesizer {
         // lane. f16 by default (halves per-step weight traffic — the realtime
         // fast path; identity holds within the resemblyzer gate);
         // MARY_SPEAK_F32=1 selects the full-precision talker. The code
-        // predictor and the f32 codec are unaffected by the switch. The Linux
-        // build runs the frames on the fused engine (`megakernel`), which
-        // aliases f32 weight buffers, so it takes the f32 talker always.
-        let engine_lane = cfg!(all(feature = "megakernel", target_os = "linux"));
-        if engine_lane || std::env::var("MARY_SPEAK_F32").is_ok() {
+        // predictor and the f32 codec are unaffected by the switch, and so is
+        // the fused engine (`megakernel`), which aliases either lane's buffers.
+        if std::env::var("MARY_SPEAK_F32").is_ok() {
             spawn_impl::<crate::nn::backend::speak::Raw>(weights, ref_wav, ref_text, ref_codes)
         } else {
             spawn_impl::<crate::nn::backend::speak::RawHalf>(weights, ref_wav, ref_text, ref_codes)
@@ -585,7 +584,230 @@ enum CodecMsg {
 /// TTFA it measured (0 if nothing was emitted).
 type CodecAck = (usize, f64);
 
-fn spawn_impl<B: Backend + 'static>(
+/// The utterance in progress on the codec side: where its PCM goes, how to
+/// tell the generator it is no longer wanted, and its clock.
+struct Out {
+    pcm: mpsc::Sender<Vec<f32>>,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    called: Instant,
+    emitted: usize,
+    ttfa: f64,
+}
+
+/// The codec side of a session: the running frame history (reference codes,
+/// then the pass's frames), decoded in hop-sized windows with trailing left
+/// context into PCM for the utterance in progress.
+struct CodecSink<B: Backend> {
+    codec: CodecDecoder<B>,
+    dev: B::Device,
+    hop: usize,
+    ctx: usize,
+    ref_len: usize,
+    history: Vec<[u32; NUM_CODE_GROUPS]>,
+    decoded_upto: usize,
+    out: Option<Out>,
+    inline: bool,
+    bench: bool,
+    /// (seconds, chunks, frames) decoded, for the bench line.
+    stats: (f64, usize, usize),
+}
+
+impl<B: Backend> CodecSink<B> {
+    /// Load and warm the codec at the steady-state chunk shape (shader
+    /// compile + autotune land here, not in the first real chunk — measured
+    /// ~0.8 s cold vs ~40 ms warm).
+    fn load(
+        loader: &WeightLoader,
+        dev: &B::Device,
+        ref_codes: Vec<[u32; NUM_CODE_GROUPS]>,
+        hop: usize,
+        ctx: usize,
+        inline: bool,
+    ) -> Self {
+        let codec = CodecDecoder::<B>::load(loader, dev);
+        let _ = codec.decode(&vec![[0u32; NUM_CODE_GROUPS]; ctx + hop], dev);
+        let ref_len = ref_codes.len();
+        Self {
+            codec,
+            dev: dev.clone(),
+            hop,
+            ctx,
+            ref_len,
+            history: ref_codes,
+            decoded_upto: ref_len,
+            out: None,
+            inline,
+            bench: std::env::var("QWEN3TTS_BENCH").is_ok(),
+            stats: (0.0, 0, 0),
+        }
+    }
+
+    /// Decode `history[from..to]` (with left context) and hand the PCM to
+    /// the current utterance. A consumer that has dropped its stream cancels
+    /// THAT utterance: its flag is raised so generation stops early, its
+    /// output is closed, and the session goes on.
+    fn flush(&mut self, from: usize, to: usize) {
+        let c = self.ctx.min(from);
+        let n = to - from;
+        let td = Instant::now();
+        // Always decode a full hop, so every chunk has the shape the codec was
+        // warmed at: a partial tail (a pass's last frames) would otherwise meet
+        // a cold shape and pay its JIT + autotune — measured ~2.5 s, more than
+        // the rest of the utterance. The codec is causal, so trailing pad
+        // frames (the last real frame, repeated) never change the real frames'
+        // samples; their samples are cut below.
+        let wav = if n < self.hop {
+            let mut window: Vec<[u32; NUM_CODE_GROUPS]> = self.history[from - c..to].to_vec();
+            let last = *window.last().expect("a frame to pad from");
+            window.resize(c + self.hop, last);
+            self.codec.decode(&window, &self.dev)
+        } else {
+            self.codec.decode(&self.history[from - c..to], &self.dev)
+        };
+        if self.bench {
+            let (s, k, f) = self.stats;
+            self.stats = (s + td.elapsed().as_secs_f64(), k + 1, f + n);
+        }
+        let pcm = wav[c * SAMPLES_PER_FRAME..(c + n) * SAMPLES_PER_FRAME].to_vec();
+        let Some(o) = self.out.as_mut() else { return };
+        if o.emitted == 0 {
+            o.ttfa = o.called.elapsed().as_secs_f64();
+            eprintln!(
+                "[timing] TTFA: {:.2}s (call → first PCM chunk, incl. load+warm+prefill)",
+                o.ttfa
+            );
+        }
+        o.emitted += pcm.len();
+        if o.pcm.send(pcm).is_err() {
+            o.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+            let finished = self.out.take().expect("utterance in progress");
+            // Keep the counts for the ack; the channel is gone.
+            self.out = Some(Out {
+                pcm: mpsc::channel().0,
+                ..finished
+            });
+        }
+    }
+
+    /// One message; `End` yields the utterance's ack.
+    fn handle(&mut self, msg: CodecMsg) -> Option<CodecAck> {
+        match msg {
+            CodecMsg::Begin { pcm, cancelled, called } => {
+                self.out = Some(Out {
+                    pcm,
+                    cancelled,
+                    called,
+                    emitted: 0,
+                    ttfa: 0.0,
+                });
+                None
+            }
+            CodecMsg::Frame(f) => {
+                self.history.push(f);
+                if self.history.len() - self.decoded_upto >= self.hop {
+                    let (from, to) = (self.decoded_upto, self.history.len());
+                    self.flush(from, to);
+                    self.decoded_upto = to;
+                }
+                None
+            }
+            CodecMsg::PassEnd { gap } => {
+                if self.history.len() > self.decoded_upto {
+                    let (from, to) = (self.decoded_upto, self.history.len());
+                    self.flush(from, to);
+                }
+                self.history.truncate(self.ref_len);
+                self.decoded_upto = self.ref_len;
+                if gap {
+                    if let Some(o) = self.out.as_mut() {
+                        let silence = vec![0.0f32; SAMPLE_RATE as usize / 6]; // ~167 ms
+                        o.emitted += silence.len();
+                        let _ = o.pcm.send(silence);
+                    }
+                }
+                None
+            }
+            CodecMsg::End => {
+                if self.history.len() > self.decoded_upto {
+                    let (from, to) = (self.decoded_upto, self.history.len());
+                    self.flush(from, to);
+                }
+                self.history.truncate(self.ref_len);
+                self.decoded_upto = self.ref_len;
+                // Dropping `out` closes the utterance's PCM channel: its
+                // iterator ends here.
+                Some(
+                    self.out
+                        .take()
+                        .map(|o| (o.emitted, o.ttfa))
+                        .unwrap_or((0, 0.0)),
+                )
+            }
+        }
+    }
+
+    fn report(&self) {
+        if self.bench {
+            let (s, n, f) = self.stats;
+            eprintln!(
+                "bench: codec: {:.1}ms/chunk × {} chunks ({:.1}ms per generated frame, {} frames; {})",
+                s / n.max(1) as f64 * 1e3,
+                n,
+                s / f.max(1) as f64 * 1e3,
+                f,
+                if self.inline {
+                    "inline on the generation thread"
+                } else {
+                    "overlapped with generation"
+                }
+            );
+        }
+    }
+}
+
+/// Where the session's frames go: a codec on its own thread, or the codec
+/// inline on the generation thread.
+enum CodecLane {
+    Thread {
+        tx: mpsc::Sender<CodecMsg>,
+        ack: mpsc::Receiver<CodecAck>,
+        thread: std::thread::JoinHandle<()>,
+    },
+    Inline(CodecSink<BFused>),
+}
+
+impl CodecLane {
+    /// Deliver one message; `Err` means the codec is gone. `End` returns the
+    /// utterance's ack.
+    fn send(&mut self, msg: CodecMsg) -> Result<Option<CodecAck>, ()> {
+        match self {
+            CodecLane::Thread { tx, ack, .. } => {
+                let is_end = matches!(msg, CodecMsg::End);
+                tx.send(msg).map_err(|_| ())?;
+                if is_end {
+                    ack.recv().map(Some).map_err(|_| ())
+                } else {
+                    Ok(None)
+                }
+            }
+            CodecLane::Inline(sink) => Ok(sink.handle(msg)),
+        }
+    }
+
+    fn finish(self) {
+        match self {
+            CodecLane::Thread { tx, thread, .. } => {
+                drop(tx);
+                if thread.join().is_err() {
+                    eprintln!("speak: codec thread panicked");
+                }
+            }
+            CodecLane::Inline(sink) => sink.report(),
+        }
+    }
+}
+
+fn spawn_impl<B: EngineBackend>(
     weights: Qwen3TtsWeights,
     ref_wav: &Path,
     ref_text: &str,
@@ -681,155 +903,67 @@ fn spawn_impl<B: Backend + 'static>(
             let (hop, ctx) =
                 (env_usize("MARY_SPEAK_HOP", STREAM_HOP), env_usize("MARY_SPEAK_CTX", STREAM_CTX));
 
-            // ── codec thread: consumes frames, decodes hop-chunks, emits PCM ──
+            // ── the codec: consumes frames, decodes hop-chunks, emits PCM ──
             // The codec (f32 whatever the talker precision: its im2col conv
-            // GEMMs measured slower in f16, and it is cheap in f32) loads AND
-            // warms here, overlapping the talker warmup on this thread — and
-            // its fused tensors live on the thread that uses them. It outlives
-            // every utterance; only the PCM channel changes hands.
-            let (tx_c, rx_c) = mpsc::channel::<CodecMsg>();
-            let (tx_ack, rx_ack) = mpsc::channel::<CodecAck>();
+            // GEMMs measured slower in f16, and it is cheap in f32) runs
+            // either on its own thread, overlapping generation, or INLINE on
+            // this thread after every hop of frames. Inline is the Linux
+            // default: there the two threads share ONE CUDA stream and block
+            // on each other's syncs (measured 134 ms/frame threaded against
+            // the engine's 35 alone); the Mac's two Metal queues overlap for
+            // real. `MARY_SPEAK_CODEC=thread|inline` overrides. Either way the
+            // codec outlives every utterance; only the PCM channel changes
+            // hands.
+            let inline = match std::env::var("MARY_SPEAK_CODEC").ok().as_deref() {
+                Some("inline") => true,
+                Some("thread") => false,
+                _ => cfg!(target_os = "linux"),
+            };
             let ref_codes_for_codec = prompt.ref_code.clone();
-            let codec_thread = match std::thread::Builder::new().name("speak-codec".into()).spawn(
-                move || {
-                    crate::models::qwen3tts::cpu::set_interactive_qos();
-                    let cdev = WgpuDevice::default();
-                    let codec = CodecDecoder::<BFused>::load(&loader, &cdev);
-                    drop(loader);
-                    // warm the decode path at the steady-state chunk shape
-                    // (shader compile + autotune land here, not in the first
-                    // real chunk — measured ~0.8 s cold vs ~40 ms warm)
-                    let _ = codec.decode(&vec![[0u32; NUM_CODE_GROUPS]; ctx + hop], &cdev);
-
-                    // history = ref codes ++ generated; windows slide over it
-                    let ref_len = ref_codes_for_codec.len();
-                    let mut history = ref_codes_for_codec;
-                    let mut decoded_upto = ref_len;
-                    let bench = std::env::var("QWEN3TTS_BENCH").is_ok();
-                    let codec_stats = std::cell::Cell::new((0f64, 0usize, 0usize)); // (s, chunks, frames)
-
-                    // The utterance in progress: where its PCM goes, how to
-                    // tell the generator it is no longer wanted, and its clock.
-                    struct Out {
-                        pcm: mpsc::Sender<Vec<f32>>,
-                        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-                        called: Instant,
-                        emitted: usize,
-                        ttfa: f64,
-                    }
-                    let mut out: Option<Out> = None;
-
-                    // Decode `history[from..to]` (with left context) and hand
-                    // the PCM to the current utterance. A consumer that has
-                    // dropped its stream cancels THAT utterance: its flag is
-                    // raised so generation stops early, its output is closed,
-                    // and the session goes on.
-                    let flush = |history: &[[u32; NUM_CODE_GROUPS]],
-                                     from: usize,
-                                     to: usize,
-                                     out: &mut Option<Out>| {
-                        let c = ctx.min(from);
-                        let td = Instant::now();
-                        let wav = codec.decode(&history[from - c..to], &cdev);
-                        if bench {
-                            let (s, n, f) = codec_stats.get();
-                            codec_stats
-                                .set((s + td.elapsed().as_secs_f64(), n + 1, f + (to - from)));
-                        }
-                        let pcm = wav[c * SAMPLES_PER_FRAME..].to_vec();
-                        let Some(o) = out.as_mut() else { return };
-                        if o.emitted == 0 {
-                            o.ttfa = o.called.elapsed().as_secs_f64();
-                            eprintln!(
-                                "[timing] TTFA: {:.2}s (call → first PCM chunk, incl. load+warm+prefill)",
-                                o.ttfa
-                            );
-                        }
-                        o.emitted += pcm.len();
-                        if o.pcm.send(pcm).is_err() {
-                            o.cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
-                            let finished = out.take().expect("utterance in progress");
-                            // Keep the counts for the ack; the channel is gone.
-                            *out = Some(Out {
-                                pcm: mpsc::channel().0,
-                                ..finished
-                            });
-                        }
-                    };
-
-                    while let Ok(msg) = rx_c.recv() {
-                        match msg {
-                            CodecMsg::Begin { pcm, cancelled, called } => {
-                                out = Some(Out {
-                                    pcm,
-                                    cancelled,
-                                    called,
-                                    emitted: 0,
-                                    ttfa: 0.0,
-                                });
-                            }
-                            CodecMsg::Frame(f) => {
-                                history.push(f);
-                                if history.len() - decoded_upto >= hop {
-                                    let (from, to) = (decoded_upto, history.len());
-                                    flush(&history, from, to, &mut out);
-                                    decoded_upto = to;
-                                }
-                            }
-                            CodecMsg::PassEnd { gap } => {
-                                if history.len() > decoded_upto {
-                                    let (from, to) = (decoded_upto, history.len());
-                                    flush(&history, from, to, &mut out);
-                                }
-                                history.truncate(ref_len);
-                                decoded_upto = ref_len;
-                                if gap {
-                                    if let Some(o) = out.as_mut() {
-                                        let silence = vec![0.0f32; SAMPLE_RATE as usize / 6]; // ~167 ms
-                                        o.emitted += silence.len();
-                                        let _ = o.pcm.send(silence);
-                                    }
-                                }
-                            }
-                            CodecMsg::End => {
-                                if history.len() > decoded_upto {
-                                    let (from, to) = (decoded_upto, history.len());
-                                    flush(&history, from, to, &mut out);
-                                }
-                                history.truncate(ref_len);
-                                decoded_upto = ref_len;
-                                let (emitted, ttfa) = out
-                                    .take()
-                                    .map(|o| (o.emitted, o.ttfa))
-                                    .unwrap_or((0, 0.0));
-                                // Dropping `out` closed the utterance's PCM
-                                // channel: its iterator ends here.
-                                if tx_ack.send((emitted, ttfa)).is_err() {
+            let mut codec = if inline {
+                let cdev = WgpuDevice::default();
+                let sink = CodecSink::<BFused>::load(&loader, &cdev, ref_codes_for_codec, hop, ctx, true);
+                drop(loader);
+                CodecLane::Inline(sink)
+            } else {
+                let (tx_c, rx_c) = mpsc::channel::<CodecMsg>();
+                let (tx_ack, rx_ack) = mpsc::channel::<CodecAck>();
+                let spawned = std::thread::Builder::new().name("speak-codec".into()).spawn(
+                    move || {
+                        crate::models::qwen3tts::cpu::set_interactive_qos();
+                        let cdev = WgpuDevice::default();
+                        let mut sink = CodecSink::<BFused>::load(
+                            &loader,
+                            &cdev,
+                            ref_codes_for_codec,
+                            hop,
+                            ctx,
+                            false,
+                        );
+                        drop(loader);
+                        while let Ok(msg) = rx_c.recv() {
+                            if let Some(ack) = sink.handle(msg) {
+                                if tx_ack.send(ack).is_err() {
                                     break;
                                 }
                             }
                         }
+                        sink.report();
+                    },
+                );
+                match spawned {
+                    Ok(thread) => CodecLane::Thread {
+                        tx: tx_c,
+                        ack: rx_ack,
+                        thread,
+                    },
+                    Err(error) => {
+                        let message = format!("spawn the codec thread: {error}");
+                        while let Ok(req) = rx_req.recv() {
+                            let _ = req.done.send(Err(anyhow::anyhow!("{message}")));
+                        }
+                        return;
                     }
-                    if bench {
-                        let (s, n, f) = codec_stats.get();
-                        eprintln!(
-                            "bench: codec: {:.1}ms/chunk × {} chunks ({:.1}ms per generated \
-                             frame, {} frames; overlapped with generation)",
-                            s / n.max(1) as f64 * 1e3,
-                            n,
-                            s / f.max(1) as f64 * 1e3,
-                            f
-                        );
-                    }
-                },
-            ) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    let message = format!("spawn the codec thread: {error}");
-                    while let Ok(req) = rx_req.recv() {
-                        let _ = req.done.send(Err(anyhow::anyhow!("{message}")));
-                    }
-                    return;
                 }
             };
 
@@ -860,7 +994,7 @@ fn spawn_impl<B: Backend + 'static>(
             // One utterance at a time, in order, until the session is dropped.
             while let Ok(req) = rx_req.recv() {
                 let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                if tx_c
+                if codec
                     .send(CodecMsg::Begin {
                         pcm: req.pcm,
                         cancelled: cancelled.clone(),
@@ -898,7 +1032,7 @@ fn spawn_impl<B: Backend + 'static>(
                     let text = pipeline::TextSide::read(&talker, &trailing, &tts_pad);
                     let sink = |f: &[u32; NUM_CODE_GROUPS]| {
                         !cancelled.load(std::sync::atomic::Ordering::Relaxed)
-                            && tx_c.send(CodecMsg::Frame(*f)).is_ok()
+                            && codec.send(CodecMsg::Frame(*f)).is_ok()
                     };
                     let frames = match engine_stepper(engine.as_mut(), &talker, &prefill, &dev) {
                         Some(mut stepper) => pipeline::generate_streaming_with(
@@ -924,7 +1058,7 @@ fn spawn_impl<B: Backend + 'static>(
                         }
                     };
                     total_frames += frames.len();
-                    if tx_c.send(CodecMsg::PassEnd { gap: i + 1 < chunks.len() }).is_err() {
+                    if codec.send(CodecMsg::PassEnd { gap: i + 1 < chunks.len() }).is_err() {
                         codec_gone = true;
                         break;
                     }
@@ -936,12 +1070,9 @@ fn spawn_impl<B: Backend + 'static>(
                         frames.len()
                     );
                 }
-                if codec_gone || tx_c.send(CodecMsg::End).is_err() {
-                    let _ = req.done.send(Err(anyhow::anyhow!("the speak codec thread has exited")));
-                    break;
-                }
-                let Ok((emitted, ttfa)) = rx_ack.recv() else {
-                    let _ = req.done.send(Err(anyhow::anyhow!("the speak codec thread has exited")));
+                let ack = if codec_gone { Err(()) } else { codec.send(CodecMsg::End) };
+                let Ok(Some((emitted, ttfa))) = ack else {
+                    let _ = req.done.send(Err(anyhow::anyhow!("the speak codec has exited")));
                     break;
                 };
                 let synth_s = t_synth.elapsed().as_secs_f32();
@@ -961,77 +1092,45 @@ fn spawn_impl<B: Backend + 'static>(
                 );
                 let _ = req.done.send(Ok(()));
             }
-            drop(tx_c);
-            if codec_thread.join().is_err() {
-                eprintln!("speak: codec thread panicked");
-            }
+            codec.finish();
         })
         .map_err(|error| anyhow::anyhow!("spawn the speak generation thread: {error}"))?;
 
     Ok(Synthesizer { tx: tx_req })
 }
 
-/// The fused talker decode engine over the session's talker, when this build
-/// has it and the talker is the f32 raw lane it aliases. `MARY_SPEAK_BURN=1`
-/// holds the frames on the Burn op loop for an A/B.
-#[cfg(all(feature = "megakernel", target_os = "linux"))]
-fn fused_engine<B: Backend + 'static>(
-    talker: &Talker<B>,
-) -> Option<crate::models::qwen3tts::megakernel::TalkerEngine> {
-    use crate::models::qwen3tts::megakernel::{Raw, TalkerEngine, MAX_SCORES};
-    use std::any::Any;
-    if std::env::var("MARY_SPEAK_BURN").is_ok() {
+/// The fused talker decode engine over the session's talker (any raw lane,
+/// f16 or f32). On Linux (CUDA) it takes the frames by default; the Mac keeps
+/// the Burn loop unless `MARY_SPEAK_ENGINE=1` asks for the engine, and
+/// `MARY_SPEAK_BURN=1` holds the Burn loop anywhere for an A/B.
+fn fused_engine<B: EngineBackend>(talker: &Talker<B>) -> Option<TalkerEngine> {
+    let wanted = cfg!(target_os = "linux") || std::env::var("MARY_SPEAK_ENGINE").is_ok();
+    if !wanted || std::env::var("MARY_SPEAK_BURN").is_ok() {
         return None;
     }
-    let raw = (talker as &dyn Any).downcast_ref::<Talker<Raw>>()?;
     let t = Instant::now();
-    let engine = TalkerEngine::new(raw, MAX_SCORES as usize);
+    let engine = TalkerEngine::new(talker, MAX_SCORES as usize);
     eprintln!(
-        "[timing] talker → fused engine ({} dispatches/frame, ring {} positions): {:.2}s",
+        "[timing] talker → fused engine ({} dispatches/frame, {} weights, ring {} positions): {:.2}s",
         TalkerEngine::DISPATCHES_PER_STEP,
+        if engine.half_weights() { "f16" } else { "f32" },
         MAX_SCORES,
         t.elapsed().as_secs_f32()
     );
     Some(engine)
 }
 
-#[cfg(not(all(feature = "megakernel", target_os = "linux")))]
-fn fused_engine<B: Backend + 'static>(_talker: &Talker<B>) -> Option<()> {
-    None
-}
-
 /// A pass's [`pipeline::FrameStepper`] over the fused engine: the Burn prefill
-/// runs on the raw talker, the engine imports its caches and takes the frames.
+/// runs on the talker, the engine imports its caches and takes the frames.
 /// `None` when there is no engine (the caller runs the Burn loop).
-#[cfg(all(feature = "megakernel", target_os = "linux"))]
-fn engine_stepper<'a, B: Backend + 'static>(
-    engine: Option<&'a mut crate::models::qwen3tts::megakernel::TalkerEngine>,
+fn engine_stepper<'a, B: EngineBackend>(
+    engine: Option<&'a mut TalkerEngine>,
     talker: &'a Talker<B>,
     prefill: &burn::tensor::Tensor<B, 3>,
-    device: &B::Device,
-) -> Option<Box<dyn pipeline::FrameStepper + 'a>>
-where
-    B::Device: 'static,
-{
-    use crate::models::qwen3tts::megakernel::{EngineStepper, Raw};
-    use std::any::Any;
-    let engine = engine?;
-    let talker = (talker as &dyn Any).downcast_ref::<Talker<Raw>>()?;
-    let prefill = (prefill as &dyn Any)
-        .downcast_ref::<burn::tensor::Tensor<Raw, 3>>()?
-        .clone();
-    let device = (device as &dyn Any).downcast_ref::<<Raw as burn::tensor::backend::BackendTypes>::Device>()?;
-    Some(Box::new(EngineStepper::new(talker, engine, prefill, device)))
-}
-
-#[cfg(not(all(feature = "megakernel", target_os = "linux")))]
-fn engine_stepper<'a, B: Backend + 'static>(
-    _engine: Option<&'a mut ()>,
-    _talker: &'a Talker<B>,
-    _prefill: &burn::tensor::Tensor<B, 3>,
-    _device: &B::Device,
+    device: &<B as burn::tensor::backend::BackendTypes>::Device,
 ) -> Option<Box<dyn pipeline::FrameStepper + 'a>> {
-    None
+    let engine = engine?;
+    Some(Box::new(EngineStepper::new(talker, engine, prefill.clone(), device)))
 }
 
 /// Convenience: [`synthesize`] then write the result to `out_path` as a 24 kHz

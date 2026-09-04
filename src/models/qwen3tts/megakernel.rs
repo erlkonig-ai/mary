@@ -30,18 +30,21 @@
 //! removes the Burn loop's per-frame recompiles: every buffer here is
 //! preallocated, so no kernel ever sees a new shape.
 
-use burn::tensor::{DType, Tensor as BurnTensor, TensorPrimitive};
+use burn::tensor::backend::{Backend, BackendTypes};
+use burn::tensor::{DType, FloatDType, Tensor as BurnTensor, TensorPrimitive};
 use burn_cubecl::tensor::CubeTensor;
 use cubecl::prelude::*;
 use cubecl::server::Handle;
+use half::f16;
 
 use super::config::*;
 use super::layers::KvCache;
 use super::pipeline::FrameStepper;
 use super::talker::Talker;
 
-/// The raw (non-fusion) f32 backend whose tensors the engine aliases.
+/// The raw (non-fusion) f32 and f16 backends whose tensors the engine aliases.
 pub type Raw = crate::nn::backend::speak::Raw;
+pub type RawHalf = crate::nn::backend::speak::RawHalf;
 
 /// The cubecl runtime behind [`Raw`] — mirrors the `nn::q4::Rt` selection so
 /// the engine's kernels launch on the same device the talker's tensors live on.
@@ -81,9 +84,9 @@ const EPS: f32 = 1e-6; // TALKER_EPS
 /// rotate_half form.
 #[cube(launch_unchecked)]
 #[allow(clippy::too_many_arguments)]
-fn qkv_rope_cache_kernel(
+fn qkv_rope_cache_kernel<W: Float>(
     x: &Array<f32>,
-    wide: &Array<f32>,
+    wide: &Array<W>,
     wn: &Array<f32>,
     rope: &Array<f32>,
     q_out: &mut Array<f32>,
@@ -136,8 +139,8 @@ fn qkv_rope_cache_kernel(
     let mut y1 = f32::new(0.0);
     for k in 0..hidden {
         let xv = x[k as usize];
-        y0 += xv * wide[(k * wide_out + c0) as usize];
-        y1 += xv * wide[(k * wide_out + c1) as usize];
+        y0 += xv * f32::cast_from(wide[(k * wide_out + c0) as usize]);
+        y1 += xv * f32::cast_from(wide[(k * wide_out + c1) as usize]);
     }
     y0 *= rms_s;
     y1 *= rms_s;
@@ -272,9 +275,9 @@ fn attn_decode_kernel(
 /// Stages 3/5: plain matvec `dst (+)= srcᵀ·W` against a pre-transposed weight
 /// (`[in, out]` row-major), optionally accumulating into `dst` (residual add).
 #[cube(launch_unchecked)]
-fn matvec_kernel(
+fn matvec_kernel<W: Float>(
     src: &Array<f32>,
-    w: &Array<f32>,
+    w: &Array<W>,
     dst: &mut Array<f32>,
     #[comptime] in_dim: u32,
     #[comptime] out_dim: u32,
@@ -284,7 +287,7 @@ fn matvec_kernel(
     if j < out_dim {
         let mut acc = f32::new(0.0);
         for k in 0..in_dim {
-            acc += src[k as usize] * w[(k * out_dim + j) as usize];
+            acc += src[k as usize] * f32::cast_from(w[(k * out_dim + j) as usize]);
         }
         if residual {
             dst[j as usize] = dst[j as usize] + acc;
@@ -298,9 +301,9 @@ fn matvec_kernel(
 /// one dispatch. Cube-cooperative rms like stage 1; thread j owns gate col j
 /// and up col j+inter of the pre-transposed `[hidden, 2·inter]` weight.
 #[cube(launch_unchecked)]
-fn mlp_gateup_kernel(
+fn mlp_gateup_kernel<W: Float>(
     x: &Array<f32>,
-    gate_up: &Array<f32>,
+    gate_up: &Array<W>,
     act: &mut Array<f32>,
     eps: f32,
     #[comptime] hidden: u32,
@@ -335,8 +338,8 @@ fn mlp_gateup_kernel(
     let mut u = f32::new(0.0);
     for k in 0..hidden {
         let xv = x[k as usize];
-        g += xv * gate_up[(k * two_i + j) as usize];
-        u += xv * gate_up[(k * two_i + inter + j) as usize];
+        g += xv * f32::cast_from(gate_up[(k * two_i + j) as usize]);
+        u += xv * f32::cast_from(gate_up[(k * two_i + inter + j) as usize]);
     }
     g *= rms_s;
     u *= rms_s;
@@ -394,19 +397,52 @@ fn copy_offset_kernel(src: &Array<f32>, dst: &mut Array<f32>, n: u32, offset: u3
 // host engine
 // ---------------------------------------------------------------------------
 
+/// A Burn backend whose float tensors are `CubeTensor`s on [`Rt`] — the raw
+/// f32 and f16 lanes the voice runs on, on either platform.
+pub trait EngineBackend:
+    Backend<FloatTensorPrimitive = CubeTensor<Rt>> + BackendTypes + 'static
+{
+}
+impl<B: Backend<FloatTensorPrimitive = CubeTensor<Rt>> + BackendTypes + 'static> EngineBackend for B {}
+
+/// Extract the contiguous `CubeTensor` behind a Burn tensor: its buffer and
+/// element type.
+fn cube_handle<B: EngineBackend, const DIM: usize>(t: &BurnTensor<B, DIM>) -> (Handle, DType) {
+    match t.clone().into_primitive() {
+        TensorPrimitive::Float(c) => {
+            let mut c: CubeTensor<Rt> = c;
+            if !c.is_contiguous() {
+                // e.g. stride bookkeeping on size-1 dims after transpose+mul
+                c = burn_cubecl::kernel::into_contiguous(c);
+            }
+            (c.handle, c.dtype)
+        }
+        _ => panic!("expected a plain float tensor"),
+    }
+}
+
+/// The same, for buffers the kernels read as f32 (chain weights, the final
+/// norm): cast first, so an f16 talker's small tensors arrive widened.
+fn cube_handle_f32<B: EngineBackend, const DIM: usize>(t: &BurnTensor<B, DIM>) -> Handle {
+    let (h, dt) = cube_handle(&t.clone().cast(FloatDType::F32));
+    assert_eq!(dt, DType::F32);
+    h
+}
+
 struct LayerBufs {
     wide: Handle,    // [hidden × wide_out]
-    wn: Handle,      // [2 · hh · d] = w ‖ w_rot
+    wn: Handle,      // [2 · hh · d] = w ‖ w_rot (f32)
     o: Handle,       // [hidden × hidden] (pre-transposed)
     gate_up: Handle, // [hidden × 2·inter]
     down: Handle,    // [inter × hidden]
-    kcache: Handle,  // [max_seq × kv_dim], position-major
+    kcache: Handle,  // [max_seq × kv_dim], position-major, f32
     vcache: Handle,
 }
 
 /// Fused decode-step engine for the talker. Aliases the Burn [`Talker`]'s GPU
-/// weight buffers (zero copy) and owns preallocated activation + KV-cache
-/// buffers. One [`step`](Self::step) = 141 dispatches + one blocking readback.
+/// weight buffers (zero copy, f16 or f32 as loaded) and owns preallocated f32
+/// activation + KV-cache buffers. One [`step`](Self::step) = 141 dispatches +
+/// one blocking readback.
 pub struct TalkerEngine {
     client: Client,
     layers: Vec<LayerBufs>,
@@ -418,26 +454,9 @@ pub struct TalkerEngine {
     out: Handle,
     len: usize,
     max_seq: usize,
-    /// Keepalives: the extracted CubeTensors' handles are refcounted, but we
-    /// also pin the source Burn tensors' lifetimes explicitly via the handles
-    /// stored above — nothing further needed; this field documents intent.
-    _keep: (),
-}
-
-/// Extract the contiguous f32 `CubeTensor` behind a Burn tensor on [`Raw`].
-fn cube_handle<const DIM: usize>(t: &BurnTensor<Raw, DIM>) -> Handle {
-    match t.clone().into_primitive() {
-        TensorPrimitive::Float(c) => {
-            let mut c: CubeTensor<Rt> = c;
-            if !c.is_contiguous() {
-                // e.g. stride bookkeeping on size-1 dims after transpose+mul
-                c = burn_cubecl::kernel::into_contiguous(c);
-            }
-            assert_eq!(c.dtype, DType::F32, "megakernel is f32-only");
-            c.handle
-        }
-        _ => panic!("expected a plain float tensor"),
-    }
+    /// The element the four weight-streaming kernels read: f16 on the half
+    /// lane, f32 otherwise. Activations, caches and chain weights stay f32.
+    w16: bool,
 }
 
 fn as_bytes(v: &[f32]) -> &[u8] {
@@ -447,7 +466,7 @@ fn as_bytes(v: &[f32]) -> &[u8] {
 impl TalkerEngine {
     /// Build the engine over a loaded talker. `max_seq` bounds prefill+frames
     /// (cache memory: `28 layers × 2 × max_seq × 4 KiB`).
-    pub fn new(talker: &Talker<Raw>, max_seq: usize) -> Self {
+    pub fn new<B: EngineBackend>(talker: &Talker<B>, max_seq: usize) -> Self {
         assert!(
             max_seq <= MAX_SCORES as usize,
             "max_seq exceeds kernel shared-memory cap"
@@ -458,28 +477,44 @@ impl TalkerEngine {
             _ => unreachable!(),
         };
 
-        let layers = talker
-            .layers
-            .iter()
-            .map(|l| {
-                let wn_t = BurnTensor::cat(
-                    vec![
-                        l.attn.w.clone().reshape([(HH * D) as usize]),
-                        l.attn.w_rot.clone().reshape([(HH * D) as usize]),
-                    ],
-                    0,
-                );
-                LayerBufs {
-                    wide: cube_handle(&l.attn.wide_t),
-                    wn: cube_handle(&wn_t),
-                    o: cube_handle(&l.attn.o_proj.weight_t),
-                    gate_up: cube_handle(&l.gate_up_t),
-                    down: cube_handle(&l.down_proj.weight_t),
-                    kcache: client.empty(max_seq * KV_DIM as usize * 4),
-                    vcache: client.empty(max_seq * KV_DIM as usize * 4),
+        let mut dtype: Option<DType> = None;
+        let layers: Vec<LayerBufs> = {
+            // every streamed weight must share one element type
+            let mut weight = |t: (Handle, DType)| -> Handle {
+                match dtype {
+                    None => dtype = Some(t.1),
+                    Some(d) => assert_eq!(d, t.1, "talker weight element types differ"),
                 }
-            })
-            .collect();
+                t.0
+            };
+            talker
+                .layers
+                .iter()
+                .map(|l| {
+                    let wn_t = BurnTensor::cat(
+                        vec![
+                            l.attn.w.clone().reshape([(HH * D) as usize]),
+                            l.attn.w_rot.clone().reshape([(HH * D) as usize]),
+                        ],
+                        0,
+                    );
+                    LayerBufs {
+                        wide: weight(cube_handle(&l.attn.wide_t)),
+                        wn: cube_handle_f32(&wn_t),
+                        o: weight(cube_handle(&l.attn.o_proj.weight_t)),
+                        gate_up: weight(cube_handle(&l.gate_up_t)),
+                        down: weight(cube_handle(&l.down_proj.weight_t)),
+                        kcache: client.empty(max_seq * KV_DIM as usize * 4),
+                        vcache: client.empty(max_seq * KV_DIM as usize * 4),
+                    }
+                })
+                .collect()
+        };
+        let w16 = match dtype.expect("a talker has layers") {
+            DType::F16 => true,
+            DType::F32 => false,
+            other => panic!("the engine reads f16 or f32 talker weights, not {other:?}"),
+        };
 
         // full-width rotate_half RoPE table, [pos][cos(d) ‖ sin(d)]
         let mut rope = vec![0f32; max_seq * 2 * D as usize];
@@ -497,7 +532,7 @@ impl TalkerEngine {
 
         Self {
             rope: client.create_from_slice(as_bytes(&rope)),
-            norm_w: cube_handle(&talker.norm.weight),
+            norm_w: cube_handle_f32(&talker.norm.weight),
             q: client.empty(TALKER_HIDDEN * 4),
             attn: client.empty(TALKER_HIDDEN * 4),
             act: client.empty(INTER as usize * 4),
@@ -506,13 +541,13 @@ impl TalkerEngine {
             client,
             len: 0,
             max_seq,
-            _keep: (),
+            w16,
         }
     }
 
     /// Import the KV caches produced by a Burn-path prefill (one-time,
     /// host-roundtripped: `[1, hkv, L, d] → [L, hkv·d]` position-major).
-    pub fn import_caches(&mut self, caches: &[KvCache<Raw>]) {
+    pub fn import_caches<B: EngineBackend>(&mut self, caches: &[KvCache<B>]) {
         assert_eq!(caches.len(), self.layers.len());
         let mut len = 0;
         for (l, c) in self.layers.iter().zip(caches) {
@@ -562,8 +597,21 @@ impl TalkerEngine {
         self.max_seq
     }
 
+    /// Whether the streamed weights are f16 (the half lane) or f32.
+    pub fn half_weights(&self) -> bool {
+        self.w16
+    }
+
     /// Encode + submit one decode step (141 dispatches), without reading back.
     pub fn step_submit(&mut self, x_host: &[f32]) {
+        if self.w16 {
+            self.step_submit_w::<f16>(x_host)
+        } else {
+            self.step_submit_w::<f32>(x_host)
+        }
+    }
+
+    fn step_submit_w<W: Float>(&mut self, x_host: &[f32]) {
         assert_eq!(x_host.len(), TALKER_HIDDEN);
         assert!(self.len < self.max_seq, "cache full");
         let pos = self.len as u32;
@@ -572,7 +620,7 @@ impl TalkerEngine {
 
         for l in &self.layers {
             unsafe {
-                qkv_rope_cache_kernel::launch_unchecked::<Rt>(
+                qkv_rope_cache_kernel::launch_unchecked::<W, Rt>(
                     &self.client,
                     CubeCount::new_1d(HH + KV_HEADS),
                     CubeDim::new_1d(D),
@@ -604,7 +652,7 @@ impl TalkerEngine {
                     D,
                     MAX_SCORES,
                 );
-                matvec_kernel::launch_unchecked::<Rt>(
+                matvec_kernel::launch_unchecked::<W, Rt>(
                     &self.client,
                     CubeCount::new_1d(HIDDEN / 128),
                     CubeDim::new_1d(128),
@@ -615,7 +663,7 @@ impl TalkerEngine {
                     HIDDEN,
                     true,
                 );
-                mlp_gateup_kernel::launch_unchecked::<Rt>(
+                mlp_gateup_kernel::launch_unchecked::<W, Rt>(
                     &self.client,
                     CubeCount::new_1d(INTER / 128),
                     CubeDim::new_1d(128),
@@ -627,7 +675,7 @@ impl TalkerEngine {
                     INTER,
                     128,
                 );
-                matvec_kernel::launch_unchecked::<Rt>(
+                matvec_kernel::launch_unchecked::<W, Rt>(
                     &self.client,
                     CubeCount::new_1d(HIDDEN / 128),
                     CubeDim::new_1d(128),
@@ -680,18 +728,18 @@ impl TalkerEngine {
 /// [`FrameStepper`] over the engine: the Burn talker runs each pass's prefill
 /// (its shapes are one-off anyway), then the engine takes the frames from the
 /// imported caches — one host row in, one normed hidden state out per frame.
-pub struct EngineStepper<'a> {
-    talker: &'a Talker<Raw>,
+pub struct EngineStepper<'a, B: EngineBackend> {
+    talker: &'a Talker<B>,
     engine: &'a mut TalkerEngine,
-    pending: Option<BurnTensor<Raw, 3>>,
+    pending: Option<BurnTensor<B, 3>>,
 }
 
-impl<'a> EngineStepper<'a> {
+impl<'a, B: EngineBackend> EngineStepper<'a, B> {
     pub fn new(
-        talker: &'a Talker<Raw>,
+        talker: &'a Talker<B>,
         engine: &'a mut TalkerEngine,
-        prefill: BurnTensor<Raw, 3>,
-        device: &<Raw as burn::tensor::backend::BackendTypes>::Device,
+        prefill: BurnTensor<B, 3>,
+        device: &<B as BackendTypes>::Device,
     ) -> Self {
         let mut caches = talker.new_caches();
         let h = talker.forward(prefill, &mut caches, device);
@@ -704,7 +752,7 @@ impl<'a> EngineStepper<'a> {
     }
 }
 
-impl FrameStepper for EngineStepper<'_> {
+impl<B: EngineBackend> FrameStepper for EngineStepper<'_, B> {
     fn hidden(&mut self) -> Vec<f32> {
         match self.pending.take() {
             Some(h) => self.talker.last_hidden(h),
