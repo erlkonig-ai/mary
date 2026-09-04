@@ -1611,6 +1611,7 @@ impl Session {
         for chunk in ids.chunks(self.prefill_budget) {
             out = self.forward(chunk)?;
         }
+        self.audio_drained()?;
         Ok(out)
     }
 
@@ -1628,7 +1629,9 @@ impl Session {
             self.pos
         );
         anyhow::ensure!(!ids.is_empty(), "a prefill with no tokens would be vacuous");
-        self.chunked_scored(ids, self.prefill_budget)
+        let out = self.chunked_scored(ids, self.prefill_budget)?;
+        self.audio_drained()?;
+        Ok(out)
     }
 
     /// [`Session::extend`] that also scores the delta: the second element has
@@ -1640,10 +1643,12 @@ impl Session {
         if ids.is_empty() {
             return self.step().map(|t| (t, ScoredNll::default()));
         }
-        if self.caches.is_empty() {
-            return self.chunked_scored(ids, self.prefill_budget);
-        }
-        self.chunked_scored(ids, self.extend_batch)
+        let out = match self.caches.is_empty() {
+            true => self.chunked_scored(ids, self.prefill_budget)?,
+            false => self.chunked_scored(ids, self.extend_batch)?,
+        };
+        self.audio_drained()?;
+        Ok(out)
     }
 
     fn chunked_scored(&mut self, ids: &[usize], width: usize) -> Result<(usize, ScoredNll)> {
@@ -1739,7 +1744,9 @@ impl Session {
         }
         if self.caches.is_empty() {
             // Nothing cached yet: this IS a prefill, and a prefill batches.
-            return self.forward(ids);
+            let out = self.forward(ids)?;
+            self.audio_drained()?;
+            return Ok(out);
         }
         let mut out = 0;
         // A chunk boundary is a commit point and nothing else, so a delta split
@@ -1749,6 +1756,7 @@ impl Session {
         for chunk in ids.chunks(self.extend_batch) {
             out = self.forward(chunk)?;
         }
+        self.audio_drained()?;
         Ok(out)
     }
 
@@ -2753,11 +2761,33 @@ impl Session {
             Some(slot) => ids.iter().filter(|&&id| id == slot).count(),
             None => 0,
         };
+        // A delta is split into passes of `extend_batch` rows, so one pass may
+        // meet none of the slots while frames wait for a later one; a pass may
+        // never need MORE than is staged. Whether everything staged was taken
+        // is checked once the whole delta is in ([`Self::audio_drained`]).
         anyhow::ensure!(
-            staged == slots,
-            "this pass has {slots} audio slot id(s) and {staged} dMel frame(s) staged for them; \
-             push_audio exactly what the pass consumes"
+            slots <= staged,
+            "this pass has {slots} audio slot id(s) but only {staged} dMel frame(s) staged; \
+             push_audio what the pass consumes before it"
         );
         Ok(())
+    }
+
+    /// After a whole delta: every staged frame must have found its slot.
+    /// Leftover frames are dropped so they cannot land under the NEXT delta's
+    /// slots, and the disagreement is reported.
+    fn audio_drained(&mut self) -> Result<()> {
+        let Some(audio) = &mut self.audio else {
+            return Ok(());
+        };
+        if audio.pending.is_empty() {
+            return Ok(());
+        }
+        let left = audio.pending.len() / audio.bins;
+        audio.pending.clear();
+        anyhow::bail!(
+            "{left} dMel frame(s) were staged and no audio slot in the delta consumed them; \
+             the frames and the ids disagree"
+        )
     }
 }
