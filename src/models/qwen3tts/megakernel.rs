@@ -40,6 +40,8 @@ use half::f16;
 use super::config::*;
 use super::layers::KvCache;
 use super::pipeline::FrameStepper;
+#[cfg(feature = "predictor-gpu")]
+use super::predictor_gpu::matvec_kernel as row_matvec_kernel;
 use super::talker::Talker;
 
 /// The raw (non-fusion) f32 and f16 backends whose tensors the engine aliases.
@@ -164,6 +166,69 @@ fn qkv_rope_cache_kernel<W: Float>(
         let idx = head * d + i;
         let tc = pos * 2 * d + i; // cos
         let ts = pos * 2 * d + d + i; // sin
+        let out = (y0 * wn[idx as usize] * rope[tc as usize]
+            + y1 * wn[(hh * d + idx) as usize] * rope[ts as usize])
+            * s;
+        if head < heads {
+            q_out[idx as usize] = out;
+        } else {
+            kcache[(pos * kv_dim + (head - heads) * d + i) as usize] = out;
+        }
+    } else {
+        vcache[(pos * kv_dim + (head - hh) * d + i) as usize] = y0;
+    }
+}
+
+/// Stage 1b of the vector-load lane: the tail of [`qkv_rope_cache_kernel`]
+/// over a `y = rms(x)·wide` that a row-major vec4 matvec already produced —
+/// per-head q/k RMS-norm, RoPE chain, q out and k/v into the cache.
+#[cube(launch_unchecked)]
+#[allow(clippy::too_many_arguments)]
+fn qk_rope_cache_kernel(
+    y: &Array<f32>,
+    wn: &Array<f32>,
+    rope: &Array<f32>,
+    q_out: &mut Array<f32>,
+    kcache: &mut Array<f32>,
+    vcache: &mut Array<f32>,
+    pos: u32,
+    eps: f32,
+    #[comptime] heads: u32,
+    #[comptime] kv_heads: u32,
+    #[comptime] d: u32,
+) {
+    let i = UNIT_POS_X;
+    let head = CUBE_POS_X;
+    let hh = heads + kv_heads;
+    let mut red = SharedMemory::<f32>::new(comptime!(d as usize));
+
+    let qk_cube = head < hh;
+    let c0 = if qk_cube {
+        head * d + i
+    } else {
+        2 * hh * d + (head - hh) * d + i
+    };
+    let c1 = if qk_cube { hh * d + head * d + i } else { c0 };
+    let y0 = y[c0 as usize];
+    let y1 = y[c1 as usize];
+
+    red[i as usize] = y0 * y0;
+    sync_cube();
+    let mut stride = u32::new((d / 2) as i64);
+    while stride > 0 {
+        if i < stride {
+            red[i as usize] = red[i as usize] + red[(i + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    let s = 1.0 / (red[0] / (d as f32) + eps).sqrt();
+
+    let kv_dim = kv_heads * d;
+    if qk_cube {
+        let idx = head * d + i;
+        let tc = pos * 2 * d + i;
+        let ts = pos * 2 * d + d + i;
         let out = (y0 * wn[idx as usize] * rope[tc as usize]
             + y1 * wn[(hh * d + idx) as usize] * rope[ts as usize])
             * s;
@@ -437,6 +502,28 @@ struct LayerBufs {
     down: Handle,    // [inter × hidden]
     kcache: Handle,  // [max_seq × kv_dim], position-major, f32
     vcache: Handle,
+    /// Row-major `[out, in]` f16 copies for the vector-load lane (None on
+    /// the column lanes): wide, o, gate‖up interleaved by row, down.
+    row: Option<RowBufs>,
+}
+
+struct RowBufs {
+    wide: Handle,
+    o: Handle,
+    gate_up: Handle,
+    down: Handle,
+}
+
+/// Which kernels stream the weights. The column lanes read the talker's own
+/// pre-transposed `[in, out]` buffers in place (one element per thread per
+/// step); the row lane reads row-major f16 copies with vec4 loads, eight
+/// rows per 256-thread cube, the predictor's kernel — the difference between
+/// issue-bound and bandwidth-bound on the GB10.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WeightLane {
+    Col32,
+    Col16,
+    Row16Vec4,
 }
 
 /// Fused decode-step engine for the talker. Aliases the Burn [`Talker`]'s GPU
@@ -454,9 +541,13 @@ pub struct TalkerEngine {
     out: Handle,
     len: usize,
     max_seq: usize,
-    /// The element the four weight-streaming kernels read: f16 on the half
-    /// lane, f32 otherwise. Activations, caches and chain weights stay f32.
-    w16: bool,
+    /// Which kernels stream the weights (see [`WeightLane`]). Activations,
+    /// caches and chain weights stay f32 on every lane.
+    lane: WeightLane,
+    /// The wide projection's output on the row lane, `[wide_out]`.
+    ywide: Handle,
+    /// A four-float zero: the row lane's kernels take a bias they never read.
+    dummy: Handle,
 }
 
 fn as_bytes(v: &[f32]) -> &[u8] {
@@ -477,6 +568,9 @@ impl TalkerEngine {
             _ => unreachable!(),
         };
 
+        // The row lane: f16 weights, the predictor's vec4 kernel available,
+        // and not held back by MARY_ENGINE_COL=1 (the A/B against in-place).
+        let want_row = cfg!(feature = "predictor-gpu") && std::env::var("MARY_ENGINE_COL").is_err();
         let mut dtype: Option<DType> = None;
         let layers: Vec<LayerBufs> = {
             // every streamed weight must share one element type
@@ -506,15 +600,48 @@ impl TalkerEngine {
                         down: weight(cube_handle(&l.down_proj.weight_t)),
                         kcache: client.empty(max_seq * KV_DIM as usize * 4),
                         vcache: client.empty(max_seq * KV_DIM as usize * 4),
+                        row: None,
                     }
                 })
                 .collect()
         };
-        let w16 = match dtype.expect("a talker has layers") {
-            DType::F16 => true,
-            DType::F32 => false,
+        let dtype = dtype.expect("a talker has layers");
+        let mut lane = match dtype {
+            DType::F16 => WeightLane::Col16,
+            DType::F32 => WeightLane::Col32,
             other => panic!("the engine reads f16 or f32 talker weights, not {other:?}"),
         };
+        let mut layers = layers;
+        if want_row && dtype == DType::F16 {
+            // Row-major copies, made on the device by Burn (transpose → the
+            // contiguous copy `cube_handle` forces). gate‖up interleaves by
+            // row so SwiGLU is the matvec's epilogue.
+            let rm = |t: &BurnTensor<B, 3>| -> Handle {
+                let (h, dt) = cube_handle(&t.clone().swap_dims(1, 2));
+                assert_eq!(dt, DType::F16);
+                h
+            };
+            for (bufs, l) in layers.iter_mut().zip(talker.layers.iter()) {
+                let [_, hidden, two_i] = l.gate_up_t.dims();
+                let inter = two_i / 2;
+                let gate_up = l
+                    .gate_up_t
+                    .clone()
+                    .swap_dims(1, 2) // [1, 2I, hidden]: gate rows then up rows
+                    .reshape([2, inter, hidden])
+                    .swap_dims(0, 1) // [I, 2, hidden]: gate_j, up_j adjacent
+                    .reshape([1, two_i, hidden]);
+                let (gate_up, dt) = cube_handle(&gate_up);
+                assert_eq!(dt, DType::F16);
+                bufs.row = Some(RowBufs {
+                    wide: rm(&l.attn.wide_t),
+                    o: rm(&l.attn.o_proj.weight_t),
+                    gate_up,
+                    down: rm(&l.down_proj.weight_t),
+                });
+            }
+            lane = WeightLane::Row16Vec4;
+        }
 
         // full-width rotate_half RoPE table, [pos][cos(d) ‖ sin(d)]
         let mut rope = vec![0f32; max_seq * 2 * D as usize];
@@ -537,11 +664,13 @@ impl TalkerEngine {
             attn: client.empty(TALKER_HIDDEN * 4),
             act: client.empty(INTER as usize * 4),
             out: client.empty(TALKER_HIDDEN * 4),
+            ywide: client.empty(WIDE_OUT as usize * 4),
+            dummy: client.create_from_slice(as_bytes(&[0f32; 4])),
             layers,
             client,
             len: 0,
             max_seq,
-            w16,
+            lane,
         }
     }
 
@@ -597,18 +726,117 @@ impl TalkerEngine {
         self.max_seq
     }
 
-    /// Whether the streamed weights are f16 (the half lane) or f32.
-    pub fn half_weights(&self) -> bool {
-        self.w16
+    /// Which kernels stream the weights.
+    pub fn lane(&self) -> WeightLane {
+        self.lane
     }
 
-    /// Encode + submit one decode step (141 dispatches), without reading back.
+    /// Whether the streamed weights are f16 or f32.
+    pub fn half_weights(&self) -> bool {
+        self.lane != WeightLane::Col32
+    }
+
+    /// Encode + submit one decode step, without reading back: 141 dispatches
+    /// on the column lanes, 169 on the row lane.
     pub fn step_submit(&mut self, x_host: &[f32]) {
-        if self.w16 {
-            self.step_submit_w::<f16>(x_host)
-        } else {
-            self.step_submit_w::<f32>(x_host)
+        match self.lane {
+            WeightLane::Col32 => self.step_submit_w::<f32>(x_host),
+            WeightLane::Col16 => self.step_submit_w::<f16>(x_host),
+            WeightLane::Row16Vec4 => self.step_submit_row(x_host),
         }
+    }
+
+    /// The row lane's step: the predictor's vec4 matvec for the four
+    /// projections (rms and SwiGLU as its prologue/epilogues), the chain
+    /// kernel over its wide output, the same attention and final norm.
+    #[cfg(feature = "predictor-gpu")]
+    fn step_submit_row(&mut self, x_host: &[f32]) {
+        assert_eq!(x_host.len(), TALKER_HIDDEN);
+        assert!(self.len < self.max_seq, "cache full");
+        let pos = self.len as u32;
+        let x = self.client.create_from_slice(as_bytes(x_host));
+        let arr = |h: &Handle, n: u32| unsafe { ArrayArg::from_raw_parts(h.clone(), n as usize) };
+        const LANES: u32 = 32;
+        const ROWS: u32 = 256 / LANES;
+        // one vec4 matvec: `y (+)= [rms](src) · W[out, in]`
+        let mv = |src: &Handle, in_dim: u32, w: &Handle, out_rows: u32, y: &Handle, pre_rms: bool, swiglu: bool, residual: bool| unsafe {
+            let y_len = if swiglu { out_rows / 2 } else { out_rows };
+            row_matvec_kernel::launch_unchecked::<Rt>(
+                &self.client,
+                CubeCount::new_1d(out_rows / ROWS),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(src.clone(), (in_dim / 4) as usize),
+                ArrayArg::from_raw_parts(w.clone(), (out_rows * in_dim / 4) as usize),
+                ArrayArg::from_raw_parts(self.dummy.clone(), out_rows as usize),
+                ArrayArg::from_raw_parts(y.clone(), y_len as usize),
+                EPS,
+                in_dim,
+                ROWS,
+                LANES,
+                pre_rms,
+                swiglu,
+                residual,
+                false,
+            );
+        };
+        for l in &self.layers {
+            let r = l.row.as_ref().expect("row lane buffers");
+            mv(&x, HIDDEN, &r.wide, WIDE_OUT, &self.ywide, true, false, false);
+            unsafe {
+                qk_rope_cache_kernel::launch_unchecked::<Rt>(
+                    &self.client,
+                    CubeCount::new_1d(HH + KV_HEADS),
+                    CubeDim::new_1d(D),
+                    arr(&self.ywide, WIDE_OUT),
+                    arr(&l.wn, 2 * HH * D),
+                    arr(&self.rope, self.max_seq as u32 * 2 * D),
+                    arr(&self.q, HIDDEN),
+                    arr(&l.kcache, self.max_seq as u32 * KV_DIM),
+                    arr(&l.vcache, self.max_seq as u32 * KV_DIM),
+                    pos,
+                    EPS,
+                    HEADS,
+                    KV_HEADS,
+                    D,
+                );
+                attn_decode_kernel::launch_unchecked::<Rt>(
+                    &self.client,
+                    CubeCount::new_1d(HEADS),
+                    CubeDim::new_1d(D),
+                    arr(&self.q, HIDDEN),
+                    arr(&l.kcache, self.max_seq as u32 * KV_DIM),
+                    arr(&l.vcache, self.max_seq as u32 * KV_DIM),
+                    arr(&self.attn, HIDDEN),
+                    pos + 1,
+                    KV_HEADS,
+                    HEADS / KV_HEADS,
+                    D,
+                    MAX_SCORES,
+                );
+            }
+            mv(&self.attn, HIDDEN, &r.o, HIDDEN, &x, false, false, true);
+            mv(&x, HIDDEN, &r.gate_up, 2 * INTER, &self.act, true, true, false);
+            mv(&self.act, INTER, &r.down, HIDDEN, &x, false, false, true);
+        }
+        unsafe {
+            rmsnorm_kernel::launch_unchecked::<Rt>(
+                &self.client,
+                CubeCount::new_single(),
+                CubeDim::new_1d(256),
+                arr(&x, HIDDEN),
+                arr(&self.norm_w, HIDDEN),
+                arr(&self.out, HIDDEN),
+                EPS,
+                HIDDEN,
+                256,
+            );
+        }
+        self.len += 1;
+    }
+
+    #[cfg(not(feature = "predictor-gpu"))]
+    fn step_submit_row(&mut self, _x_host: &[f32]) {
+        unreachable!("the row lane needs the predictor-gpu feature")
     }
 
     fn step_submit_w<W: Float>(&mut self, x_host: &[f32]) {

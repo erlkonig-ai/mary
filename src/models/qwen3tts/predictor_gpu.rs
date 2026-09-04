@@ -107,7 +107,7 @@ const STEPS: usize = NUM_CODE_GROUPS - 1; // 15
 #[cube(launch_unchecked)]
 #[allow(clippy::manual_is_multiple_of)] // `%` is the cube-kernel primitive
 #[allow(clippy::too_many_arguments)]
-fn matvec_kernel(
+pub(crate) fn matvec_kernel(
     x: &Array<Vector<f32, Const<4>>>,
     w: &Array<Vector<f16, Const<4>>>,
     bias: &Array<f32>,
@@ -723,6 +723,20 @@ struct LayerBufs {
     vcache: Handle,
 }
 
+/// How a frame's ~530 launches reach the device. The first frame runs
+/// eagerly, because the first launch of a shape compiles it and a compile
+/// must not happen inside a capture; the second frame is captured as one CUDA
+/// graph over the persistent buffers; every frame after that is one replay.
+/// `MARY_PRED_EAGER=1` holds the eager path (the A/B), as does a backend that
+/// cannot capture or a capture the driver invalidated.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Lane {
+    Cold,
+    Warm,
+    Graph(u64),
+    Eager,
+}
+
 /// The code predictor as a device-resident engine. One
 /// [`predict_frame`](Self::predict_frame) call encodes ~530 dispatches and
 /// syncs exactly once, mirroring
@@ -749,6 +763,18 @@ pub struct PredictorEngine {
     act: Handle,      // [3072]
     logits: Handle,   // [2048]
     code_dev: Handle, // [15] the sampled ids, device-side, never read back
+    // The frame's inputs and its one output, persistent so the launch
+    // sequence sees the same pointers every frame and can be captured once.
+    noise_buf: Handle, // [15 × 2048] the frame's gumbel noise
+    h0: Handle,        // [talker_width] the talker's last hidden state
+    h1: Handle,        // [talker_width] codebook-0's embedding row
+    out: Handle,       // [talker_width + 15] embedding sum ‖ sampled ids
+    zeros: Handle,     // [talker_width + 15] to clear `out` each frame
+    /// Where the frame's launches go: eager, or one captured graph replayed.
+    lane: std::cell::Cell<Lane>,
+    /// The sampling temperature the captured graph bakes in (a by-value
+    /// kernel argument); a session keeps one, and replay asserts it.
+    captured_temp: std::cell::Cell<f32>,
     talker_width: usize,
     /// The format the streamed stack is stored in.
     pub mode: WeightMode,
@@ -873,6 +899,13 @@ impl PredictorEngine {
             act: client.empty(INTER as usize * 4),
             logits: client.empty(VOCAB as usize * 4),
             code_dev: client.empty(STEPS * 4),
+            noise_buf: client.empty(STEPS * VOCAB as usize * 4),
+            h0: client.empty(tw * 4),
+            h1: client.empty(tw * 4),
+            out: client.empty((tw + STEPS) * 4),
+            zeros: client.create_from_slice(as_bytes(&vec![0f32; tw + STEPS])),
+            lane: std::cell::Cell::new(Lane::Cold),
+            captured_temp: std::cell::Cell::new(0.0),
             layers,
             embeddings,
             lm_heads,
@@ -1111,17 +1144,112 @@ impl PredictorEngine {
         } else {
             vec![0f32; STEPS * VOCAB as usize]
         };
-        let noise = self.client.create_from_slice(as_bytes(&noise));
-        // `out` = embedding sum ‖ the 15 sampled ids; created zeroed, read once.
-        let out = self
-            .client
-            .create_from_slice(as_bytes(&vec![0f32; tw + STEPS]));
 
-        let h0 = self.client.create_from_slice(as_bytes(talker_hidden));
-        self.project(&h0);
+        // Inputs into their persistent buffers — one upload and one copy
+        // each, outside any graph — and `out` cleared.
+        self.refresh(&self.noise_buf, &noise);
+        self.refresh(&self.h0, talker_hidden);
+        self.refresh(&self.h1, code0_embed);
+        self.copy(&self.zeros, &self.out, (tw + STEPS) as u32);
+
+        match self.lane.get() {
+            Lane::Eager => self.frame_launches(temp),
+            Lane::Cold => {
+                let capturable = std::env::var("MARY_PRED_EAGER").is_err()
+                    && self.client.graph_capture_supported();
+                if capturable {
+                    // The warm frame runs with the capture arena open, so the
+                    // runtime learns the region's allocation sequence (launch
+                    // metadata) at addresses a capture may then bake in.
+                    self.client.graph_arena_begin();
+                    self.frame_launches(temp);
+                    self.client.graph_arena_end();
+                    self.lane.set(Lane::Warm);
+                } else {
+                    self.frame_launches(temp);
+                    self.lane.set(Lane::Eager);
+                }
+            }
+            Lane::Warm => {
+                // Drain the drop queue before the capture opens: inside it the
+                // flush is suppressed, so it must not be due. The arena stays
+                // reserved after it closes, which is what keeps every address
+                // the graph recorded valid for as long as it is replayed.
+                self.client.flush();
+                self.client.graph_arena_begin();
+                self.client.graph_capture_begin();
+                self.frame_launches(temp);
+                let intact = self.client.graph_capture_status() == 1;
+                let g = self.client.graph_capture_end();
+                self.client.graph_arena_end();
+                if intact {
+                    eprintln!(
+                        "[predictor] captured the frame: {} launches → {} graph nodes",
+                        self.client.graph_launch_count(g),
+                        self.client.graph_node_count(g)
+                    );
+                    self.captured_temp.set(temp);
+                    self.lane.set(Lane::Graph(g));
+                    // captured work never executed: this frame runs as a replay
+                    self.client.graph_replay(g);
+                } else {
+                    eprintln!("[predictor] the driver invalidated the capture; staying eager");
+                    self.client.graph_destroy(g);
+                    self.lane.set(Lane::Eager);
+                    self.frame_launches(temp);
+                }
+            }
+            Lane::Graph(g) => {
+                assert!(
+                    (self.captured_temp.get() - temp).abs() < 1e-9,
+                    "the captured frame bakes in the sampling temperature; a session keeps one"
+                );
+                self.client.graph_replay(g);
+            }
+        }
+
+        // the frame's one sync
+        let bytes = self.client.read_one(self.out.clone()).expect("readback");
+        let vals = f32::from_bytes(&bytes);
+        let mut codes = [0u32; STEPS];
+        for (i, c) in codes.iter_mut().enumerate() {
+            *c = vals[tw + i] as u32;
+        }
+        (codes, vals[..tw].to_vec())
+    }
+
+    /// Whether frames are currently replayed from a captured graph.
+    pub fn replaying(&self) -> bool {
+        matches!(self.lane.get(), Lane::Graph(_))
+    }
+
+    /// Upload `host` and copy it into the persistent `dst`.
+    fn refresh(&self, dst: &Handle, host: &[f32]) {
+        let src = self.client.create_from_slice(as_bytes(host));
+        self.copy(&src, dst, host.len() as u32);
+    }
+
+    fn copy(&self, src: &Handle, dst: &Handle, n: u32) {
+        unsafe {
+            copy_kernel::launch_unchecked::<Rt>(
+                &self.client,
+                CubeCount::new_1d(n.div_ceil(256)),
+                CubeDim::new_1d(256),
+                ArrayArg::from_raw_parts(src.clone(), n as usize),
+                ArrayArg::from_raw_parts(dst.clone(), n as usize),
+                n,
+            );
+        }
+    }
+
+    /// The frame's launch sequence over the persistent buffers: two
+    /// projected positions, then 15 steps of head → sample → gather →
+    /// position. Every pointer and scalar here is the same each frame.
+    fn frame_launches(&self, temp: f32) {
+        let tw = self.talker_width;
+        self.project(&self.h0);
         self.forward_pos(0);
-        let h1 = self.client.create_from_slice(as_bytes(code0_embed));
-        self.project(&h1);
+        self.project(&self.h1);
         self.forward_pos(1);
 
         for step in 0..STEPS {
@@ -1143,9 +1271,9 @@ impl PredictorEngine {
                     CubeCount::new_single(),
                     CubeDim::new_1d(256),
                     ArrayArg::from_raw_parts(self.logits.clone(), VOCAB as usize),
-                    ArrayArg::from_raw_parts(noise.clone(), STEPS * VOCAB as usize),
+                    ArrayArg::from_raw_parts(self.noise_buf.clone(), STEPS * VOCAB as usize),
                     ArrayArg::from_raw_parts(self.code_dev.clone(), STEPS),
-                    ArrayArg::from_raw_parts(out.clone(), tw + STEPS),
+                    ArrayArg::from_raw_parts(self.out.clone(), tw + STEPS),
                     step as u32 * VOCAB,
                     step as u32,
                     (tw + step) as u32,
@@ -1159,7 +1287,7 @@ impl PredictorEngine {
                     CubeDim::new_1d(256),
                     ArrayArg::from_raw_parts(self.embeddings[step].clone(), VOCAB as usize * tw),
                     ArrayArg::from_raw_parts(self.code_dev.clone(), STEPS),
-                    ArrayArg::from_raw_parts(out.clone(), tw + STEPS),
+                    ArrayArg::from_raw_parts(self.out.clone(), tw + STEPS),
                     ArrayArg::from_raw_parts(self.xin.clone(), tw),
                     step as u32,
                     tw as u32,
@@ -1170,14 +1298,5 @@ impl PredictorEngine {
                 self.forward_pos(step as u32 + 2);
             }
         }
-
-        // the frame's one sync
-        let bytes = self.client.read_one(out).expect("readback");
-        let vals = f32::from_bytes(&bytes);
-        let mut codes = [0u32; STEPS];
-        for (i, c) in codes.iter_mut().enumerate() {
-            *c = vals[tw + i] as u32;
-        }
-        (codes, vals[..tw].to_vec())
     }
 }
