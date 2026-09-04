@@ -91,6 +91,24 @@
 //! so the sum must be the world size -- cannot catch this one, because it
 //! catches a group that PAIRED WRONGLY and this group never pairs at all.
 //!
+//! # A TCP probe of the rendezvous port IS a peer
+//!
+//! 2026-09-04, forty minutes: rank 0 sat in "building the communicator" with
+//! no rank 1 alive, because a `</dev/tcp/10.55.0.2/29500` reachability check
+//! from the other box had CONNECTED, rank 0 took that socket as its one peer
+//! for a world of two, closed the listener, and entered `ncclCommInitRank`
+//! against a shell builtin. The real rank 1, launched afterwards, was refused.
+//! Nothing here can tell a probe from a rank before the handshake, and nothing
+//! should have to: check reachability with `ping`, or read `ss -ltn` on the
+//! binding box, never with a connection.
+//!
+//! The launch-order trap that led to the probe: an ssh line of the form
+//! `ssh box "cd dir && nohup cmd > log 2>&1 < /dev/null &"` backgrounds the
+//! whole `cd && nohup` list in a subshell that still holds the ssh channel, so
+//! the ssh does not return until the rank EXITS -- rank 1 dialed its whole
+//! 180 s window before rank 0 had even been started. `setsid -f sh -c 'exec
+//! cmd > log 2>&1 < /dev/null'` returns at once.
+//!
 //! # Sum is the only reduction, and that is not a limitation
 //!
 //! cubecl exposes `Sum` and `Mean`. Every collective this design needs is a
