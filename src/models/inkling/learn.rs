@@ -552,8 +552,11 @@ pub const ANCHOR_ROWS: usize = 64;
 
 /// What a learning pass learns TOWARD, per row.
 pub enum Target<'a> {
-    /// The id that actually followed each row: next-token NLL.
-    Ids(&'a [usize]),
+    /// The id that actually followed each row: next-token NLL. `skip` is as
+    /// long as `ids`; a skipped row carries no gradient and is not counted --
+    /// an audio slot's row, whose "next id" is the placeholder every audio
+    /// frame stands behind and would be learned for free and for nothing.
+    Ids { ids: &'a [usize], skip: &'a [bool] },
     /// A distribution per row, `[rows, vocab_eff]` f32, held to at `weight`
     /// times the NLL's scale: the gradient is `weight * (softmax - dist)`.
     Dist { dist: &'a T2, weight: f32 },
@@ -718,7 +721,15 @@ pub fn learn_last_layer(
     let t0 = std::time::Instant::now();
     let [n, h] = xd.dims();
     let scored = match &target {
-        Target::Ids(ids) => ids.len(),
+        Target::Ids { ids, skip } => {
+            anyhow::ensure!(
+                skip.len() == ids.len(),
+                "a skip mask of {} rows for {} target ids",
+                skip.len(),
+                ids.len()
+            );
+            ids.len()
+        }
         Target::Dist { dist, .. } => {
             let [rows, width] = dist.dims();
             anyhow::ensure!(
@@ -729,25 +740,37 @@ pub fn learn_last_layer(
         }
     };
     anyhow::ensure!(scored > 0 && scored <= n, "a learning pass wants scored rows");
+    // The mean is over the rows that carry gradient; skipped rows weigh zero.
+    let kept = match &target {
+        Target::Ids { skip, .. } => skip.iter().filter(|&&s| !s).count(),
+        Target::Dist { .. } => scored,
+    };
+    anyhow::ensure!(kept > 0, "every scored row of this pass is skipped; nothing to learn");
     let sconv = keep.sconv.as_ref().expect("the session fills in the last layer's taps");
 
     // ---- 1. head backward, in row slices ----------------------------------
     let mut g_hs: T2 = Tensor::zeros([n, h], dev);
-    let inv = 1.0 / scored as f32;
+    let inv = 1.0 / kept as f32;
     let mut lo = 0;
     while lo < scored {
         let hi = (lo + slice_rows).min(scored);
         let rows = hi - lo;
         let logits = head(xd.clone().slice([lo..hi, 0..h]));
         let g = match &target {
-            Target::Ids(ids) => {
+            Target::Ids { ids, skip } => {
                 let idx: Vec<i64> = ids[lo..hi].iter().map(|&t| t as i64).collect();
                 let idx: Tensor<Bk, 2, Int> =
                     Tensor::from_data(TensorData::new(idx, [rows, 1]), dev);
                 let minus: T2 = Tensor::zeros([rows, 1], dev).sub_scalar(1.0);
+                // Per-row weight: `inv` for a scored row, zero for a skipped one.
+                let weight: Vec<f32> = skip[lo..hi]
+                    .iter()
+                    .map(|&s| if s { 0.0 } else { inv })
+                    .collect();
+                let weight: T2 = Tensor::from_data(TensorData::new(weight, [rows, 1]), dev);
                 burn::tensor::activation::softmax(logits, 1)
                     .scatter(1, idx, minus, burn::tensor::IndexingUpdateOp::Add)
-                    .mul_scalar(inv)
+                    .mul(weight)
             }
             Target::Dist { dist, weight } => {
                 let p = burn::tensor::activation::softmax(

@@ -654,6 +654,9 @@ enum PassOutput {
 /// under the live weights, and -- while a layer is frozen -- the same rows
 /// under the checkpoint's experts on that layer, everything else identical.
 /// `frozen` is empty when nothing is frozen and otherwise as long as `nll`.
+/// An entry is `NaN` where the row was NOT scored -- its target was the audio
+/// slot -- so the vectors stay one entry per appended id after the first and
+/// a mean is over the finite entries.
 #[derive(Clone, Debug, Default)]
 pub struct ScoredNll {
     pub nll: Vec<f32>,
@@ -2263,6 +2266,14 @@ impl Session {
                 // slice also yields the committed token.
                 let mut targets: Vec<usize> = ids[1..].to_vec();
                 targets.extend(next);
+                // A row whose target is the audio slot is not scored and not
+                // learned from: every audio frame stands behind the same
+                // placeholder id, so its "next token" is free to predict and
+                // means nothing. Those rows read NaN in the score.
+                let skip: Vec<bool> = match self.audio.as_ref().and_then(|a| a.slot) {
+                    Some(slot) => targets.iter().map(|&t| t == slot).collect(),
+                    None => vec![false; targets.len()],
+                };
                 let mut nll = Vec::with_capacity(targets.len());
                 let mut best = None;
                 let mut lo = 0;
@@ -2283,6 +2294,11 @@ impl Session {
                     lo = hi;
                 }
                 let best = best.expect("a pass has at least one row");
+                for (v, &s) in nll.iter_mut().zip(&skip) {
+                    if s {
+                        *v = f32::NAN;
+                    }
+                }
                 // The CONTROL. The residual stream is the checkpoint's up to
                 // the learned layer, so the frozen model's score of these
                 // same rows is that one layer again over its frozen experts
@@ -2292,7 +2308,7 @@ impl Session {
                 // rows, so both columns are prequential. The kept forward
                 // stays for the learner: this pass reads it and leaves it.
                 #[cfg(feature = "inkling-cuda")]
-                let frozen_nll: Vec<f32> = match (self.moe.learn.as_ref(), self.src.frozen_prefix()) {
+                let mut frozen_nll: Vec<f32> = match (self.moe.learn.as_ref(), self.src.frozen_prefix()) {
                     (Some(keep), Some(prefix)) if !targets.is_empty() => {
                         let layer = keep.layer;
                         let hn = keep.hn.clone();
@@ -2350,7 +2366,7 @@ impl Session {
                     _ => Vec::new(),
                 };
                 #[cfg(not(feature = "inkling-cuda"))]
-                let frozen_nll: Vec<f32> = Vec::new();
+                let mut frozen_nll: Vec<f32> = Vec::new();
                 #[cfg(feature = "inkling-cuda")]
                 let learn_inter = match tp {
                     Some(tp) => tp
@@ -2364,7 +2380,7 @@ impl Session {
                 // order before the next pass reads the arena.
                 #[cfg(feature = "inkling-cuda")]
                 if let (Some(learner), Some(keep)) = (self.learner.as_mut(), self.moe.learn.take())
-                    && !targets.is_empty()
+                    && skip.iter().any(|&s| !s)
                 {
                     let route = self.moe.route.as_ref().expect("a routed layer ran");
                     let tab = route
@@ -2384,7 +2400,10 @@ impl Session {
                         &xd,
                         final_norm,
                         &head,
-                        super::learn::Target::Ids(&targets),
+                        super::learn::Target::Ids {
+                            ids: &targets,
+                            skip: &skip,
+                        },
                         mup,
                         eps,
                         vocab,
@@ -2500,7 +2519,14 @@ impl Session {
                     best,
                     nll: ScoredNll {
                         nll,
-                        frozen: frozen_nll,
+                        frozen: {
+                            for (v, &s) in frozen_nll.iter_mut().zip(&skip) {
+                                if s {
+                                    *v = f32::NAN;
+                                }
+                            }
+                            frozen_nll
+                        },
                     },
                 })
             }

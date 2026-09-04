@@ -218,12 +218,19 @@ pub fn ready_fragment(ready: &Ready) -> Result<Fragment> {
 pub fn turn_end_fragment(end: &TurnEnd) -> Fragment {
     let mut fragment = Fragment::empty();
     let stop_reason = fragment.put::<UTF8String, _>(end.stopped.to_owned());
-    let scored = (!end.delta_nll.is_empty()).then(|| {
-        let nats: f64 = end.delta_nll.iter().map(|&x| x as f64).sum();
-        (nats, end.delta_nll.len() as u128)
-    });
-    let frozen = (end.delta_nll_frozen.len() == end.delta_nll.len() && !end.delta_nll.is_empty())
-        .then(|| end.delta_nll_frozen.iter().map(|&x| x as f64).sum::<f64>());
+    // NaN entries are rows that were not scored (audio slots): neither summed
+    // nor counted, in both columns.
+    let finite = |v: &[f32]| -> (f64, u128) {
+        v.iter()
+            .filter(|x| x.is_finite())
+            .fold((0f64, 0u128), |(s, c), &x| (s + x as f64, c + 1))
+    };
+    let scored = {
+        let (nats, count) = finite(&end.delta_nll);
+        (count > 0).then_some((nats, count))
+    };
+    let frozen = (end.delta_nll_frozen.len() == end.delta_nll.len() && scored.is_some())
+        .then(|| finite(&end.delta_nll_frozen).0);
     fragment += entity! { _ @
         metadata::tag: schema::kind_turn_end,
         schema::turn: end.turn as u128,

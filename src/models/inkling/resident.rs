@@ -1083,21 +1083,27 @@ pub struct TurnEnd {
     pub position: usize,
 }
 
+/// Mean over the scored entries: a `NaN` entry is a row that was not scored
+/// (its target was the audio slot) and is neither summed nor counted.
+pub fn finite_mean(scores: &[f32]) -> Option<f64> {
+    let (sum, count) = scores
+        .iter()
+        .filter(|x| x.is_finite())
+        .fold((0f64, 0usize), |(s, c), &x| (s + x as f64, c + 1));
+    (count > 0).then(|| sum / count as f64)
+}
+
 impl TurnEnd {
     /// Mean of [`TurnEnd::delta_nll`] in nats per scored delta token, `None`
     /// when nothing was scored.
     pub fn delta_mean_nll(&self) -> Option<f64> {
-        (!self.delta_nll.is_empty())
-            .then(|| self.delta_nll.iter().map(|&x| x as f64).sum::<f64>() / self.delta_nll.len() as f64)
+        finite_mean(&self.delta_nll)
     }
 
     /// Mean of [`TurnEnd::delta_nll_frozen`], the checkpoint's score of the
     /// same delta, `None` when no layer was frozen.
     pub fn delta_mean_nll_frozen(&self) -> Option<f64> {
-        (!self.delta_nll_frozen.is_empty()).then(|| {
-            self.delta_nll_frozen.iter().map(|&x| x as f64).sum::<f64>()
-                / self.delta_nll_frozen.len() as f64
-        })
+        finite_mean(&self.delta_nll_frozen)
     }
 
     /// One line for a report, carrying its own framing rule.
