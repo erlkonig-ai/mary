@@ -1237,7 +1237,8 @@ impl Session {
             let Some(layer) = self.moe.learn_layer else {
                 return Ok(Vec::new());
             };
-            cubecl::future::block_on(self.client.sync());
+            cubecl::future::block_on(self.client.sync())
+                .map_err(|e| anyhow::anyhow!("device sync before exporting the learned layer: {e:?}"))?;
             let tp = self.group.as_ref().map(|g| g.tp());
             let n_routed = self.cfg.text_config.n_routed_experts;
             return super::learned::export_learned(&self.src, tp, layer, n_routed);

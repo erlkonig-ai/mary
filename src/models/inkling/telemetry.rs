@@ -153,6 +153,7 @@ pub mod schema {
     pub const kind_turn_end: Id = triblespace::macros::id_hex!("393BFF0B7490738059AAE5440B5DBBAB");
     /// A learned version was written back into the model graph
     /// (`Model::persist_learned`). Minted 2026-09-03.
+    #[allow(non_upper_case_globals)]
     pub const kind_persisted: Id = triblespace::macros::id_hex!("EAC03015B00190308DCE7E58ACE5D800");
 
     /// One exact context-admission preflight.
