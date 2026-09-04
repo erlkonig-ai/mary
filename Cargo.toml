@@ -286,7 +286,7 @@ q4 = ["dep:cubecl", "cubecl?/wgpu", "dep:memmap2"]
 mxfp4 = ["dep:sha2"]
 # `mary::speak` — the production voice seam: Qwen3-TTS synthesis loading its
 # weights from a durable standalone pile (no safetensors in the load path).
-speak = ["qwen3tts", "predictor-gpu"]
+speak = ["qwen3tts", "predictor-gpu", "megakernel"]
 # Voxtral-Mini-4B-Realtime (mary::models::voxtral) — delay-
 # conditioned streaming STT. Tekken tokenizer is decode-only (serde_json,
 # already unconditional); fusion deps for the BFused decode loop; memmap2

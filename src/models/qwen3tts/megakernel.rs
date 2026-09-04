@@ -37,6 +37,7 @@ use cubecl::server::Handle;
 
 use super::config::*;
 use super::layers::KvCache;
+use super::pipeline::FrameStepper;
 use super::talker::Talker;
 
 /// The raw (non-fusion) f32 backend whose tensors the engine aliases.
@@ -556,6 +557,11 @@ impl TalkerEngine {
         self.len == 0
     }
 
+    /// The cache ring's capacity: prefill + frames a pass can hold.
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
     /// Encode + submit one decode step (141 dispatches), without reading back.
     pub fn step_submit(&mut self, x_host: &[f32]) {
         assert_eq!(x_host.len(), TALKER_HIDDEN);
@@ -669,6 +675,50 @@ impl TalkerEngine {
     /// Dispatches encoded per [`step_submit`] — the number the whole module
     /// exists to shrink.
     pub const DISPATCHES_PER_STEP: usize = TALKER_LAYERS * 5 + 1;
+}
+
+/// [`FrameStepper`] over the engine: the Burn talker runs each pass's prefill
+/// (its shapes are one-off anyway), then the engine takes the frames from the
+/// imported caches — one host row in, one normed hidden state out per frame.
+pub struct EngineStepper<'a> {
+    talker: &'a Talker<Raw>,
+    engine: &'a mut TalkerEngine,
+    pending: Option<BurnTensor<Raw, 3>>,
+}
+
+impl<'a> EngineStepper<'a> {
+    pub fn new(
+        talker: &'a Talker<Raw>,
+        engine: &'a mut TalkerEngine,
+        prefill: BurnTensor<Raw, 3>,
+        device: &<Raw as burn::tensor::backend::BackendTypes>::Device,
+    ) -> Self {
+        let mut caches = talker.new_caches();
+        let h = talker.forward(prefill, &mut caches, device);
+        engine.import_caches(&caches);
+        Self {
+            talker,
+            engine,
+            pending: Some(h),
+        }
+    }
+}
+
+impl FrameStepper for EngineStepper<'_> {
+    fn hidden(&mut self) -> Vec<f32> {
+        match self.pending.take() {
+            Some(h) => self.talker.last_hidden(h),
+            None => self.engine.read_hidden(),
+        }
+    }
+
+    fn submit(&mut self, x: &[f32]) -> bool {
+        if self.engine.len() >= self.engine.max_seq() {
+            return false;
+        }
+        self.engine.step_submit(x);
+        true
+    }
 }
 
 /// Shared-memory cap of [`attn_decode_kernel`]'s score buffer (f32 count).

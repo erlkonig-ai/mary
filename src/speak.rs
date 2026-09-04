@@ -486,9 +486,12 @@ impl Synthesizer {
         // The talker runs on the RAW (non-fusion) backends — the ONLY talker
         // lane. f16 by default (halves per-step weight traffic — the realtime
         // fast path; identity holds within the resemblyzer gate);
-        // MARY_SPEAK_F32=1 selects the full-precision talker. The CPU code
-        // predictor and the f32 codec are unaffected by the switch.
-        if std::env::var("MARY_SPEAK_F32").is_ok() {
+        // MARY_SPEAK_F32=1 selects the full-precision talker. The code
+        // predictor and the f32 codec are unaffected by the switch. The Linux
+        // build runs the frames on the fused engine (`megakernel`), which
+        // aliases f32 weight buffers, so it takes the f32 talker always.
+        let engine_lane = cfg!(all(feature = "megakernel", target_os = "linux"));
+        if engine_lane || std::env::var("MARY_SPEAK_F32").is_ok() {
             spawn_impl::<crate::nn::backend::speak::Raw>(weights, ref_wav, ref_text, ref_codes)
         } else {
             spawn_impl::<crate::nn::backend::speak::RawHalf>(weights, ref_wav, ref_text, ref_codes)
@@ -671,6 +674,9 @@ fn spawn_impl<B: Backend + 'static>(
                     return;
                 }
             };
+            // The fused decode engine over the talker's own weight buffers
+            // (Linux/CUDA builds; None elsewhere or under MARY_SPEAK_BURN=1).
+            let mut engine = fused_engine(&talker);
 
             let (hop, ctx) =
                 (env_usize("MARY_SPEAK_HOP", STREAM_HOP), env_usize("MARY_SPEAK_CTX", STREAM_CTX));
@@ -889,20 +895,34 @@ fn spawn_impl<B: Backend + 'static>(
                     if std::env::var("QWEN3TTS_BENCH").is_ok() {
                         eprintln!("bench: build_prefill {:.0}ms", tb.elapsed().as_secs_f32() * 1e3);
                     }
-                    let frames = pipeline::generate_streaming(
-                        &talker,
-                        &predictor,
-                        prefill,
-                        trailing,
-                        tts_pad,
-                        &params,
-                        &mut rng,
-                        &dev,
-                        |f| {
-                            !cancelled.load(std::sync::atomic::Ordering::Relaxed)
-                                && tx_c.send(CodecMsg::Frame(*f)).is_ok()
-                        },
-                    );
+                    let text = pipeline::TextSide::read(&talker, &trailing, &tts_pad);
+                    let sink = |f: &[u32; NUM_CODE_GROUPS]| {
+                        !cancelled.load(std::sync::atomic::Ordering::Relaxed)
+                            && tx_c.send(CodecMsg::Frame(*f)).is_ok()
+                    };
+                    let frames = match engine_stepper(engine.as_mut(), &talker, &prefill, &dev) {
+                        Some(mut stepper) => pipeline::generate_streaming_with(
+                            &talker,
+                            &predictor,
+                            stepper.as_mut(),
+                            &text,
+                            &params,
+                            &mut rng,
+                            sink,
+                        ),
+                        None => {
+                            let mut stepper = pipeline::BurnStepper::new(&talker, prefill, &dev);
+                            pipeline::generate_streaming_with(
+                                &talker,
+                                &predictor,
+                                &mut stepper,
+                                &text,
+                                &params,
+                                &mut rng,
+                                sink,
+                            )
+                        }
+                    };
                     total_frames += frames.len();
                     if tx_c.send(CodecMsg::PassEnd { gap: i + 1 < chunks.len() }).is_err() {
                         codec_gone = true;
@@ -949,6 +969,69 @@ fn spawn_impl<B: Backend + 'static>(
         .map_err(|error| anyhow::anyhow!("spawn the speak generation thread: {error}"))?;
 
     Ok(Synthesizer { tx: tx_req })
+}
+
+/// The fused talker decode engine over the session's talker, when this build
+/// has it and the talker is the f32 raw lane it aliases. `MARY_SPEAK_BURN=1`
+/// holds the frames on the Burn op loop for an A/B.
+#[cfg(all(feature = "megakernel", target_os = "linux"))]
+fn fused_engine<B: Backend + 'static>(
+    talker: &Talker<B>,
+) -> Option<crate::models::qwen3tts::megakernel::TalkerEngine> {
+    use crate::models::qwen3tts::megakernel::{Raw, TalkerEngine, MAX_SCORES};
+    use std::any::Any;
+    if std::env::var("MARY_SPEAK_BURN").is_ok() {
+        return None;
+    }
+    let raw = (talker as &dyn Any).downcast_ref::<Talker<Raw>>()?;
+    let t = Instant::now();
+    let engine = TalkerEngine::new(raw, MAX_SCORES as usize);
+    eprintln!(
+        "[timing] talker → fused engine ({} dispatches/frame, ring {} positions): {:.2}s",
+        TalkerEngine::DISPATCHES_PER_STEP,
+        MAX_SCORES,
+        t.elapsed().as_secs_f32()
+    );
+    Some(engine)
+}
+
+#[cfg(not(all(feature = "megakernel", target_os = "linux")))]
+fn fused_engine<B: Backend + 'static>(_talker: &Talker<B>) -> Option<()> {
+    None
+}
+
+/// A pass's [`pipeline::FrameStepper`] over the fused engine: the Burn prefill
+/// runs on the raw talker, the engine imports its caches and takes the frames.
+/// `None` when there is no engine (the caller runs the Burn loop).
+#[cfg(all(feature = "megakernel", target_os = "linux"))]
+fn engine_stepper<'a, B: Backend + 'static>(
+    engine: Option<&'a mut crate::models::qwen3tts::megakernel::TalkerEngine>,
+    talker: &'a Talker<B>,
+    prefill: &burn::tensor::Tensor<B, 3>,
+    device: &B::Device,
+) -> Option<Box<dyn pipeline::FrameStepper + 'a>>
+where
+    B::Device: 'static,
+{
+    use crate::models::qwen3tts::megakernel::{EngineStepper, Raw};
+    use std::any::Any;
+    let engine = engine?;
+    let talker = (talker as &dyn Any).downcast_ref::<Talker<Raw>>()?;
+    let prefill = (prefill as &dyn Any)
+        .downcast_ref::<burn::tensor::Tensor<Raw, 3>>()?
+        .clone();
+    let device = (device as &dyn Any).downcast_ref::<<Raw as burn::tensor::backend::BackendTypes>::Device>()?;
+    Some(Box::new(EngineStepper::new(talker, engine, prefill, device)))
+}
+
+#[cfg(not(all(feature = "megakernel", target_os = "linux")))]
+fn engine_stepper<'a, B: Backend + 'static>(
+    _engine: Option<&'a mut ()>,
+    _talker: &'a Talker<B>,
+    _prefill: &burn::tensor::Tensor<B, 3>,
+    _device: &B::Device,
+) -> Option<Box<dyn pipeline::FrameStepper + 'a>> {
+    None
 }
 
 /// Convenience: [`synthesize`] then write the result to `out_path` as a 24 kHz

@@ -11,6 +11,7 @@ use std::path::Path;
 use super::codec::CodecDecoder;
 use super::config::*;
 use super::encoder::CodecEncoder;
+use super::layers::KvCache;
 use super::predictor::CodePredictor;
 use super::speaker::{SpeakerEncoder, SpeakerMel};
 use super::talker::Talker;
@@ -240,9 +241,96 @@ pub fn generate<B: Backend>(
     )
 }
 
+/// One talker step per frame, behind whichever engine runs it: the Burn op
+/// loop ([`BurnStepper`]) or the fused decode engine
+/// (`megakernel::EngineStepper`, the Linux/CUDA build). The loop hands the
+/// stepper each frame's talker input as ONE host row — codec embedding sum +
+/// codebook-0 row + text side, already added — and reads back one normed
+/// hidden state per frame, which is the frame's one sync.
+pub trait FrameStepper {
+    /// The normed hidden state `[hidden]` of the last submitted position.
+    fn hidden(&mut self) -> Vec<f32>;
+    /// Submit the next position. `false` means the stepper cannot take another
+    /// frame (a bounded cache is full) and the pass ends with the frames so far.
+    fn submit(&mut self, x: &[f32]) -> bool;
+}
+
+/// The Burn op loop: upload the row, run the stack over the growing KV cache,
+/// read the last hidden state back.
+pub struct BurnStepper<'a, B: Backend> {
+    talker: &'a Talker<B>,
+    caches: Vec<KvCache<B>>,
+    device: &'a B::Device,
+    pending: Option<Tensor<B, 3>>,
+}
+
+impl<'a, B: Backend> BurnStepper<'a, B> {
+    /// Runs the prefill; the first [`hidden`](FrameStepper::hidden) is its
+    /// last position.
+    pub fn new(talker: &'a Talker<B>, prefill: Tensor<B, 3>, device: &'a B::Device) -> Self {
+        let mut caches = talker.new_caches();
+        let pending = Some(talker.forward(prefill, &mut caches, device));
+        Self {
+            talker,
+            caches,
+            device,
+            pending,
+        }
+    }
+}
+
+impl<B: Backend> FrameStepper for BurnStepper<'_, B> {
+    fn hidden(&mut self) -> Vec<f32> {
+        let h = self.pending.take().expect("a submitted position to read back");
+        self.talker.last_hidden(h)
+    }
+
+    fn submit(&mut self, x: &[f32]) -> bool {
+        let e = Tensor::<B, 1>::from_floats(x, self.device).reshape([1, 1, self.talker.hidden]);
+        self.pending = Some(self.talker.forward(e, &mut self.caches, self.device));
+        true
+    }
+}
+
+/// The text side of each frame's input, read back to the host once per pass:
+/// the trailing text hiddens (one row per early frame), then `tts_pad`.
+pub struct TextSide {
+    rows: Vec<f32>,
+    pad: Vec<f32>,
+    hidden: usize,
+}
+
+impl TextSide {
+    pub fn read<B: Backend>(
+        talker: &Talker<B>,
+        trailing: &Tensor<B, 3>,
+        tts_pad: &Tensor<B, 3>,
+    ) -> Self {
+        let host = |t: &Tensor<B, 3>| -> Vec<f32> {
+            t.clone().into_data().convert::<f32>().to_vec::<f32>().unwrap()
+        };
+        Self {
+            rows: host(trailing),
+            pad: host(tts_pad),
+            hidden: talker.hidden,
+        }
+    }
+
+    /// The row added at frame `step`.
+    pub fn row(&self, step: usize) -> &[f32] {
+        let n = self.rows.len() / self.hidden;
+        if step < n {
+            &self.rows[step * self.hidden..][..self.hidden]
+        } else {
+            &self.pad
+        }
+    }
+}
+
 /// [`generate`] with a per-frame sink — the streaming path hands each frame
 /// to the codec thread the moment it is sampled. Returning `false` from the
-/// sink stops generation without retaining the rejected frame.
+/// sink stops generation without retaining the rejected frame. Runs the Burn
+/// loop; [`generate_streaming_with`] takes any [`FrameStepper`].
 #[allow(clippy::too_many_arguments)]
 pub fn generate_streaming<B: Backend>(
     talker: &Talker<B>,
@@ -253,6 +341,25 @@ pub fn generate_streaming<B: Backend>(
     params: &SamplingParams,
     rng: &mut StdRng,
     device: &B::Device,
+    on_frame: impl FnMut(&[u32; NUM_CODE_GROUPS]) -> bool,
+) -> Vec<[u32; NUM_CODE_GROUPS]> {
+    let text = TextSide::read(talker, &trailing, &tts_pad);
+    let mut stepper = BurnStepper::new(talker, prefill, device);
+    generate_streaming_with(talker, predictor, &mut stepper, &text, params, rng, on_frame)
+}
+
+/// The generation loop over a [`FrameStepper`] that has already run the
+/// prefill. Per frame: one read-back of the normed hidden state (the one
+/// sync), codebook-0 logits + sampling on the host, the code predictor, then
+/// the next input row (codec embedding sum + text side) submitted.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_streaming_with<B: Backend>(
+    talker: &Talker<B>,
+    predictor: &CodePredictor,
+    stepper: &mut dyn FrameStepper,
+    text: &TextSide,
+    params: &SamplingParams,
+    rng: &mut StdRng,
     mut on_frame: impl FnMut(&[u32; NUM_CODE_GROUPS]) -> bool,
 ) -> Vec<[u32; NUM_CODE_GROUPS]> {
     let bench = std::env::var("QWEN3TTS_BENCH").is_ok();
@@ -264,27 +371,21 @@ pub fn generate_streaming<B: Backend>(
     let gate = std::env::var("MARY_PRED_GATE").is_ok() && predictor.on_gpu();
     let (mut gate_hit, mut gate_tot) = (0usize, 0usize);
     let mut gate_embed_err = 0f32;
-    let mut caches = talker.new_caches();
-    let prefill_len = prefill.dims()[1];
-    let tp0 = std::time::Instant::now();
-    let mut hidden = talker.forward(prefill, &mut caches, device);
-    let t_prefill_submit = tp0.elapsed().as_secs_f64();
 
-    let trailing_len = trailing.dims()[1];
     let mut generated: Vec<u32> = Vec::new();
     let mut frames: Vec<[u32; NUM_CODE_GROUPS]> = Vec::new();
 
-    // Per-frame decomposition (bench only): sync = the one GPU read-back wait,
-    // logits = CPU head gemv + processing + sampling, pred = the CPU code
-    // predictor, embed = next-input assembly + upload, talker = op submission.
-    // Frame 0's sync also drains the prefill GPU work + first-op JIT — tracked
-    // separately so the steady-state numbers stay honest.
+    // Per-frame decomposition (bench only): sync = the one hidden-state
+    // read-back, logits = CPU head gemv + processing + sampling, pred = the
+    // code predictor, embed = next-input assembly, talker = submission. Frame
+    // 0's sync also drains the prefill + first-op JIT — tracked separately so
+    // the steady-state numbers stay honest.
     let (mut t_talker, mut t_pred, mut t_sync, mut t_logits, mut t_embed) =
         (0f64, 0f64, 0f64, 0f64, 0f64);
     let mut t_sync0 = 0f64;
     for step in 0..params.max_frames {
         let ts = std::time::Instant::now();
-        let h = talker.last_hidden(hidden.clone()); // the one sync per frame
+        let h = stepper.hidden(); // the one sync per frame
         let dt_sync = ts.elapsed().as_secs_f64();
         if step == 0 {
             t_sync0 = dt_sync;
@@ -307,7 +408,7 @@ pub fn generate_streaming<B: Backend>(
             break;
         }
 
-        // fill codebooks 1..15 for this frame (CPU)
+        // fill codebooks 1..15 for this frame
         let tp = std::time::Instant::now();
         let code0_row = talker.codec_row(code0);
         let oracle = gate.then(|| {
@@ -343,26 +444,20 @@ pub fn generate_streaming<B: Backend>(
         }
         frames.push(frame);
 
-        // next talker input: Σ₁₆ codebook embeds (assembled host-side, one
-        // upload) + trailing text (or tts_pad)
+        // next talker input: Σ₁₆ codebook embeds + codebook-0 row + text side,
+        // assembled host-side as one row
         let te = std::time::Instant::now();
-        for (e, &r) in embed_sum.iter_mut().zip(code0_row) {
-            *e += r;
+        let text_row = text.row(step);
+        for ((e, &r), &t) in embed_sum.iter_mut().zip(code0_row).zip(text_row) {
+            *e += r + t;
         }
-        let e = Tensor::<B, 1>::from_floats(embed_sum.as_slice(), device).reshape([
-            1,
-            1,
-            talker.hidden,
-        ]);
-        let text_side = if step < trailing_len {
-            trailing.clone().narrow(1, step, 1)
-        } else {
-            tts_pad.clone()
-        };
         t_embed += te.elapsed().as_secs_f64();
         let tt = std::time::Instant::now();
-        hidden = talker.forward(e + text_side, &mut caches, device);
+        let more = stepper.submit(&embed_sum);
         t_talker += tt.elapsed().as_secs_f64();
+        if !more {
+            break;
+        }
     }
     if bench {
         // steady-state = per-frame averages with frame 0's sync excluded
@@ -371,11 +466,9 @@ pub fn generate_streaming<B: Backend>(
         let per_frame_ms =
             (t_talker / n + t_sync / ns + t_logits / n + t_pred / n + t_embed / n) * 1e3;
         eprintln!(
-            "bench: prefill {}pos submit {:.0}ms + frame0-sync(JIT+drain) {:.0}ms | per frame: \
-             {:.1}ms talker-submit + {:.1}ms sync + {:.1}ms logits+sample + {:.1}ms cpu-predictor \
-             + {:.1}ms embed-upload = {:.1}ms ({} frames, {:.2}x audio-rate steady)",
-            prefill_len,
-            t_prefill_submit * 1e3,
+            "bench: frame0-sync(prefill+JIT) {:.0}ms | per frame: {:.1}ms talker-submit + \
+             {:.1}ms sync + {:.1}ms logits+sample + {:.1}ms predictor + {:.1}ms embed = \
+             {:.1}ms ({} frames, {:.2}x audio-rate steady)",
             t_sync0 * 1e3,
             t_talker / n * 1e3,
             t_sync / ns * 1e3,
@@ -392,7 +485,7 @@ pub fn generate_streaming<B: Backend>(
     }
     if gate {
         eprintln!(
-            "gate: predictor token agreement {}/{} ({:.2}%) over {} frames; max |Δembed_sum|              {:.3e}",
+            "gate: predictor token agreement {}/{} ({:.2}%) over {} frames; max |Δembed_sum| {:.3e}",
             gate_hit,
             gate_tot,
             gate_hit as f64 / gate_tot.max(1) as f64 * 100.0,
