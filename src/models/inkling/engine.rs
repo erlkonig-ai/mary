@@ -860,13 +860,39 @@ impl Model for Engine {
             .codec
             .encode(context)
             .context("encode typed Inkling context")?;
+        // The closing of a message her shell cut is attended to NOW, in a
+        // plain pass of its own. It is neither her word nor the world's, so it
+        // is never scored -- and it cannot wait in the delta: the next
+        // admission's preflight wants an empty delta (fold gate f14,
+        // 2026-09-05, died there), and one unscored flag over the whole next
+        // delta would have hidden her shell's note and the world's answer
+        // from the loss. Her last generated token is the carry and goes in
+        // first; the last closing token becomes the new carry, so the next
+        // turn still scores exactly one row per delta token.
+        if let InklingContext::CloseResponse { .. } = context {
+            anyhow::ensure!(
+                self.delta.is_empty(),
+                "a message is closed for her between turns, with nothing pending"
+            );
+            let carry = self
+                .carry
+                .context("a message can only be closed after a turn generated one")?;
+            let (last, head) = ids
+                .split_last()
+                .context("a CloseResponse encodes at least one token")?;
+            for &id in &ids {
+                let _ = (self.decode)(id as u32)?;
+            }
+            let pass: Vec<usize> = std::iter::once(carry).chain(head.iter().copied()).collect();
+            self.pass(Pass::Extend(pass))
+                .context("attend to the closing of a cut message")?;
+            self.carry = Some(*last);
+            return Ok(());
+        }
         self.delta.extend(ids);
-        // Neither the cover she wakes with nor the closing of a message her
-        // shell cut is her word or the world's: attended to, never scored.
-        if matches!(
-            context,
-            InklingContext::Initialize { .. } | InklingContext::CloseResponse { .. }
-        ) {
+        // The cover she wakes with is not her word or the world's: attended
+        // to, never scored.
+        if matches!(context, InklingContext::Initialize { .. }) {
             self.delta_unscored = true;
         }
         // The payloads behind the slots just emitted, each medium to its own
