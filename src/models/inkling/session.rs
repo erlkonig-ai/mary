@@ -1169,12 +1169,19 @@ impl Session {
             let cache = &self.caches[layer - self.lo].attn;
             let kind = t.attn_kind(layer);
             local_layers += usize::from(kind == AttnKind::Local);
-            let (expected_base, expected_len) =
+            let (expected_base, mut expected_len) =
                 required_cache_span(kind, self.pos, t.sliding_window_size);
+            // A folded span has left this cache and its positions have not:
+            // the rows are fewer by exactly what was evicted, and that is the
+            // complete cache (fold gate f6, 2026-09-05: the first scored extend
+            // after a fold refused a global cache 1033 rows short of its
+            // position).
+            let evicted: usize = cache.evicted().iter().map(|&(a, b)| b - a).sum();
+            expected_len = expected_len.saturating_sub(evicted);
             anyhow::ensure!(
                 cache.len() == expected_len && cache.base() == expected_base,
                 "layer {layer} {:?} cache is base {} + len {} at position {}, expected base \
-                 {expected_base} + len {expected_len}",
+                 {expected_base} + len {expected_len} ({evicted} evicted)",
                 kind,
                 cache.base(),
                 cache.len(),
