@@ -960,6 +960,10 @@ impl Model for Engine {
         Some(self.session.position())
     }
 
+    fn staged_end(&self) -> Option<usize> {
+        Some(self.session.position() + usize::from(self.carry.is_some()) + self.delta.len())
+    }
+
     fn evict(&mut self, from: usize, to: usize) -> Result<()> {
         Engine::evict_span(self, from, to)
     }

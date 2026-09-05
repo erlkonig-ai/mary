@@ -1581,6 +1581,16 @@ pub trait Model: Send {
         None
     }
 
+    /// The absolute position the pending, not-yet-fed delta ends at: where
+    /// her own next token goes once everything staged so far has entered the
+    /// cache. `position()` when nothing is staged. The moment begins here
+    /// after a context is installed, because the install stages rather than
+    /// prefills, and `position()` at that instant still names the row before
+    /// the cover.
+    fn staged_end(&self) -> Option<usize> {
+        self.position()
+    }
+
     /// EVICT the keys at absolute positions `from..to` from the context: a
     /// folded span of the moment leaving the cache while the positions of
     /// everything around it stay exactly what they were, on every rank. The
