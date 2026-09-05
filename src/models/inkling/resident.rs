@@ -1650,6 +1650,17 @@ pub trait Model: Send {
         self.position()
     }
 
+    /// Cut `text` to its first `max_tokens` tokens as THIS model counts them.
+    /// `Ok(None)` when it already fits; otherwise the decoded prefix and the
+    /// full count, so a shell can bound what one result puts in the moment by
+    /// the measure that matters (fold gate f9, 2026-09-05: a character bound
+    /// let file paths run 2.5 characters a token and a binary 1.6). A model
+    /// with no tokenizer fits everything.
+    fn cut_to_tokens(&self, text: &str, max_tokens: usize) -> Result<Option<(String, usize)>> {
+        let _ = (text, max_tokens);
+        Ok(None)
+    }
+
     /// EVICT the keys at absolute positions `from..to` from the context: a
     /// folded span of the moment leaving the cache while the positions of
     /// everything around it stay exactly what they were, on every rank. The

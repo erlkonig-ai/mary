@@ -977,6 +977,22 @@ impl Model for Engine {
         Some(self.session.position() + usize::from(self.carry.is_some()) + self.delta.len())
     }
 
+    fn cut_to_tokens(&self, text: &str, max_tokens: usize) -> Result<Option<(String, usize)>> {
+        let ids = self
+            .codec
+            .encode_raw_content(text)
+            .context("count a result's tokens")?;
+        if ids.len() <= max_tokens {
+            return Ok(None);
+        }
+        let head: Vec<u32> = ids[..max_tokens].iter().map(|&id| id as u32).collect();
+        let prefix = self
+            .tokenizer
+            .decode(&head, true)
+            .map_err(|error| anyhow::anyhow!("decode a cut result's prefix: {error}"))?;
+        Ok(Some((prefix, ids.len())))
+    }
+
     fn evict(&mut self, from: usize, to: usize) -> Result<()> {
         Engine::evict_span(self, from, to)
     }
