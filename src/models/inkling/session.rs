@@ -1526,6 +1526,19 @@ impl Session {
         Ok(())
     }
 
+    /// Positions folded out of the global caches so far: the rows the context
+    /// is SHORTER than its position. Admission counts rows, not positions,
+    /// because a fold frees rows and leaves positions where they were.
+    pub fn evicted_rows(&self) -> usize {
+        let lo = self.lo;
+        self.caches
+            .iter()
+            .enumerate()
+            .find(|(i, _)| self.cfg.text_config.attn_kind(lo + i) == AttnKind::Global)
+            .map(|(_, cache)| cache.attn.evicted().iter().map(|&(a, b)| b - a).sum())
+            .unwrap_or(0)
+    }
+
     pub fn checkpoint(&self) -> Result<Checkpoint> {
         anyhow::ensure!(
             !self.torn,

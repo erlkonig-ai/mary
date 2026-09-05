@@ -865,6 +865,7 @@ impl Model for Engine {
             encoded.len(),
             request.max_response_tokens,
             self.context_budget,
+            self.session.evicted_rows(),
         )
     }
 

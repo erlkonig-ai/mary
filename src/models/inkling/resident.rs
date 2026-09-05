@@ -456,6 +456,8 @@ pub struct ContextPreflighted {
     pub max_response_tokens: usize,
     pub required_end: Option<usize>,
     pub context_budget: usize,
+    /// Rows folded out of the context below `position`; the budget bounds rows.
+    pub evicted: usize,
     pub fits: bool,
 }
 
@@ -490,6 +492,7 @@ impl ContextPreflighted {
             self.delta_tokens,
             self.max_response_tokens,
             self.context_budget,
+            self.evicted,
         )?;
         anyhow::ensure!(
             *self == recomputed,
@@ -511,19 +514,23 @@ pub fn context_preflight(
     delta_tokens: usize,
     max_response_tokens: usize,
     context_budget: usize,
+    evicted: usize,
 ) -> Result<ContextPreflighted> {
     anyhow::ensure!(
         max_response_tokens > 0,
         "context preflight requires a nonzero response bound"
     );
-    let (base_position, base_carried) = match placement {
-        ContextPlacement::Append => (position, carried),
-        ContextPlacement::Replace => (0, 0),
+    let (base_position, base_carried, evicted) = match placement {
+        ContextPlacement::Append => (position, carried, evicted),
+        ContextPlacement::Replace => (0, 0, 0),
     };
     let required_end = base_position
         .checked_add(base_carried)
         .and_then(|end| end.checked_add(delta_tokens))
         .and_then(|end| end.checked_add(max_response_tokens - 1));
+    // Positions folded out of the context are not rows: the budget bounds
+    // ROWS, and a moment that has folded stands `evicted` rows short of its
+    // position (design 8; fold gate f7, 2026-09-05).
     Ok(ContextPreflighted {
         placement,
         position: base_position,
@@ -532,7 +539,8 @@ pub fn context_preflight(
         max_response_tokens,
         required_end,
         context_budget,
-        fits: required_end.is_some_and(|end| end <= context_budget),
+        evicted,
+        fits: required_end.is_some_and(|end| end.saturating_sub(evicted) <= context_budget),
     })
 }
 
