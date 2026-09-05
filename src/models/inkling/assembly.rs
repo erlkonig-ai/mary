@@ -2776,6 +2776,98 @@ pub fn moe_layer(
         t.route_scale as f32 * r.global_scale,
     );
 
+    // ---- WIDE passes take the host row plan ---------------------------------
+    //
+    // The device plan does not deduplicate experts across rows: `n * k` slots
+    // of one token each, every slot a whole MTILE-row tile, every slot a read
+    // of its expert's plane. At one row that is the point of the lane -- no
+    // readback. At four thousand rows it is sixteen times the rows and about
+    // ninety-six times the weight traffic of a plan that groups the rows by
+    // expert, and it is why the served prefill ran at 16 rows a second on a
+    // half stack where the harness runs 388 (2026-09-05, sky, layers 0:21,
+    // the same 12,252 tokens). So above MTILE rows the layer takes the
+    // harness's lane: one readback of the top-k per routed layer, the rows
+    // grouped by expert on the host, full tiles, the prefill schedule. The
+    // learned layer keeps the device plan while learning is armed, because
+    // the learner reads that plan after the pass.
+    let wide = n > crate::models::inkling::fp4gemm::MTILE
+        && !(st.learn_layer == Some(layer) && !frozen);
+    if wide {
+        let g = crate::models::inkling::seam::tensor_of(
+            client.clone(),
+            dev.clone(),
+            topk_h,
+            n,
+            topk_width,
+        );
+        let t_r = Instant::now();
+        let flat = down(g.clone());
+        st.host.slice += t_r.elapsed().as_secs_f64();
+        let mut by_expert: BTreeMap<usize, Vec<(usize, f32)>> = BTreeMap::new();
+        for ti in 0..n {
+            let row = &flat[ti * topk_width..(ti + 1) * topk_width];
+            let bad = row[topk_width - 1] as u32;
+            anyhow::ensure!(
+                bad == 0,
+                "{p}: router logit is non-finite at token {ti}, row {}",
+                bad.wrapping_sub(1)
+            );
+            for j in 0..k {
+                by_expert
+                    .entry(row[j] as usize)
+                    .or_default()
+                    .push((ti, row[k + j]));
+            }
+        }
+        let acc = match cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
+            true => routed_experts_fp4(
+                cp,
+                aliases,
+                client,
+                dev,
+                p,
+                &by_expert,
+                &hn,
+                n,
+                h,
+                inter,
+                false,
+                &mut st.host,
+            )?,
+            false => routed_experts_bf16(
+                cp,
+                aliases,
+                client,
+                dev,
+                p,
+                &by_expert,
+                &hn,
+                n,
+                h,
+                inter,
+                &mut st.host,
+            )?,
+        };
+        if let Some(al) = aliases {
+            for _ in 0..by_expert.len() {
+                al.note_alias(tb.expert_bytes);
+            }
+        }
+        let sw = dense.shared_for(
+            cp,
+            client,
+            aliases,
+            p,
+            ns,
+            global_inter,
+            h,
+            shared_halved,
+            tp,
+        )?;
+        let sh = shared_experts_dev(hn, sw, g, k, ns, layer);
+        return Ok(acc + sh);
+    }
+
     // ---- the ROW PLAN, from a top-k answer that is never read back ---------
     let dp = crate::models::inkling::devplan::plan_from_topk_launch(
         client,

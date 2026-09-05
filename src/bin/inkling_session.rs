@@ -114,7 +114,16 @@ fn main() -> Result<()> {
     );
 
     let t0 = std::time::Instant::now();
-    let mut session = Session::load(SessionConfig::new(&pile))?;
+    let mut config = SessionConfig::new(&pile);
+    // `--context-budget <n>`: the window the session is built for; the default
+    // (4096) admits only one prefill chunk, which refuses a long prompt.
+    if let Some(budget) = std::env::var("INK_SESSION_CONTEXT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        config.context_budget = budget;
+    }
+    let mut session = Session::load(config)?;
     println!(
         "  session loaded     : layers {:?} in {:.1}s",
         session.layer_range(),

@@ -1702,7 +1702,14 @@ impl Session {
         anyhow::ensure!(!ids.is_empty(), "a prefill with no tokens would be vacuous");
         let mut out = 0;
         for chunk in ids.chunks(self.prefill_budget) {
+            let started = std::time::Instant::now();
             out = self.forward(chunk)?;
+            eprintln!(
+                "inkling: prefill chunk of {} rows in {:.1} s ({:.0} rows/s)",
+                chunk.len(),
+                started.elapsed().as_secs_f64(),
+                chunk.len() as f64 / started.elapsed().as_secs_f64().max(1e-9),
+            );
         }
         self.senses_drained()?;
         Ok(out)
@@ -1847,7 +1854,14 @@ impl Session {
         // property that lets `extend_batch` be a resource knob rather than a
         // semantic one.
         for chunk in ids.chunks(self.extend_batch) {
+            let started = std::time::Instant::now();
             out = self.forward(chunk)?;
+            eprintln!(
+                "inkling: extend chunk of {} rows in {:.1} s ({:.0} rows/s)",
+                chunk.len(),
+                started.elapsed().as_secs_f64(),
+                chunk.len() as f64 / started.elapsed().as_secs_f64().max(1e-9),
+            );
         }
         self.senses_drained()?;
         Ok(out)
