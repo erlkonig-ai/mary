@@ -1096,12 +1096,12 @@ mod tests {
     /// The gate's KV charge and the pool's reservation must not disagree about
     /// WHICH ROWS are retained.
     ///
-    /// They are priced at different widths on purpose -- the charge is the
-    /// dense cache at `policy.cache`, the reservation is NVFP4 at 4.5 bits --
-    /// so the check is that the two differ by exactly that ratio and by nothing
-    /// else. A term left out of one of them shows up here as a ratio that is
-    /// not 3.56, which is the disagreement `kv_reserve_line` exists to make
-    /// unquotable.
+    /// Since 39d6cb2 both are priced at the width the cache stores, NVFP4 at
+    /// 4.5 bits (the charge used to be the dense cache at `policy.cache`,
+    /// 3.56x wider), so the check is that the two agree to within the `epoch`
+    /// rows the reservation carries and by nothing else. A term left out of
+    /// one of them shows up here as a ratio that is not ~1, which is the
+    /// disagreement `kv_reserve_line` exists to make unquotable.
     #[test]
     fn the_reservation_and_the_admission_charge_retain_the_same_rows() {
         use super::{GIB, kv_cache_bytes};
@@ -1122,17 +1122,18 @@ mod tests {
         assert_eq!(locals, 35, "35 of the 42 layers are windowed");
         let held = plan.bytes(42 - locals, locals, width);
 
-        // The gate's own arithmetic at the same context, at BF16.
+        // The gate's own arithmetic at the same context, at NVFP4 (39d6cb2: the
+        // charge is priced at the width the cache stores, no longer at BF16).
         let charged = kv_cache_bytes(&t, 0..42, CTX, narrow());
         // The reservation carries `epoch` extra rows per windowed store, which
         // is what lets a compacting store never re-allocate; everything else is
-        // the same rows at a narrower element.
+        // the same rows at the same element, so the charge is a shade under.
         let ratio = charged as f64 / held as f64;
         assert!(
-            (3.4..3.6).contains(&ratio),
-            "the BF16 charge is {ratio:.2}x the NVFP4 reservation, want the 3.56 that is \
-             2 bytes against 0.5625 -- anything else means one of them is counting \
-             different rows"
+            (0.99..=1.0).contains(&ratio),
+            "the NVFP4 charge is {ratio:.4}x the NVFP4 reservation, want ~1 (0.9976: the \
+             same 576-byte rows, less the reservation's epoch rows) -- anything else \
+             means one of them is counting different rows"
         );
         // And the number that gets quoted, with its framing: whole model, both
         // stores, one node, 1,048,576 tokens.
@@ -1281,9 +1282,11 @@ mod tests {
         let policy = narrow().with_plain_bf16_layer(2);
         let two_dp = |b: u64| (b as f64 / super::GIB * 100.0).round() / 100.0;
         assert_eq!(two_dp(prefill_activation_bytes(&t, 0..16, 5, policy)), 0.03);
+        // 1.28 as the node printed it, less 0.03 GiB of KV: since 39d6cb2 the
+        // cache is priced at the NVFP4 width it is stored, not at BF16.
         assert_eq!(
             two_dp(prefill_activation_bytes(&t, 0..16, 2_048, policy)),
-            1.28
+            1.25
         );
         // Strictly increasing across the ladder, which is the property the
         // report denied. 16,384 tokens is already 10 GiB, which is what makes
@@ -1296,7 +1299,8 @@ mod tests {
             ladder.windows(2).all(|w| w[1] > w[0]),
             "not monotone: {ladder:?}"
         );
-        assert_eq!(two_dp(ladder[3]), 10.06, "16,384 tokens");
+        // 10.06 printed, less the same NVFP4 re-pricing of the KV (39d6cb2).
+        assert_eq!(two_dp(ladder[3]), 9.95, "16,384 tokens");
     }
 
     /// Anything that made attention the peak would mean this had been mis-read.
@@ -1422,7 +1426,9 @@ mod tests {
                     AttnKind::Local => t.sliding_window_size.min(n),
                     AttnKind::Global => n,
                 } as u64;
-                2 * keep * (kv_heads * head_dim) as u64 * 2
+                // NVFP4 width, 9 of 16 bits a value: 39d6cb2 prices the cache
+                // at the width it is stored, no longer `policy.cache`'s 2 bytes.
+                2 * keep * (kv_heads * head_dim) as u64 * 9 / 16
             })
             .sum();
         let old_prefill = 2 * nu * h * f32b + old_caches + old_widest;
@@ -1761,10 +1767,13 @@ mod admission_breakdown {
     ///
     /// `INK_LAYERS=22:42` at 14,169 tokens on the 121.63 GiB node. The old
     /// floor refused it -- the node's own log says "that is 125.77 GiB, and
-    /// this machine has 121.63" -- and the arithmetic here reproduces that
-    /// figure to the hundredth. Under the allocator charge the same run is
-    /// admitted, and the node printed 100.88 GiB against the 100.87 modelled
-    /// below before it ran.
+    /// this machine has 121.63" -- and the arithmetic here reproduced that
+    /// figure to the hundredth while the KV was charged at BF16. Under the
+    /// allocator charge the same run is admitted, and the node printed 100.88
+    /// GiB against the 100.87 modelled here before it ran. Since 39d6cb2 the
+    /// cache is priced at the NVFP4 width it is stored, which takes 0.18 GiB
+    /// off `live` (0.32 off the allocator-scaled need): the bands below are
+    /// those printed figures less exactly that.
     #[test]
     fn the_fourteen_thousand_token_needle_is_admissible() {
         let t = small();
@@ -1778,8 +1787,9 @@ mod admission_breakdown {
         let need_new = weights + fixed + allocator_overhead_bytes(p, machine, live) + live;
         assert!(need_old > machine, "the old floor admitted it after all");
         assert!(
-            (125.6..125.9).contains(&gib(need_old)),
-            "modelled {:.2} GiB against the 125.77 the node printed",
+            (125.5..125.7).contains(&gib(need_old)),
+            "modelled {:.2} GiB against the 125.59 that is the node's 125.77 with the KV \
+             at NVFP4 (39d6cb2)",
             gib(need_old)
         );
         assert!(
@@ -1788,8 +1798,9 @@ mod admission_breakdown {
             gib(need_new)
         );
         assert!(
-            (100.7..101.0).contains(&gib(need_new)),
-            "modelled {:.2} GiB against the 100.88 the node printed",
+            (100.4..100.7).contains(&gib(need_new)),
+            "modelled {:.2} GiB against the 100.56 that is the node's 100.88 with the KV \
+             at NVFP4 (39d6cb2)",
             gib(need_new)
         );
     }
