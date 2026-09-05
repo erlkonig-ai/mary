@@ -147,6 +147,12 @@ pub struct Engine {
     /// Score every delta as it is attended to (see [`TurnEnd::delta_nll`]).
     /// On by default; `INK_SCORE=0` turns it off.
     score: bool,
+    /// The pending delta is her own cover and history -- an Initialize
+    /// context, at wake or at a replacement -- not new experience: attended
+    /// to, never scored, never learned from. Measured 2026-09-05: scoring a
+    /// 58k-position wake cost a fifth of the wake, and a learning run would
+    /// have learned her own memories back every wake.
+    delta_unscored: bool,
 }
 
 /// A rank-1 model: a `Session` and nothing else.
@@ -360,6 +366,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         digest: blake3::Hasher::new(),
         terminated: false,
         score: std::env::var("INK_SCORE").map(|v| v != "0").unwrap_or(true),
+        delta_unscored: false,
     }))
 }
 
@@ -736,7 +743,8 @@ impl Engine {
         // live loss data the online-learning path exists for, and it is what
         // makes a learning change measurable at all: `INK_SCORE=0` turns it
         // off for a run that wants the head's last row only.
-        let (first, scored) = match self.score {
+        let unscored = std::mem::take(&mut self.delta_unscored);
+        let (first, scored) = match self.score && !unscored {
             true => self.pass_scored(pass)?,
             false => (self.pass(pass)?, super::session::ScoredNll::default()),
         };
@@ -830,6 +838,9 @@ impl Model for Engine {
             .encode(context)
             .context("encode typed Inkling context")?;
         self.delta.extend(ids);
+        if matches!(context, InklingContext::Initialize { .. }) {
+            self.delta_unscored = true;
+        }
         // The payloads behind the slots just emitted, each medium to its own
         // queue, in the order the slots were emitted.
         for record in self.codec.sensed(context) {
@@ -905,6 +916,7 @@ impl Model for Engine {
         // state.
         self.decode = detokenizer(self.tokenizer);
         self.delta = replacement;
+        self.delta_unscored = true;
         self.delta_audio.clear();
         self.delta_vision.clear();
         self.carry = None;
