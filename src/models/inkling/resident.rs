@@ -1229,9 +1229,29 @@ enum NativeOutputState {
     Text,
     Thinking,
     ToolJson(String),
+    /// A tool-JSON block under a header that is not `exec`: a call to a tool
+    /// she does not have. Collected whole and reported as a misuse rather
+    /// than refused mid-message, so the message closes the way the grammar
+    /// says and her shell can tell her (fold gate f5, 2026-09-05: she called
+    /// a tool named `memory`).
+    OtherTool { name: String, json: String },
     /// A block ended; another block must begin with `message_model`, or the
     /// response must end with `content_model_end_sampling`.
     Between,
+}
+
+/// A well-formed native tool call she cannot make: a tool her shell does not
+/// have, or exec JSON that does not parse. Not a failure of the turn -- the
+/// message is grammatical and complete -- but a thing her shell must answer,
+/// the way it answers a command that does not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeToolMisuse {
+    /// The tool the header named.
+    pub name: String,
+    /// The JSON body as she wrote it.
+    pub json: String,
+    /// Why it could not be a call, when the name was right but the body was not.
+    pub error: Option<String>,
 }
 
 /// Incremental parser for Inkling's generated typed blocks.
@@ -1244,6 +1264,7 @@ pub struct NativeOutputParser {
     ids: InklingSpecialIds,
     state: NativeOutputState,
     call: Option<NativeExecCall>,
+    misuse: Option<NativeToolMisuse>,
     completed: bool,
 }
 
@@ -1256,6 +1277,7 @@ impl NativeOutputParser {
             // header/content-kind position.
             state: NativeOutputState::Header(String::new()),
             call: None,
+            misuse: None,
             completed: false,
         }
     }
@@ -1293,6 +1315,9 @@ impl NativeOutputParser {
                 }
                 NativeOutputState::ToolJson(_) => {
                     anyhow::bail!("model_end_sampling truncated an exec JSON block")
+                }
+                NativeOutputState::OtherTool { name, .. } => {
+                    anyhow::bail!("model_end_sampling truncated a {name} tool block")
                 }
                 NativeOutputState::Text => {
                     anyhow::bail!("model_end_sampling truncated a text block before end_message")
@@ -1349,11 +1374,14 @@ impl NativeOutputParser {
             let NativeOutputState::Header(header) = &self.state else {
                 anyhow::bail!("content_invoke_tool_json appeared outside a model-message header")
             };
-            anyhow::ensure!(
-                header == "exec",
-                "native tool header named {header:?}, expected exactly \"exec\""
-            );
-            self.state = NativeOutputState::ToolJson(String::new());
+            self.state = if header == "exec" {
+                NativeOutputState::ToolJson(String::new())
+            } else {
+                NativeOutputState::OtherTool {
+                    name: header.clone(),
+                    json: String::new(),
+                }
+            };
             return Ok(delta);
         }
 
@@ -1363,7 +1391,23 @@ impl NativeOutputParser {
                 NativeOutputState::Text | NativeOutputState::Thinking => {}
                 NativeOutputState::ToolJson(json) => {
                     anyhow::ensure!(self.call.is_none(), "model emitted multiple exec calls");
-                    self.call = Some(parse_native_exec(&json)?);
+                    match parse_native_exec(&json) {
+                        Ok(call) => self.call = Some(call),
+                        Err(error) => {
+                            self.misuse = Some(NativeToolMisuse {
+                                name: "exec".to_string(),
+                                json,
+                                error: Some(format!("{error:#}")),
+                            })
+                        }
+                    }
+                }
+                NativeOutputState::OtherTool { name, json } => {
+                    self.misuse = Some(NativeToolMisuse {
+                        name,
+                        json,
+                        error: None,
+                    });
                 }
                 NativeOutputState::Header(header) => {
                     anyhow::bail!("end_message closed an unclassified header {header:?}")
@@ -1390,6 +1434,7 @@ impl NativeOutputParser {
             NativeOutputState::Text => delta.text.push_str(fragment),
             NativeOutputState::Thinking => delta.thinking.push_str(fragment),
             NativeOutputState::ToolJson(json) => json.push_str(fragment),
+            NativeOutputState::OtherTool { json, .. } => json.push_str(fragment),
             NativeOutputState::Between => {
                 anyhow::bail!("decoder flushed ordinary payload between model messages")
             }
@@ -1405,6 +1450,12 @@ impl NativeOutputParser {
         self.completed = false;
         self.state = NativeOutputState::Header(String::new());
         Ok(self.call.take())
+    }
+
+    /// The call she could not make in the response just completed, if any:
+    /// taken once, beside [`Self::take_completed_call`].
+    pub fn take_misuse(&mut self) -> Option<NativeToolMisuse> {
+        self.misuse.take()
     }
 }
 
