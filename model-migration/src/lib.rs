@@ -825,11 +825,11 @@ fn adopt_legacy_personaplex_bundle_with_policy(
     // dependency. A matching `(root, H)` makes the operation a strict no-op;
     // a different PersonaPlex identity fails before a COMMIT can be exposed.
     let observation = pile
-        .snapshot()
+        .snapshot_at(instant)
         .context("freeze existing PersonaPlex bundle collection")?;
-    let (support, admitted_commits) = collection
-        .admitted_with_commits_at(&observation, instant)
-        .context("admit existing PersonaPlex bundle commits")?;
+    let support = collection
+        .admitted(&observation)
+        .context("admit existing PersonaPlex bundle support")?;
     let snapshot = snapshot_model_bundle_collection_exact(&observation, &support)
         .context("materialize existing PersonaPlex bundle support")?;
     if let Some(existing) = PersonaPlexWeights::find_in_bundle_snapshot(snapshot)
@@ -841,11 +841,29 @@ fn adopt_legacy_personaplex_bundle_with_policy(
             "a different PersonaPlex bundle is already authoritative in this collection"
         );
         let token_data = existing.authority().bundle_token_data();
-        let commit = admitted_commits
-            .iter()
-            .copied()
-            .find(|commit| commit.data() == token_data)
-            .expect("validated bundle authority has an admitted commit root");
+        // Support admits payloads, not every attestation of those payloads.
+        // A retry must return a COMMIT whose writer is admitted by this same
+        // frozen observation, even if another key also signed the token.
+        let mut admitted_commit = None;
+        for commit in support
+            .commits(&observation)
+            .context("read existing PersonaPlex token provenance")?
+        {
+            if commit.data() != token_data {
+                continue;
+            }
+            let writer = VerifyingKey::from_bytes(&commit.public_key().raw)
+                .context("decode verified PersonaPlex token writer")?;
+            if collection
+                .writer_is_admitted(&observation, writer)
+                .context("check existing PersonaPlex token writer admission")?
+            {
+                admitted_commit = Some(commit);
+                break;
+            }
+        }
+        let commit =
+            admitted_commit.expect("validated bundle authority has an admitted commit root");
         return Ok(PersonaPlexLegacyAdoptionResult {
             commit,
             published: false,
@@ -1880,11 +1898,19 @@ mod tests {
             ModelCollection::open(&snapshot, first.collection.handle()).unwrap(),
             first.collection,
         );
-        let instant = epoch_now();
-        let (_, admitted) = first
-            .collection
-            .admitted_with_commits_at(&snapshot, instant)
-            .unwrap();
+        let support = first.collection.admitted(&snapshot).unwrap();
+        let admitted: Vec<_> = support
+            .commits(&snapshot)
+            .unwrap()
+            .into_iter()
+            .filter(|commit| {
+                let writer = VerifyingKey::from_bytes(&commit.public_key().raw).unwrap();
+                first
+                    .collection
+                    .writer_is_admitted(&snapshot, writer)
+                    .unwrap()
+            })
+            .collect();
         assert_eq!(admitted, first.commits);
         drop(snapshot);
 
@@ -2377,6 +2403,58 @@ mod tests {
     }
 
     #[test]
+    fn personaplex_retry_does_not_return_an_unadmitted_token_attestation() {
+        let fixture = legacy_personaplex_fixture("personaplex-retry-writer", false, false);
+        let policy = personaplex_policy(&fixture);
+        let mut keys = [key(0x79), key(0x7a)];
+        keys.sort_by_key(|key| key.verifying_key().to_bytes());
+        let [unadmitted_key, migration_key] = keys;
+        let mut pile = Pile::open(fixture.pile.path()).unwrap();
+        let first = adopt_legacy_personaplex_bundle_with_policy(
+            &mut pile,
+            &migration_key,
+            fixture.weight_commit,
+            policy,
+        )
+        .expect("adopt exact legacy PersonaPlex weight commit");
+        assert!(first.published);
+
+        let unadmitted = CollectionCommit::sign(
+            &unadmitted_key,
+            first.collection.handle(),
+            first.commit.data(),
+            first.commit.metadata(),
+        );
+        pile.insert(CollectionRecord::Commit(unadmitted)).unwrap();
+        let observation = pile.snapshot().unwrap();
+        let support = first.collection.admitted(&observation).unwrap();
+        assert_eq!(support.len(), 1);
+        assert_eq!(
+            support.commits(&observation).unwrap(),
+            vec![unadmitted, first.commit],
+            "the unadmitted attestation must sort before the legitimate retry result"
+        );
+        assert!(!first
+            .collection
+            .writer_is_admitted(&observation, unadmitted_key.verifying_key())
+            .unwrap());
+        drop(observation);
+
+        let before = std::fs::read(fixture.pile.path()).unwrap();
+        let repeated = adopt_legacy_personaplex_bundle_with_policy(
+            &mut pile,
+            &migration_key,
+            fixture.weight_commit,
+            policy,
+        )
+        .expect("repeat adoption with an extra unadmitted token attestation");
+        assert!(!repeated.published);
+        assert_eq!(repeated.commit, first.commit);
+        assert_eq!(std::fs::read(fixture.pile.path()).unwrap(), before);
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn personaplex_count_and_overlap_fail_before_any_publication() {
         let count_fixture = legacy_personaplex_fixture("personaplex-count", false, false);
         let mut wrong_count = personaplex_policy(&count_fixture);
@@ -2475,10 +2553,17 @@ mod tests {
         let instant = epoch_now();
         let collection =
             model_bundle_collection_or_create_at(&mut pile, &migration_key, instant).unwrap();
-        let store = pile.snapshot().unwrap();
-        let (cover, commits) = collection
-            .admitted_with_commits_at(&store, instant)
-            .unwrap();
+        let store = pile.snapshot_at(instant).unwrap();
+        let cover = collection.admitted(&store).unwrap();
+        let commits: Vec<_> = cover
+            .commits(&store)
+            .unwrap()
+            .into_iter()
+            .filter(|commit| {
+                let writer = VerifyingKey::from_bytes(&commit.public_key().raw).unwrap();
+                collection.writer_is_admitted(&store, writer).unwrap()
+            })
+            .collect();
         assert_eq!(cover.len(), 1);
         assert_eq!(commits, vec![existing]);
         drop(store);
@@ -2542,10 +2627,17 @@ mod tests {
         let instant = epoch_now();
         let collection =
             model_bundle_collection_or_create_at(&mut pile, &migration_key, instant).unwrap();
-        let store = pile.snapshot().unwrap();
-        let (cover, commits) = collection
-            .admitted_with_commits_at(&store, instant)
-            .unwrap();
+        let store = pile.snapshot_at(instant).unwrap();
+        let cover = collection.admitted(&store).unwrap();
+        let commits: Vec<_> = cover
+            .commits(&store)
+            .unwrap()
+            .into_iter()
+            .filter(|commit| {
+                let writer = VerifyingKey::from_bytes(&commit.public_key().raw).unwrap();
+                collection.writer_is_admitted(&store, writer).unwrap()
+            })
+            .collect();
         assert_eq!(cover.len(), 1);
         assert_eq!(commits, vec![existing]);
         drop(store);
