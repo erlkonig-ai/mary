@@ -147,8 +147,8 @@
 //! context codec and its content-only tokenizer view (a tool result spelling
 //! `<|message_model|>` is still ordinary content, never structure), the
 //! execution manifest, the context preflight, the one-token carry and its
-//! accounting in [`TurnEnd::carried`], the native output parser and its strict
-//! single-call rule, the monologue-coordinate discipline, and the
+//! accounting in [`TurnEnd::carried`], the native output parser (text and
+//! thinking; her message is the command), the monologue-coordinate discipline, and the
 //! replacement/reinitialization boundary. Those were never the wire's; they are
 //! what a turn of this model IS.
 
@@ -158,6 +158,11 @@ use anyhow::{Context, Result};
 const MESSAGE_MODEL: &str = "<|message_model|>";
 #[cfg(any(feature = "tokenizer", test))]
 const MESSAGE_SYSTEM: &str = "<|message_system|>";
+/// The world's answer to what she said arrives in the user voice, exactly as
+/// the shipped template renders a user text message. Her shell declares no
+/// tools; her whole message is the command, and this is what came back.
+#[cfg(any(feature = "tokenizer", test))]
+const MESSAGE_USER: &str = "<|message_user|>";
 #[cfg(any(feature = "tokenizer", test))]
 const MESSAGE_TOOL: &str = "<|message_tool|>";
 #[cfg(any(feature = "tokenizer", test))]
@@ -189,18 +194,6 @@ const IMAGE_SLOT: &str = "<|unused_200054|>";
 pub const DMEL_BINS: usize = 80;
 pub const DMEL_LEVELS: usize = 16;
 
-/// The single tool exposed to Inkling, in the exact compact/sorted JSON shape
-/// produced by the checkpoint's shipped `chat_template.jinja`.
-///
-/// This is content, not framing: it is deliberately passed through the
-/// content-only tokenizer even though it is trusted static text.
-pub const EXEC_TOOL_DECLARATION: &str = concat!(
-    "[{\"description\":\"Execute one shell command in Drive's sandbox.\",",
-    "\"name\":\"exec\",\"parameters\":{\"properties\":{\"command\":{",
-    "\"type\":\"string\"}},\"required\":[\"command\"],\"type\":\"object\"},",
-    "\"type\":\"function\"}]"
-);
-
 #[cfg(any(feature = "tokenizer", test))]
 const DEFAULT_THINKING_EFFORT: &str = "Thinking effort level: 0.9";
 
@@ -217,6 +210,8 @@ const DEFAULT_THINKING_EFFORT: &str = "Thinking effort level: 0.9";
 pub struct InklingSpecialIds {
     pub message_model: u32,
     pub message_system: u32,
+    /// The voice her shell answers in.
+    pub message_user: u32,
     pub message_tool: u32,
     pub content_text: u32,
     pub content_xml: u32,
@@ -253,13 +248,17 @@ impl InklingSpecialIds {
     }
 }
 
-/// One historical or live result of the sole `exec` tool.
+/// One historical or live answer of her shell to something she said.
+///
+/// She has no tools. Her whole model message is the command her shell runs
+/// (a multi-line message is a script), and the shell's answer comes back in
+/// the user voice. This is the pair as Drive keeps it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecResultContext {
-    /// Exact shell command whose result this is. It is used to reconstruct a
-    /// historical assistant call and to bind a live result to its outstanding
-    /// native call in `InklingMind`.
+    /// The exact command this answers: what she said, trimmed. It binds a
+    /// live result to the outstanding command in `InklingMind` and is the
+    /// text of a reconstructed historical model turn.
     pub command: String,
     /// Drive's deliberate text projection of its typed result, including any
     /// structural status annotation that adds information.
@@ -268,31 +267,26 @@ pub struct ExecResultContext {
 
 /// One ordered part of a completed historical model response.
 ///
-/// Adjacent parts of the same textual kind are fragments of one model block.
-/// The codec concatenates them *before* content tokenization, preserving exact
-/// tokens regardless of archival fragment boundaries. An `Exec` part is
-/// instead a complete native call and is valid only as the final model part of
-/// a response.
+/// Adjacent parts of the same kind are fragments of one model block. The
+/// codec concatenates them *before* content tokenization, preserving exact
+/// tokens regardless of archival fragment boundaries. There is no part for a
+/// call: what she said IS what ran, so a response that has a `tool_result`
+/// had its text run as the command.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InklingHistoryPart {
     Thinking { content: String },
     Text { content: String },
-    Exec { command: String },
 }
 
-/// One completed historical model response and its optional native result.
+/// One completed historical model response and, when her words ran, what
+/// her shell answered.
 ///
-/// The parts retain model-channel order. A response either contains only text
-/// and thinking parts, or contains exactly one final `Exec` part followed by
-/// `tool_result`. This shape deliberately stores the command once: the result
-/// is structurally attached to that final call, so there is no second command
-/// string that can disagree with it.
-///
-/// This representation can retain arbitrary thinking/text alternation. Drive's current
-/// `Turn` cannot yet produce that full fidelity because it separates reasoning
-/// from speech instead of carrying one ordered emitted-part vector; callers
-/// must not infer an order from those two accumulated fields during rollover.
+/// The parts retain model-channel order. This representation can retain
+/// arbitrary thinking/text alternation. Drive's current `Turn` cannot yet
+/// produce that full fidelity because it separates reasoning from speech
+/// instead of carrying one ordered emitted-part vector; callers must not
+/// infer an order from those two accumulated fields during rollover.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InklingHistoryResponse {
@@ -301,41 +295,25 @@ pub struct InklingHistoryResponse {
 }
 
 impl InklingHistoryResponse {
-    /// Lift the former exec-result-only history into the ordered response
-    /// model without retaining a second compatibility representation.
+    /// One command/result pair as a historical turn: the command is the model
+    /// text, the result is the shell's answer. This is the shape of every
+    /// memory-cover pair and of every archived turn of hers.
     pub fn exec(result: ExecResultContext) -> Self {
         Self {
-            parts: vec![InklingHistoryPart::Exec {
-                command: result.command,
+            parts: vec![InklingHistoryPart::Text {
+                content: result.command,
             }],
             tool_result: Some(result.content),
         }
     }
 
     pub fn validate(&self) -> Result<()> {
-        let execs = self
-            .parts
-            .iter()
-            .filter(|part| matches!(part, InklingHistoryPart::Exec { .. }))
-            .count();
-        anyhow::ensure!(
-            execs <= 1,
-            "a historical response contains multiple exec calls"
-        );
-        let final_exec = matches!(self.parts.last(), Some(InklingHistoryPart::Exec { .. }));
-        anyhow::ensure!(
-            execs == 0 || final_exec,
-            "a historical exec call must be the response's final model part"
-        );
-        if final_exec {
+        if self.tool_result.is_some() {
             anyhow::ensure!(
-                self.tool_result.is_some(),
-                "a completed historical exec response requires its tool result"
-            );
-        } else {
-            anyhow::ensure!(
-                self.tool_result.is_none(),
-                "a historical tool result has no final exec call"
+                self.parts
+                    .iter()
+                    .any(|part| matches!(part, InklingHistoryPart::Text { .. })),
+                "a historical result answers words, and this response has no text part"
             );
         }
         Ok(())
@@ -558,15 +536,6 @@ pub struct Reinitialized {
     pub initialization_tokens: usize,
 }
 
-#[cfg(any(feature = "tokenizer", test))]
-fn canonical_exec_call_json(command: &str) -> String {
-    // The shipped template fixes wrapper order as `name`, then `args`, while
-    // recursively sorting the argument object. There is one argument, so JSON
-    // string escaping is the only variable operation.
-    let command = serde_json::to_string(command).expect("a Rust string always serializes to JSON");
-    format!(r#"{{"name":"exec","args":{{"command":{command}}}}}"#)
-}
-
 /// Server-side TML encoder built from the exact checkpoint tokenizer.
 ///
 /// `tokenizer` retains special added tokens for generated-token decoding and
@@ -625,6 +594,7 @@ impl InklingContextCodec {
         let special_ids = InklingSpecialIds {
             message_model: required(MESSAGE_MODEL)?,
             message_system: required(MESSAGE_SYSTEM)?,
+            message_user: required(MESSAGE_USER)?,
             message_tool: required(MESSAGE_TOOL)?,
             content_text: required(CONTENT_TEXT)?,
             content_xml: required(CONTENT_XML)?,
@@ -643,6 +613,7 @@ impl InklingContextCodec {
         for id in [
             special_ids.message_model,
             special_ids.message_system,
+            special_ids.message_user,
             special_ids.message_tool,
             special_ids.content_text,
             special_ids.content_xml,
@@ -713,15 +684,11 @@ impl InklingContextCodec {
         let mut ids = Vec::new();
         match context {
             InklingContext::Initialize { system, history } => {
-                // Shipped template order: tool declaration, system message,
-                // default effort (immediately before the first non-system
-                // message, or as the all-system fallback), history, prompt.
-                ids.push(self.special_ids.message_system as usize);
-                self.push_content(&mut ids, "tool_declare")?;
-                ids.push(self.special_ids.content_xml as usize);
-                self.push_content(&mut ids, EXEC_TOOL_DECLARATION)?;
-                ids.push(self.special_ids.end_message as usize);
-
+                // Shipped template order with no tools declared: system
+                // message, default effort (immediately before the first
+                // non-system message, or as the all-system fallback),
+                // history, prompt. No `tool_declare` block: she has no tools,
+                // her message is the command.
                 ids.push(self.special_ids.message_system as usize);
                 ids.push(self.special_ids.content_text as usize);
                 self.push_content(&mut ids, system)?;
@@ -738,7 +705,7 @@ impl InklingContextCodec {
                 ids.push(self.special_ids.message_model as usize);
             }
             InklingContext::ToolResult { result, sensed } => {
-                self.push_tool_result(&mut ids, result)?;
+                self.push_result(&mut ids, &result.content)?;
                 for record in sensed {
                     self.push_sense_part(&mut ids, record)?;
                 }
@@ -838,18 +805,11 @@ impl InklingContextCodec {
                     }
                     self.push_historical_text_part(ids, self.special_ids.content_text, &content)?;
                 }
-                InklingHistoryPart::Exec { command } => {
-                    ids.push(self.special_ids.message_model as usize);
-                    self.push_content(ids, "exec")?;
-                    ids.push(self.special_ids.content_invoke_tool_json as usize);
-                    self.push_content(ids, &canonical_exec_call_json(command))?;
-                    ids.push(self.special_ids.end_message as usize);
-                }
             }
         }
         ids.push(self.special_ids.content_model_end_sampling as usize);
         if let Some(content) = &response.tool_result {
-            self.push_tool_result_content(ids, content)?;
+            self.push_result(ids, content)?;
         }
         Ok(())
     }
@@ -867,13 +827,12 @@ impl InklingContextCodec {
         Ok(())
     }
 
-    fn push_tool_result(&self, ids: &mut Vec<usize>, result: &ExecResultContext) -> Result<()> {
-        self.push_tool_result_content(ids, &result.content)
-    }
-
-    fn push_tool_result_content(&self, ids: &mut Vec<usize>, content: &str) -> Result<()> {
-        ids.push(self.special_ids.message_tool as usize);
-        self.push_content(ids, "exec")?;
+    /// The world's answer is a user turn, `<|message_user|><|content_text|>…`,
+    /// exactly as the shipped template renders a user text message. Nothing
+    /// speaks in the tool voice but her senses: what she said ran, and this
+    /// is what came back.
+    fn push_result(&self, ids: &mut Vec<usize>, content: &str) -> Result<()> {
+        ids.push(self.special_ids.message_user as usize);
         ids.push(self.special_ids.content_text as usize);
         self.push_content(ids, content)?;
         ids.push(self.special_ids.end_message as usize);
@@ -1205,12 +1164,6 @@ impl TurnEnd {
     }
 }
 
-/// One native call extracted from a completed model response.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeExecCall {
-    pub command: String,
-}
-
 /// Content emitted by one generated token after structural parsing.
 ///
 /// Archive currently preserves the channel and exact per-part bytes, but
@@ -1232,34 +1185,16 @@ pub struct NativeTokenDelta {
 #[derive(Debug)]
 enum NativeOutputState {
     /// The generation prompt has already inserted `message_model`; ordinary
-    /// fragments here are the optional tool name preceding its content kind.
+    /// fragments here are the template's optional block name that precedes a
+    /// content kind. She has no tools to name, so whatever she writes here is
+    /// kept as the first bytes of the block it precedes: her bytes are her
+    /// bytes, and her shell answers them.
     Header(String),
     Text,
     Thinking,
-    ToolJson(String),
-    /// A tool-JSON block under a header that is not `exec`: a call to a tool
-    /// she does not have. Collected whole and reported as a misuse rather
-    /// than refused mid-message, so the message closes the way the grammar
-    /// says and her shell can tell her (fold gate f5, 2026-09-05: she called
-    /// a tool named `memory`).
-    OtherTool { name: String, json: String },
     /// A block ended; another block must begin with `message_model`, or the
     /// response must end with `content_model_end_sampling`.
     Between,
-}
-
-/// A well-formed native tool call she cannot make: a tool her shell does not
-/// have, or exec JSON that does not parse. Not a failure of the turn -- the
-/// message is grammatical and complete -- but a thing her shell must answer,
-/// the way it answers a command that does not exist.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeToolMisuse {
-    /// The tool the header named.
-    pub name: String,
-    /// The JSON body as she wrote it.
-    pub json: String,
-    /// Why it could not be a call, when the name was right but the body was not.
-    pub error: Option<String>,
 }
 
 /// Incremental parser for Inkling's generated typed blocks.
@@ -1267,12 +1202,18 @@ pub struct NativeToolMisuse {
 /// Structure is recognized exclusively by exact ids announced in READY.
 /// Decoded strings are payload fragments only; a literal marker spelling made
 /// from ordinary tokens remains ordinary content.
+///
+/// Her shell declares no tools, so the grammar she is read against is text and
+/// thinking, and everything she says is the command. The template's tool-JSON
+/// block is not refused: a mind that stopped existing because it reached for
+/// a word its shell does not know could not live in a shell (fold gate f5,
+/// 2026-09-05, when she called a tool named `memory`). It is read as text --
+/// the block name, then its body -- so what she wrote reaches her shell as her
+/// message, and her shell answers it the way it answers anything.
 #[derive(Debug)]
 pub struct NativeOutputParser {
     ids: InklingSpecialIds,
     state: NativeOutputState,
-    call: Option<NativeExecCall>,
-    misuse: Option<NativeToolMisuse>,
     completed: bool,
 }
 
@@ -1280,12 +1221,10 @@ impl NativeOutputParser {
     pub fn new(ids: InklingSpecialIds) -> Self {
         Self {
             ids,
-            // Initialize/tool-result/generation-prompt all end by inserting
+            // Initialize/result/generation-prompt all end by inserting
             // message_model, so the first generated token is already in its
             // header/content-kind position.
             state: NativeOutputState::Header(String::new()),
-            call: None,
-            misuse: None,
             completed: false,
         }
     }
@@ -1321,12 +1260,6 @@ impl NativeOutputParser {
                 NativeOutputState::Header(header) => {
                     anyhow::bail!("model_end_sampling left unclassified message header {header:?}")
                 }
-                NativeOutputState::ToolJson(_) => {
-                    anyhow::bail!("model_end_sampling truncated an exec JSON block")
-                }
-                NativeOutputState::OtherTool { name, .. } => {
-                    anyhow::bail!("model_end_sampling truncated a {name} tool block")
-                }
                 NativeOutputState::Text => {
                     anyhow::bail!("model_end_sampling truncated a text block before end_message")
                 }
@@ -1346,50 +1279,27 @@ impl NativeOutputParser {
                 matches!(self.state, NativeOutputState::Between),
                 "message_model appeared before the previous block ended"
             );
-            anyhow::ensure!(
-                self.call.is_none(),
-                "model emitted another block after its exec call"
-            );
             self.state = NativeOutputState::Header(String::new());
             return Ok(delta);
         }
 
-        if id == self.ids.content_text {
-            let NativeOutputState::Header(header) = &self.state else {
-                anyhow::bail!("content_text appeared outside a model-message header")
+        // Text, and the tool-JSON block read as text: whatever named the block
+        // is the first thing she said in it.
+        if id == self.ids.content_text || id == self.ids.content_invoke_tool_json {
+            let NativeOutputState::Header(header) = &mut self.state else {
+                anyhow::bail!("a content kind appeared outside a model-message header")
             };
-            anyhow::ensure!(
-                header.is_empty(),
-                "text block carried unexpected model-message header {header:?}"
-            );
+            delta.text.push_str(header);
             self.state = NativeOutputState::Text;
             return Ok(delta);
         }
 
         if id == self.ids.content_thinking {
-            let NativeOutputState::Header(header) = &self.state else {
+            let NativeOutputState::Header(header) = &mut self.state else {
                 anyhow::bail!("content_thinking appeared outside a model-message header")
             };
-            anyhow::ensure!(
-                header.is_empty(),
-                "thinking block carried unexpected model-message header {header:?}"
-            );
+            delta.thinking.push_str(header);
             self.state = NativeOutputState::Thinking;
-            return Ok(delta);
-        }
-
-        if id == self.ids.content_invoke_tool_json {
-            let NativeOutputState::Header(header) = &self.state else {
-                anyhow::bail!("content_invoke_tool_json appeared outside a model-message header")
-            };
-            self.state = if header == "exec" {
-                NativeOutputState::ToolJson(String::new())
-            } else {
-                NativeOutputState::OtherTool {
-                    name: header.clone(),
-                    json: String::new(),
-                }
-            };
             return Ok(delta);
         }
 
@@ -1397,26 +1307,6 @@ impl NativeOutputParser {
             let state = std::mem::replace(&mut self.state, NativeOutputState::Between);
             match state {
                 NativeOutputState::Text | NativeOutputState::Thinking => {}
-                NativeOutputState::ToolJson(json) => {
-                    anyhow::ensure!(self.call.is_none(), "model emitted multiple exec calls");
-                    match parse_native_exec(&json) {
-                        Ok(call) => self.call = Some(call),
-                        Err(error) => {
-                            self.misuse = Some(NativeToolMisuse {
-                                name: "exec".to_string(),
-                                json,
-                                error: Some(format!("{error:#}")),
-                            })
-                        }
-                    }
-                }
-                NativeOutputState::OtherTool { name, json } => {
-                    self.misuse = Some(NativeToolMisuse {
-                        name,
-                        json,
-                        error: None,
-                    });
-                }
                 NativeOutputState::Header(header) => {
                     anyhow::bail!("end_message closed an unclassified header {header:?}")
                 }
@@ -1441,8 +1331,6 @@ impl NativeOutputParser {
             NativeOutputState::Header(header) => header.push_str(fragment),
             NativeOutputState::Text => delta.text.push_str(fragment),
             NativeOutputState::Thinking => delta.thinking.push_str(fragment),
-            NativeOutputState::ToolJson(json) => json.push_str(fragment),
-            NativeOutputState::OtherTool { json, .. } => json.push_str(fragment),
             NativeOutputState::Between => {
                 anyhow::bail!("decoder flushed ordinary payload between model messages")
             }
@@ -1450,66 +1338,14 @@ impl NativeOutputParser {
         Ok(())
     }
 
-    /// Take the optional call after an exact end-of-sampling token and reset
-    /// for the next generation prompt. Calling this on an incomplete response
-    /// is a caller error.
-    pub fn take_completed_call(&mut self) -> Result<Option<NativeExecCall>> {
+    /// Reset for the next generation prompt after an exact end-of-sampling
+    /// token. Calling this on an incomplete response is a caller error.
+    pub fn take_completed(&mut self) -> Result<()> {
         anyhow::ensure!(self.completed, "model response is not complete");
         self.completed = false;
         self.state = NativeOutputState::Header(String::new());
-        Ok(self.call.take())
+        Ok(())
     }
-
-    /// The call she could not make in the response just completed, if any:
-    /// taken once, beside [`Self::take_completed_call`].
-    pub fn take_misuse(&mut self) -> Option<NativeToolMisuse> {
-        self.misuse.take()
-    }
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeExecEnvelope {
-    name: String,
-    args: NativeExecArgs,
-}
-
-#[derive(serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NativeExecArgs {
-    command: String,
-}
-
-fn parse_native_exec(json: &str) -> Result<NativeExecCall> {
-    let envelope: NativeExecEnvelope =
-        serde_json::from_str(json).context("parse strict native exec JSON")?;
-    anyhow::ensure!(
-        envelope.name == "exec",
-        "native tool JSON named {:?}, expected exactly \"exec\"",
-        envelope.name
-    );
-    Ok(NativeExecCall {
-        command: envelope.args.command,
-    })
-}
-
-/// Append a canonical, marker-free transcript projection for one typed call.
-/// The returned range is exact within `said` and can be shifted by the current
-/// session monologue extent for `Decision::fire_projected`.
-pub fn project_native_exec(said: &mut String, command: &str) -> std::ops::Range<usize> {
-    // The separator is projection scaffold too. Naming it inside the range lets
-    // Archive remove the entire synthetic suffix without retaining a newline
-    // that the model never actually spoke.
-    let start = said.len();
-    if !said.is_empty() && !said.ends_with('\n') {
-        said.push('\n');
-    }
-    said.push_str("$ ");
-    said.push_str(command);
-    if !said.ends_with('\n') {
-        said.push('\n');
-    }
-    start..said.len()
 }
 
 /// Associate one arbitrated id with the fragments emitted by its one-token
@@ -1773,5 +1609,248 @@ impl StreamProof {
     /// the mind stopped generating.
     pub fn streamed(&self) -> bool {
         matches!(self.tokens_at_first_return, Some(k) if k < self.tokens)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ids() -> InklingSpecialIds {
+        let spellings: [(u32, &str); 15] = [
+            (1, MESSAGE_MODEL),
+            (2, MESSAGE_SYSTEM),
+            (3, MESSAGE_TOOL),
+            (4, CONTENT_TEXT),
+            (5, CONTENT_XML),
+            (6, CONTENT_THINKING),
+            (7, CONTENT_INVOKE_TOOL_JSON),
+            (8, CONTENT_MODEL_END_SAMPLING),
+            (9, END_MESSAGE),
+            (10, CONTENT_AUDIO_INPUT),
+            (11, AUDIO_SLOT),
+            (12, AUDIO_END),
+            (13, CONTENT_IMAGE),
+            (14, IMAGE_SLOT),
+            (15, MESSAGE_USER),
+        ];
+        InklingSpecialIds {
+            message_model: 1,
+            message_system: 2,
+            message_tool: 3,
+            content_text: 4,
+            content_xml: 5,
+            content_thinking: 6,
+            content_invoke_tool_json: 7,
+            content_model_end_sampling: 8,
+            end_message: 9,
+            content_audio_input: 10,
+            audio_slot: 11,
+            audio_end: 12,
+            content_image: 13,
+            image_slot: 14,
+            message_user: 15,
+            all_special: (1..=15).collect(),
+            decoded_special: spellings
+                .iter()
+                .map(|(id, spelling)| (*id, spelling.to_string()))
+                .collect(),
+        }
+    }
+
+    /// What the decoder hands the parser at a special: whatever ordinary
+    /// payload it was still holding, then the special's own spelling.
+    fn at(ids: &InklingSpecialIds, id: u32, payload: &str) -> String {
+        let spelling = ids
+            .decoded_special
+            .iter()
+            .find(|(candidate, _)| *candidate == id)
+            .map(|(_, spelling)| spelling.as_str())
+            .expect("a declared special");
+        format!("{payload}{spelling}")
+    }
+
+    fn read(ids: &InklingSpecialIds, script: &[(u32, String)]) -> Result<(String, String, bool)> {
+        let mut parser = NativeOutputParser::new(ids.clone());
+        let (mut text, mut thinking, mut completed) = (String::new(), String::new(), false);
+        for (id, fragment) in script {
+            let delta = parser.push(*id, fragment)?;
+            text.push_str(&delta.text);
+            thinking.push_str(&delta.thinking);
+            completed |= delta.completed;
+        }
+        if completed {
+            parser.take_completed()?;
+        }
+        Ok((text, thinking, completed))
+    }
+
+    #[test]
+    fn her_message_is_text_and_thinking() {
+        let ids = ids();
+        let script = [
+            (6, at(&ids, 6, "")),
+            (100, "look ".to_string()),
+            (101, "around".to_string()),
+            (9, at(&ids, 9, "")),
+            (1, at(&ids, 1, "")),
+            (4, at(&ids, 4, "")),
+            (102, "ls ".to_string()),
+            // The decoder's late flush of an incomplete token lands in the
+            // block that was open, never in the transition.
+            (9, at(&ids, 9, "-la")),
+            (8, at(&ids, 8, "")),
+        ];
+        let (text, thinking, completed) = read(&ids, &script).unwrap();
+        assert_eq!(thinking, "look around");
+        assert_eq!(text, "ls -la");
+        assert!(completed);
+    }
+
+    #[test]
+    fn a_tool_block_is_read_as_text_with_its_name() {
+        // Fold gate f5, 2026-09-05: she called a tool named `memory`. Her
+        // shell declares none; what she wrote reaches it as her message.
+        let ids = ids();
+        let script = [
+            (100, "memory".to_string()),
+            (7, at(&ids, 7, "")),
+            (101, r#"{"name":"memory","args":{"range":"a..b"}}"#.to_string()),
+            (9, at(&ids, 9, "")),
+            (8, at(&ids, 8, "")),
+        ];
+        let (text, thinking, completed) = read(&ids, &script).unwrap();
+        assert_eq!(text, r#"memory{"name":"memory","args":{"range":"a..b"}}"#);
+        assert!(thinking.is_empty());
+        assert!(completed);
+    }
+
+    #[test]
+    fn a_truncated_block_is_still_refused() {
+        let ids = ids();
+        let error = read(
+            &ids,
+            &[(4, at(&ids, 4, "")), (100, "ls".to_string()), (8, at(&ids, 8, ""))],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("truncated a text block"), "{error:#}");
+        let error = read(&ids, &[(100, "memory".to_string()), (8, at(&ids, 8, ""))]).unwrap_err();
+        assert!(format!("{error:#}").contains("unclassified message header"), "{error:#}");
+    }
+
+    #[test]
+    fn a_historical_result_answers_words() {
+        let thought_only = InklingHistoryResponse {
+            parts: vec![InklingHistoryPart::Thinking {
+                content: "hm".to_string(),
+            }],
+            tool_result: Some("out".to_string()),
+        };
+        assert!(thought_only.validate().is_err());
+        let pair = InklingHistoryResponse::exec(ExecResultContext {
+            command: "ls".to_string(),
+            content: "out".to_string(),
+        });
+        assert!(pair.validate().is_ok());
+        let unanswered = InklingHistoryResponse {
+            parts: vec![InklingHistoryPart::Text {
+                content: "ls".to_string(),
+            }],
+            tool_result: None,
+        };
+        assert!(unanswered.validate().is_ok());
+    }
+
+    #[cfg(feature = "tokenizer")]
+    fn miniature_tokenizer_json() -> Vec<u8> {
+        let added_tokens = ids()
+            .decoded_special
+            .iter()
+            .map(|(id, content)| {
+                serde_json::json!({
+                    "id": id,
+                    "content": content,
+                    "single_word": false,
+                    "lstrip": false,
+                    "rstrip": false,
+                    "normalized": false,
+                    "special": true,
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::to_vec(&serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": added_tokens,
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": {"<unk>": 0},
+                "unk_token": "<unk>",
+            },
+        }))
+        .expect("serialize miniature tokenizer")
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn the_codec_declares_no_tools_and_the_world_answers_in_the_user_voice() {
+        let codec = InklingContextCodec::from_json(&miniature_tokenizer_json()).unwrap();
+        let s = codec.special_ids();
+        let pair = ExecResultContext {
+            command: "ls".to_string(),
+            content: "out".to_string(),
+        };
+        let encoded = codec
+            .encode(&InklingContext::Initialize {
+                system: "system".to_string(),
+                history: vec![InklingHistoryResponse::exec(pair.clone())],
+            })
+            .unwrap();
+        assert_eq!(
+            encoded,
+            [
+                s.message_system as usize,
+                s.content_text as usize,
+                0,
+                s.end_message as usize,
+                s.message_system as usize,
+                s.content_text as usize,
+                0,
+                s.end_message as usize,
+                s.message_model as usize,
+                s.content_text as usize,
+                0,
+                s.end_message as usize,
+                s.content_model_end_sampling as usize,
+                s.message_user as usize,
+                s.content_text as usize,
+                0,
+                s.end_message as usize,
+                s.message_model as usize,
+            ]
+        );
+        assert!(!encoded.contains(&(s.message_tool as usize)));
+        assert!(!encoded.contains(&(s.content_invoke_tool_json as usize)));
+        let live = codec
+            .encode(&InklingContext::ToolResult {
+                result: pair,
+                sensed: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(
+            live,
+            [
+                s.message_user as usize,
+                s.content_text as usize,
+                0,
+                s.end_message as usize,
+                s.message_model as usize,
+            ]
+        );
     }
 }
