@@ -350,6 +350,11 @@ pub enum InklingContext {
     /// Start another autonomous assistant response after a completed text-only
     /// response. A tool result already carries this prompt itself.
     GenerationPrompt,
+    /// Close a response her shell cut: the room above her memories ran out
+    /// under her thought. The block she was in, if any, is ended and the
+    /// message ended, so the context stays grammatical and the next prompt
+    /// is hers again. Nothing here is hers or the world's; it is never scored.
+    CloseResponse { open_block: bool },
     /// Something was sensed and nothing else happened: one tool message per
     /// record, each named for the faculty that sensed it and holding the
     /// template's own part for its medium (the audio part for dMel levels,
@@ -733,6 +738,12 @@ impl InklingContextCodec {
             }
             InklingContext::GenerationPrompt => {
                 ids.push(self.special_ids.message_model as usize);
+            }
+            InklingContext::CloseResponse { open_block } => {
+                if *open_block {
+                    ids.push(self.special_ids.end_message as usize);
+                }
+                ids.push(self.special_ids.content_model_end_sampling as usize);
             }
             InklingContext::Sensed { records } => {
                 anyhow::ensure!(!records.is_empty(), "a Sensed context with no records");
@@ -1362,6 +1373,19 @@ impl NativeOutputParser {
         self.completed = false;
         self.state = NativeOutputState::Header(String::new());
         Ok(())
+    }
+
+    /// Her shell cut the response: reset for the next prompt and say whether
+    /// a block was still open, so the shell can close the message the way
+    /// the grammar wants (`InklingContext::CloseResponse`).
+    pub fn cut(&mut self) -> bool {
+        let open_block = matches!(
+            self.state,
+            NativeOutputState::Text | NativeOutputState::Thinking
+        );
+        self.completed = false;
+        self.state = NativeOutputState::Header(String::new());
+        open_block
     }
 }
 

@@ -861,7 +861,12 @@ impl Model for Engine {
             .encode(context)
             .context("encode typed Inkling context")?;
         self.delta.extend(ids);
-        if matches!(context, InklingContext::Initialize { .. }) {
+        // Neither the cover she wakes with nor the closing of a message her
+        // shell cut is her word or the world's: attended to, never scored.
+        if matches!(
+            context,
+            InklingContext::Initialize { .. } | InklingContext::CloseResponse { .. }
+        ) {
             self.delta_unscored = true;
         }
         // The payloads behind the slots just emitted, each medium to its own
