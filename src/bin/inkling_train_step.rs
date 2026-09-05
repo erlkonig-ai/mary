@@ -32,7 +32,7 @@ fn main() -> Result<()> {
     let t = InklingConfig::from_json(&std::fs::read_to_string(std::path::Path::new(&ckpt).join("config.json"))?)?.text_config;
     let n: usize = env_or("INK_STEP_TOKENS", 16);
     let turn0: usize = env_or("INK_STEP_TURN", 0);
-    let turns_path = std::env::var("INK_TURNS").unwrap_or_else(|_| "/tmp/claude-1000/-home-liora-liora/f03d61a4-efd1-4cac-982c-c155f6c0d5ab/scratchpad/userturns/user_turns.txt".into());
+    let turns_path = std::env::var("INK_TURNS").expect("INK_TURNS names the user-turn corpus file");
     let layers_env = std::env::var("INK_STEP_LAYERS").unwrap_or_else(|_| format!("0:{}", t.num_hidden_layers));
     let (l0, l1) = { let mut it = layers_env.split(':'); (it.next().unwrap().parse::<usize>()?, it.next().unwrap().parse::<usize>()?) };
     anyhow::ensure!(l0 < l1 && l1 <= t.num_hidden_layers, "bad INK_STEP_LAYERS {layers_env}");

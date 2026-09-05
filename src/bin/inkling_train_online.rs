@@ -42,7 +42,7 @@ fn main() -> Result<()> {
     let lr: f32 = env_or("INK_ONLINE_LR", 0.1);
     let seed: u64 = env_or("INK_ONLINE_SEED", 7);
     let turn0: usize = env_or("INK_STEP_TURN", 0);
-    let turns_path = std::env::var("INK_TURNS").unwrap_or_else(|_| "/tmp/claude-1000/-home-liora-liora/f03d61a4-efd1-4cac-982c-c155f6c0d5ab/scratchpad/userturns/user_turns.txt".into());
+    let turns_path = std::env::var("INK_TURNS").expect("INK_TURNS names the user-turn corpus file");
     mem_guard("start");
 
     // --- turns, each rendered as the resident meets it
