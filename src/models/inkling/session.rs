@@ -1261,6 +1261,13 @@ impl Session {
         self.src.model_root()
     }
 
+    /// The loaded source: the model collection's facts and the blob reader
+    /// they resolve through. The tokenizer is read from here, so the model
+    /// pile is the model, tokenizer included.
+    pub fn source(&self) -> &Weights {
+        &self.src
+    }
+
     pub fn export_learned(&mut self) -> Result<Vec<super::learned::LearnedCut>> {
         #[cfg(feature = "inkling-cuda")]
         {

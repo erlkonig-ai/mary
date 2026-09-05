@@ -564,10 +564,42 @@ pub fn heard_frames(levels: &[u8]) -> Result<usize> {
 
 #[cfg(feature = "tokenizer")]
 impl InklingContextCodec {
-    /// Build both tokenizer views and resolve every structural id by spelling.
+    /// Both tokenizer views from a `tokenizer.json`: the whole tokenizer, and
+    /// the same JSON with every special added token removed. The resident
+    /// engine builds its views from the model graph instead
+    /// ([`Self::from_views`]); this is for gates and tests that start from
+    /// the checkpoint's own file.
     pub fn from_json(tokenizer_json: &[u8]) -> Result<Self> {
         let tokenizer = tokenizers::Tokenizer::from_bytes(tokenizer_json)
             .map_err(|error| anyhow::anyhow!("load Inkling tokenizer: {error}"))?;
+        let mut content_json: serde_json::Value = serde_json::from_slice(tokenizer_json)
+            .context("parse Inkling tokenizer JSON for the content-only view")?;
+        let added = content_json
+            .get_mut("added_tokens")
+            .and_then(serde_json::Value::as_array_mut)
+            .context("Inkling tokenizer JSON has no added_tokens array")?;
+        added.retain(|token| {
+            !token
+                .get("special")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+        });
+        let content_json = serde_json::to_vec(&content_json)
+            .context("serialize Inkling content-only tokenizer JSON")?;
+        let content = tokenizers::Tokenizer::from_bytes(&content_json)
+            .map_err(|error| anyhow::anyhow!("load Inkling content-only tokenizer: {error}"))?;
+        Self::from_views(&tokenizer, content)
+    }
+
+    /// Resolve every structural id by spelling from the whole tokenizer, and
+    /// keep the content-only view for everything untrusted. The engine builds
+    /// both from the tokenizer graph in the model pile, so the model pile is
+    /// the model, tokenizer included; the whole tokenizer is borrowed because
+    /// the engine keeps it for the detokenizer.
+    pub fn from_views(
+        tokenizer: &tokenizers::Tokenizer,
+        content: tokenizers::Tokenizer,
+    ) -> Result<Self> {
         let required = |spelling: &str| {
             tokenizer
                 .token_to_id(spelling)
@@ -633,22 +665,6 @@ impl InklingContextCodec {
             );
         }
 
-        let mut content_json: serde_json::Value = serde_json::from_slice(tokenizer_json)
-            .context("parse Inkling tokenizer JSON for the content-only view")?;
-        let added = content_json
-            .get_mut("added_tokens")
-            .and_then(serde_json::Value::as_array_mut)
-            .context("Inkling tokenizer JSON has no added_tokens array")?;
-        added.retain(|token| {
-            !token
-                .get("special")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false)
-        });
-        let content_json = serde_json::to_vec(&content_json)
-            .context("serialize Inkling content-only tokenizer JSON")?;
-        let content = tokenizers::Tokenizer::from_bytes(&content_json)
-            .map_err(|error| anyhow::anyhow!("load Inkling content-only tokenizer: {error}"))?;
         let codec = Self {
             content,
             special_ids,
@@ -976,8 +992,10 @@ pub struct Ready {
     /// Canonical SimpleArchive handle of the projected model facts the runtime
     /// actually indexed, rendered as 64 hexadecimal digits.
     pub model_identity: String,
-    /// RawBytes handle of the exact tokenizer bytes, rendered as 64
-    /// hexadecimal digits.
+    /// The id of the tokenizer entity in the model graph the run built its
+    /// tokenizer from, rendered as 32 hexadecimal digits. Content-derived,
+    /// so it is the identity of the exact tokenizer; both ranks read it from
+    /// their own copy of the pile and must agree.
     pub tokenizer_identity: String,
     /// TML ids resolved from that tokenizer by spelling at runtime. The client
     /// parses generated structure by these ids, never by decoded marker text.

@@ -15,7 +15,7 @@
 use anyhow::{Context as _, Result};
 use triblespace::core::metadata;
 use triblespace::prelude::blobencodings::UTF8String;
-use triblespace::prelude::inlineencodings::{Blake3, Boolean, F64, Handle, Hash, U256BE};
+use triblespace::prelude::inlineencodings::{Blake3, Boolean, F64, GenId, Handle, Hash, U256BE};
 use triblespace::prelude::*;
 
 use super::resident::{ContextPlacement, ContextPreflighted, Ready, Reinitialized, TurnEnd};
@@ -28,9 +28,16 @@ pub mod schema {
         /// Canonical identity of the projected model facts actually loaded.
         /// Minted 2026-08-28: E65EDFF32D71BAB66F6B1BA69C11ABE3.
         "E65EDFF32D71BAB66F6B1BA69C11ABE3" as pub model_identity: Hash<Blake3>;
-        /// Content identity of the exact tokenizer bytes.
-        /// Minted 2026-08-28: 01C84FAC727F47AF438951439ED3B657.
+        /// Content identity of the exact tokenizer bytes of a `tokenizer.json`
+        /// beside the pile. Minted 2026-08-28: 01C84FAC727F47AF438951439ED3B657.
+        /// No longer written: the tokenizer comes out of the model graph and
+        /// READY names its entity (`tokenizer` below). Declared so the READY
+        /// rows written before 2026-09-05 stay readable.
         "01C84FAC727F47AF438951439ED3B657" as pub tokenizer_identity: Hash<Blake3>;
+        /// The tokenizer entity in the model graph the run built its views
+        /// from. Its id is content-derived, so this IS the identity of the
+        /// exact tokenizer. Minted 2026-09-05: 9692481AC9DA5388A755F2280B8F391D.
+        "9692481AC9DA5388A755F2280B8F391D" as pub tokenizer: GenId;
         /// Identity of the sealed/observed executable configuration.
         /// Minted 2026-08-28: 45514D5DD40BA7A83A84A6F9C829D66A.
         "45514D5DD40BA7A83A84A6F9C829D66A" as pub execution_identity: Hash<Blake3>;
@@ -177,8 +184,8 @@ pub mod schema {
 pub fn ready_fragment(ready: &Ready) -> Result<Fragment> {
     let model_identity = Hash::<Blake3>::from_hex(&ready.model_identity)
         .context("READY model identity is not a 32-byte hexadecimal BLAKE3 digest")?;
-    let tokenizer_identity = Hash::<Blake3>::from_hex(&ready.tokenizer_identity)
-        .context("READY tokenizer identity is not a 32-byte hexadecimal BLAKE3 digest")?;
+    let tokenizer = Id::from_hex(&ready.tokenizer_identity)
+        .context("READY tokenizer identity is not the 32-hex id of a tokenizer entity")?;
     let execution_identity = Hash::<Blake3>::from_hex(&ready.execution_identity)
         .context("READY execution identity is not a 32-byte hexadecimal BLAKE3 digest")?;
 
@@ -193,7 +200,7 @@ pub fn ready_fragment(ready: &Ready) -> Result<Fragment> {
     fragment += entity! { _ @
         metadata::tag: schema::kind_ready,
         schema::model_identity: model_identity,
-        schema::tokenizer_identity: tokenizer_identity,
+        schema::tokenizer: tokenizer,
         schema::execution_identity: execution_identity,
         schema::execution_profile: execution_profile,
         schema::execution_unavailable*: execution_unavailable,
@@ -304,7 +311,7 @@ mod tests {
         Ready {
             pile: "fixture.pile".to_string(),
             model_identity: "11".repeat(32),
-            tokenizer_identity: "22".repeat(32),
+            tokenizer_identity: "22".repeat(16),
             special_ids: InklingSpecialIds {
                 message_model: 1,
                 message_system: 2,

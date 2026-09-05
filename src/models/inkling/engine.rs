@@ -70,8 +70,6 @@ use super::resident::{
 use super::session::{Session, SessionConfig};
 use super::tp::Tp;
 use super::tpcomm::{Group, Pass, transport_note};
-use triblespace::core::blob::IntoBlob;
-use triblespace::core::blob::encodings::rawbytes::RawBytes;
 
 /// One decoded text chunk per generated id, or `None` while an incomplete
 /// UTF-8 sequence waits for a later token.
@@ -84,10 +82,8 @@ type Detokenizer = Box<dyn FnMut(u32) -> Result<Option<String>> + Send>;
 
 /// How to load one rank of the model.
 pub struct EngineConfig {
-    /// The model collection: weights AND config.json.
+    /// The model collection: weights, config.json AND the tokenizer graph.
     pub pile: std::path::PathBuf,
-    /// The checkpoint's own `tokenizer.json`.
-    pub tokenizer: std::path::PathBuf,
     /// Layers this rank runs. A tensor-parallel rank must run all of them.
     pub layers: Option<std::ops::Range<usize>>,
     /// Maximum token rows one prefill pass processes at once.
@@ -185,12 +181,6 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     };
     let mut execution_manifest = begin_execution_manifest(execution_profile)?;
 
-    let tokenizer_bytes = std::fs::read(&config.tokenizer)
-        .with_context(|| format!("read {}", config.tokenizer.display()))?;
-    let tokenizer_identity = IntoBlob::<RawBytes>::to_blob(tokenizer_bytes.as_slice())
-        .get_handle()
-        .raw;
-
     let mut session_config = SessionConfig::new(&config.pile);
     if let Some(layers) = config.layers.clone() {
         session_config = session_config.layers(layers);
@@ -245,11 +235,43 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         }
     };
     let load_secs = loaded.elapsed().as_secs_f64();
+
+    // The tokenizer comes out of the model pile itself: the model collection
+    // carries its tokenizer graph (ingested and proven by
+    // `inkling_tokenizer_gate`), so the pile is the model, tokenizer included,
+    // and no side file can drift from it. Both views are built here -- the
+    // whole tokenizer for structure and the detokenizer, the content-only
+    // one for everything untrusted -- and the identity is the graph's own.
+    // Both ranks build them: rank 1 for the ids and the identity alone.
+    let (tokenizer_identity, tokenizer, content) = {
+        let source = session.source();
+        let facts = source.facts();
+        let mut found = crate::tokenizer::find_tokenizers(facts);
+        let tok_id = found.next().with_context(|| {
+            format!(
+                "the model collection in {} carries no tokenizer graph; ingest it with \
+                 inkling_tokenizer_gate <tokenizer.json> <pile> --signing-key <key>",
+                config.pile.display()
+            )
+        })?;
+        anyhow::ensure!(
+            found.next().is_none(),
+            "the model collection in {} carries more than one tokenizer",
+            config.pile.display()
+        );
+        let tokenizer = crate::tokenizer::build_tokenizer(facts, source.reader(), tok_id)
+            .map_err(|error| anyhow::anyhow!("build the tokenizer from the model graph: {error}"))?;
+        let content =
+            crate::tokenizer::build_tokenizer_with_added(facts, source.reader(), tok_id, false)
+                .map_err(|error| {
+                    anyhow::anyhow!("build the content-only tokenizer from the model graph: {error}")
+                })?;
+        (format!("{tok_id:X}"), tokenizer, content)
+    };
     let runtime_facts = RuntimeFacts::observe();
 
     let range = session.layer_range();
     let model_identity = hex_identity(session.model_identity());
-    let tokenizer_identity = hex_identity(tokenizer_identity);
     for (name, value) in [
         ("model-identity", model_identity.as_str()),
         ("tokenizer-identity", tokenizer_identity.as_str()),
@@ -290,8 +312,8 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // before branching, because it is also where the special ids come from and
     // both ranks' READY records must agree on the execution identity that the
     // tokenizer identity feeds. Rank 1 drops it immediately.
-    let codec = InklingContextCodec::from_json(&tokenizer_bytes)
-        .with_context(|| format!("build context codec from {}", config.tokenizer.display()))?;
+    let codec = InklingContextCodec::from_views(&tokenizer, content)
+        .context("build the context codec from the model graph's tokenizer")?;
     // Her shell declares no tools, so the template's tool-call block is not
     // part of her grammar: the token that opens it is never chosen, on every
     // rank alike. The parser reads text and thinking only.
@@ -350,10 +372,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // generated ids advance the same stream and their chunks are emitted. A
     // carried token is never advanced twice: it entered this sequence when it
     // was generated, while `carry` only catches the KV cache up to that fact.
-    let tokenizer: &'static tokenizers::Tokenizer = Box::leak(Box::new(
-        tokenizers::Tokenizer::from_bytes(&tokenizer_bytes)
-            .map_err(|error| anyhow::anyhow!("load {}: {error}", config.tokenizer.display()))?,
-    ));
+    let tokenizer: &'static tokenizers::Tokenizer = Box::leak(Box::new(tokenizer));
     Ok(Loaded::Engine(Engine {
         signing_key: config.signing_key.clone(),
         session,

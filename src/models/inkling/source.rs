@@ -230,6 +230,16 @@ impl Weights {
         self.src.model_root()
     }
 
+    /// Everything the model collection asserts, tokenizer graph included.
+    pub fn facts(&self) -> &triblespace::prelude::TribleSet {
+        self.src.facts()
+    }
+
+    /// The blob reader the facts resolve through.
+    pub fn reader(&self) -> &triblespace::core::repo::pile::PileSnapshot {
+        self.src.reader()
+    }
+
     /// Freeze one layer's routed experts as the control; see
     /// [`PileSource::freeze_experts`].
     pub fn freeze_experts(&mut self, prefix: &str) -> Result<(usize, usize)> {

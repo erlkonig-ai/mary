@@ -1071,6 +1071,22 @@ pub fn build_tokenizer(
     blobs: &impl BlobStoreGet,
     tok_id: Id,
 ) -> Result<tokenizers::Tokenizer, Err> {
+    build_tokenizer_with_added(tribles, blobs, tok_id, true)
+}
+
+/// [`build_tokenizer`], with the choice of leaving the added tokens out.
+///
+/// Without them the result is the CONTENT-ONLY view a chat codec needs:
+/// every added token of our tokenizers is special, so a tokenizer built
+/// without them turns a literal marker spelling in untrusted text into
+/// ordinary pieces instead of structure.
+#[cfg(feature = "tokenizer")]
+pub fn build_tokenizer_with_added(
+    tribles: &TribleSet,
+    blobs: &impl BlobStoreGet,
+    tok_id: Id,
+    with_added: bool,
+) -> Result<tokenizers::Tokenizer, Err> {
     use tokenizers::models::bpe::BPE;
     use tokenizers::models::wordpiece::WordPiece;
 
@@ -1172,7 +1188,7 @@ pub fn build_tokenizer(
         .into_iter()
         .map(|(content, _id)| tokenizers::AddedToken::from(content, true))
         .collect();
-    if !added.is_empty() {
+    if with_added && !added.is_empty() {
         tok.add_special_tokens(&added);
     }
     Ok(tok)
