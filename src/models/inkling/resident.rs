@@ -1205,11 +1205,11 @@ enum NativeOutputState {
 ///
 /// Her shell declares no tools, so the grammar she is read against is text and
 /// thinking, and everything she says is the command. The template's tool-JSON
-/// block is not refused: a mind that stopped existing because it reached for
-/// a word its shell does not know could not live in a shell (fold gate f5,
-/// 2026-09-05, when she called a tool named `memory`). It is read as text --
-/// the block name, then its body -- so what she wrote reaches her shell as her
-/// message, and her shell answers it the way it answers anything.
+/// block is not in her grammar at all: the engine forbids its opening token at
+/// the head (`Session::forbid`), so it is never generated, and here it is only
+/// an unsupported special like any other. The template's optional block name
+/// before a content kind is kept as the first bytes of that block: her bytes
+/// are her bytes, and her shell answers them.
 #[derive(Debug)]
 pub struct NativeOutputParser {
     ids: InklingSpecialIds,
@@ -1283,9 +1283,8 @@ impl NativeOutputParser {
             return Ok(delta);
         }
 
-        // Text, and the tool-JSON block read as text: whatever named the block
-        // is the first thing she said in it.
-        if id == self.ids.content_text || id == self.ids.content_invoke_tool_json {
+        // Whatever named the block is the first thing she said in it.
+        if id == self.ids.content_text {
             let NativeOutputState::Header(header) = &mut self.state else {
                 anyhow::bail!("a content kind appeared outside a model-message header")
             };
@@ -1708,20 +1707,27 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_block_is_read_as_text_with_its_name() {
-        // Fold gate f5, 2026-09-05: she called a tool named `memory`. Her
-        // shell declares none; what she wrote reaches it as her message.
+    fn a_tool_block_is_not_in_her_grammar() {
+        // The engine forbids this token at the head, so the parser never sees
+        // it; if it ever did, that is a model fault, not a message.
         let ids = ids();
+        let error = read(
+            &ids,
+            &[(100, "memory".to_string()), (7, at(&ids, 7, ""))],
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("unsupported generated"), "{error:#}");
+
+        // A block name before text stays hers.
         let script = [
             (100, "memory".to_string()),
-            (7, at(&ids, 7, "")),
-            (101, r#"{"name":"memory","args":{"range":"a..b"}}"#.to_string()),
+            (4, at(&ids, 4, "")),
+            (101, " create a..b".to_string()),
             (9, at(&ids, 9, "")),
             (8, at(&ids, 8, "")),
         ];
-        let (text, thinking, completed) = read(&ids, &script).unwrap();
-        assert_eq!(text, r#"memory{"name":"memory","args":{"range":"a..b"}}"#);
-        assert!(thinking.is_empty());
+        let (text, _, completed) = read(&ids, &script).unwrap();
+        assert_eq!(text, "memory create a..b");
         assert!(completed);
     }
 

@@ -225,7 +225,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         .unwrap_or((None, 1));
 
     let loaded = std::time::Instant::now();
-    let session = match config.tensor_parallel {
+    let mut session = match config.tensor_parallel {
         None => Session::load(session_config).context("load the model")?,
         Some(tensor_parallel) => {
             eprintln!(
@@ -292,6 +292,10 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // tokenizer identity feeds. Rank 1 drops it immediately.
     let codec = InklingContextCodec::from_json(&tokenizer_bytes)
         .with_context(|| format!("build context codec from {}", config.tokenizer.display()))?;
+    // Her shell declares no tools, so the template's tool-call block is not
+    // part of her grammar: the token that opens it is never chosen, on every
+    // rank alike. The parser reads text and thinking only.
+    session.forbid([codec.special_ids().content_invoke_tool_json as usize]);
 
     let ready = Ready {
         pile: config.pile.display().to_string(),

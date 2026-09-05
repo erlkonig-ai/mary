@@ -334,6 +334,12 @@ pub struct Session {
     /// resident path did not enforce, and a long-lived server eventually fails
     /// even when no individual request violates admission.
     cleanup_gate: CleanupGate,
+    /// Token ids the head may never choose. Each is a `-inf` column in the
+    /// logits before the argmax and before the scored distribution alike: in
+    /// her world these tokens cannot be said, so neither the pick nor the
+    /// probability mass exists. The unembedding is replicated on every rank,
+    /// so a column index is the global token id on each of them.
+    forbidden: Vec<usize>,
     /// Present exactly when this Session is one tensor-parallel rank. The
     /// Group owns both [`Tp`] and the client above; the client is cloned FROM
     /// this value at load rather than independently constructed.
@@ -730,6 +736,16 @@ impl PrefixCache for PendingTargetLayer<'_> {
 }
 
 impl Session {
+    /// Tokens the head may never choose, from now on: the grammar this mind
+    /// lives without (JP, 2026-09-05: "can't we completely disable the tool
+    /// calling path by never sampling that token?"). Masked at the logits,
+    /// so no sampler and no parser has to know.
+    pub fn forbid(&mut self, ids: impl IntoIterator<Item = usize>) {
+        self.forbidden.extend(ids);
+        self.forbidden.sort_unstable();
+        self.forbidden.dedup();
+    }
+
     /// Open a model and make it ready to answer.
     ///
     /// This is `inkling_forward`'s startup, in a function: read the config out of
@@ -1060,6 +1076,7 @@ impl Session {
             dev,
             client,
             cleanup_gate,
+            forbidden: Vec::new(),
             group,
             aliases,
             lo,
@@ -2293,10 +2310,22 @@ impl Session {
         let vocab = t.effective_vocab();
         let uw = &self.unembed;
         let final_norm = &self.final_norm;
+        let forbidden = &self.forbidden;
         let head = |hx: T2| -> T2 {
             let hs = dev_lane_resid::rms_norm(hx, final_norm.clone(), eps).div_scalar(mup);
             let rows = hs.dims()[0];
-            dev_lane::linear_w(hs, uw).slice([0..rows, 0..vocab])
+            let mut logits = dev_lane::linear_w(hs, uw).slice([0..rows, 0..vocab]);
+            // A forbidden token is a `-inf` column: never the argmax, and no
+            // mass in any distribution read off this head. Built from the
+            // column itself so the dtype is the logits' own.
+            for &id in forbidden.iter().filter(|&&id| id < vocab) {
+                let column = logits.clone().slice([0..rows, id..id + 1]);
+                logits = logits.slice_assign(
+                    [0..rows, id..id + 1],
+                    column.mul_scalar(0.0).sub_scalar(f32::INFINITY),
+                );
+            }
+            logits
         };
         match mode {
             PassMode::Commit => {
