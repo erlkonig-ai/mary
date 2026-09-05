@@ -20,7 +20,6 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use triblespace::core::attribute::Attribute;
 use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
-use triblespace::core::clock::epoch_now;
 use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
@@ -220,9 +219,11 @@ fn collection_or_create_with_instant(
     instant: Option<hifitime::Epoch>,
 ) -> anyhow::Result<ModelCollection> {
     let signer = signing_key.verifying_key();
-    let snapshot = pile
-        .snapshot()
-        .context("freeze model collection selection")?;
+    let snapshot = match instant {
+        Some(instant) => pile.snapshot_at(instant),
+        None => pile.snapshot(),
+    }
+    .context("freeze model collection selection")?;
     let collections = named_collections_in(&snapshot, name)?;
     match collections.as_slice() {
         [] => pile
@@ -230,7 +231,7 @@ fn collection_or_create_with_instant(
             .map_err(|error| anyhow!("register '{name}' collection: {error}")),
         [collection] => {
             let admitted = collection
-                .writer_is_admitted_at(&snapshot, signer, instant.unwrap_or_else(epoch_now))
+                .writer_is_admitted(&snapshot, signer)
                 .with_context(|| format!("check WRITE policy for '{name}'"))?;
             if !admitted {
                 bail!(
@@ -351,7 +352,7 @@ pub fn local_model_support(
     collection: ModelCollection,
 ) -> anyhow::Result<Support> {
     collection
-        .admitted_at(store, epoch_now())
+        .admitted(store)
         .context("admit local model collection support")
 }
 
@@ -438,18 +439,6 @@ pub fn snapshot_model_bundle_collection_in(
 ) -> anyhow::Result<ModelPileSnapshot> {
     let collection = sole_named_collection_in(store, mary_model_bundle_name())?;
     snapshot_model_collection_for(store, collection)
-}
-
-pub fn snapshot_model_bundle_collection_local_latest_with_admission(
-    pile: &mut Pile,
-) -> anyhow::Result<(ModelPileSnapshot, Vec<CollectionCommit>)> {
-    let store = pile.snapshot().context("freeze model bundle observation")?;
-    let collection = sole_named_collection_in(&store, mary_model_bundle_name())?;
-    let (support, commits) = collection
-        .admitted_with_commits_at(&store, epoch_now())
-        .context("admit model bundle commits")?;
-    let snapshot = snapshot_model_bundle_collection_exact(&store, &support)?;
-    Ok((snapshot, commits))
 }
 
 pub fn load_model_collection_local_latest(
