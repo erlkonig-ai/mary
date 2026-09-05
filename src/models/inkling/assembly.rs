@@ -2790,7 +2790,12 @@ pub fn moe_layer(
     // grouped by expert on the host, full tiles, the prefill schedule. The
     // learned layer keeps the device plan while learning is armed, because
     // the learner reads that plan after the pass.
-    let wide = n > crate::models::inkling::fp4gemm::MTILE
+    // `INK_HOST_PLAN=1` forces the host lane at every width, for measuring the
+    // two lanes against each other at one row (the decode step), where the
+    // device plan's point is the readback it avoids and the grouped kernel's
+    // schedule is the question.
+    let host_plan_forced = std::env::var("INK_HOST_PLAN").ok().as_deref() == Some("1");
+    let wide = (n > crate::models::inkling::fp4gemm::MTILE || host_plan_forced)
         && !(st.learn_layer == Some(layer) && !frozen);
     if wide {
         let g = crate::models::inkling::seam::tensor_of(
