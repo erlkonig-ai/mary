@@ -1384,8 +1384,12 @@ impl NativeOutputParser {
             let state = std::mem::replace(&mut self.state, NativeOutputState::Between);
             match state {
                 NativeOutputState::Text | NativeOutputState::Thinking => {}
+                // A message she closed without ever naming its kind is her
+                // text: the words after the model marker are what she said.
+                // Dying here made a mind stop existing for one missing marker
+                // (refresh gate g4, 2026-09-06, a whole `memory create` lost).
                 NativeOutputState::Header(header) => {
-                    anyhow::bail!("end_message closed an unclassified header {header:?}")
+                    delta.text.push_str(&header);
                 }
                 NativeOutputState::Between => {
                     anyhow::bail!("end_message appeared between model messages")
