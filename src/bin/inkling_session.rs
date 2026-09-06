@@ -160,8 +160,14 @@ fn main() -> Result<()> {
 
         let mut out = vec![tok];
         let t_d = std::time::Instant::now();
+        // Every step's own time, so the arm is read by its median and its
+        // spread rather than by an aggregate that a handful of KV-bucket
+        // recompiles (`INK_KV_PAD`) can double.
+        let mut step_ms: Vec<f64> = Vec::with_capacity(want);
         for _ in 1..want {
+            let t_s = std::time::Instant::now();
             tok = session.step()?;
+            step_ms.push(t_s.elapsed().as_secs_f64() * 1e3);
             out.push(tok);
         }
         let t_decode = t_d.elapsed().as_secs_f64();
@@ -175,6 +181,19 @@ fn main() -> Result<()> {
             (want - 1) as f64 / t_decode.max(f64::EPSILON),
             session.position(),
         );
+        if step_ms.len() >= 3 {
+            let mut sorted = step_ms.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let at = |q: f64| sorted[((sorted.len() - 1) as f64 * q).round() as usize];
+            let median = at(0.5);
+            let stalls = step_ms.iter().filter(|&&ms| ms > 2.0 * median).count();
+            println!(
+                "  steps turn {turn}: median {median:.1} ms, p10 {:.1}, p90 {:.1}, max {:.1}; {stalls} step(s) over twice the median",
+                at(0.1),
+                at(0.9),
+                sorted[sorted.len() - 1],
+            );
+        }
     }
     Ok(())
 }

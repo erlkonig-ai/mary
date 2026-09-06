@@ -2795,7 +2795,17 @@ pub fn moe_layer(
     // device plan's point is the readback it avoids and the grouped kernel's
     // schedule is the question.
     let host_plan_forced = std::env::var("INK_HOST_PLAN").ok().as_deref() == Some("1");
-    let wide = (n > crate::models::inkling::fp4gemm::MTILE || host_plan_forced)
+    // `INK_DECODE_EXPERTS=per`: at ONE row, run the routed experts one expert
+    // at a time on the harness's per-expert kernels instead of the grouped
+    // kernel's decode schedule. Profiled 2026-09-05 (sky, layers 0:21, ctx
+    // 3.2k, warm median): the grouped kernel spends 40.6 ms of an 84.8 ms step
+    // on the experts; the per-expert kernels spend 11.5 of 60.1. The lanes
+    // agree per layer to a rounding gap (INK_GROUPED=2). Default stays the
+    // grouped lane until the frozen model's loss on JP's turns says the same
+    // for the whole stack.
+    let per_expert_decode =
+        n == 1 && std::env::var("INK_DECODE_EXPERTS").ok().as_deref() == Some("per");
+    let wide = (n > crate::models::inkling::fp4gemm::MTILE || host_plan_forced || per_expert_decode)
         && !(st.learn_layer == Some(layer) && !frozen);
     if wide {
         let g = crate::models::inkling::seam::tensor_of(
@@ -2824,8 +2834,15 @@ pub fn moe_layer(
                     .push((ti, row[k + j]));
             }
         }
-        let acc = match cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")) {
-            true => routed_experts_fp4(
+        let acc = match (cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")), per_expert_decode) {
+            (true, true) => {
+                st.host.per_expert += 1;
+                st.host.expert_slots += by_expert.len();
+                per_expert_fp4(
+                    cp, aliases, client, dev, p, &by_expert, &hn, n, h, inter, &mut st.host,
+                )?
+            }
+            (true, false) => routed_experts_fp4(
                 cp,
                 aliases,
                 client,
@@ -2839,7 +2856,14 @@ pub fn moe_layer(
                 false,
                 &mut st.host,
             )?,
-            false => routed_experts_bf16(
+            (false, true) => {
+                st.host.per_expert += 1;
+                st.host.expert_slots += by_expert.len();
+                per_expert_bf16(
+                    cp, aliases, client, dev, p, &by_expert, &hn, n, h, inter, &mut st.host,
+                )?
+            }
+            (false, false) => routed_experts_bf16(
                 cp,
                 aliases,
                 client,
