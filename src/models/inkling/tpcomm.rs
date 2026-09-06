@@ -776,6 +776,13 @@ pub enum Pass {
     /// staying exactly what they were. Both ranks must do it in lockstep or
     /// their halves of every later attention would disagree.
     Evict { from: usize, to: usize },
+    /// `Session::checkpoint` on every rank, kept under `index`: a rewind
+    /// point inside her cover. Not a collective; every rank takes it at the
+    /// same position because every rank made the same passes.
+    Checkpoint { index: usize },
+    /// `Session::rewind` on every rank to the checkpoint kept under `index`,
+    /// dropping it and every later one. The next pass extends from there.
+    Rewind { index: usize },
 }
 
 impl Pass {
@@ -792,6 +799,8 @@ impl Pass {
     const AUDIO: u8 = 0x0B;
     const VISION: u8 = 0x0C;
     const EVICT: u8 = 0x0D;
+    const CHECKPOINT: u8 = 0x0E;
+    const REWIND: u8 = 0x0F;
 
     /// `[tag u8][count u32be][count x u32be ids]`.
     ///
@@ -817,6 +826,7 @@ impl Pass {
         }
         const NONE: &[usize] = &[];
         let evict_ids: [usize; 2];
+        let one_id: [usize; 1];
         let (tag, ids): (u8, &[usize]) = match self {
             Pass::Prefill(ids) => (Self::PREFILL, ids.as_slice()),
             Pass::Extend(ids) => (Self::EXTEND, ids.as_slice()),
@@ -831,6 +841,14 @@ impl Pass {
             Pass::Evict { from, to } => {
                 evict_ids = [*from, *to];
                 (Self::EVICT, &evict_ids[..])
+            }
+            Pass::Checkpoint { index } => {
+                one_id = [*index];
+                (Self::CHECKPOINT, &one_id[..])
+            }
+            Pass::Rewind { index } => {
+                one_id = [*index];
+                (Self::REWIND, &one_id[..])
             }
             Pass::Audio { .. } | Pass::Vision { .. } => unreachable!("encoded above"),
         };
@@ -867,6 +885,17 @@ impl Pass {
                 Pass::Evict {
                     from: ids[0],
                     to: ids[1],
+                }
+            }
+            Self::CHECKPOINT | Self::REWIND => {
+                anyhow::ensure!(
+                    ids.len() == 1,
+                    "a checkpoint or rewind pass carries exactly one index, but {} id(s) arrived",
+                    ids.len()
+                );
+                match tag {
+                    Self::CHECKPOINT => Pass::Checkpoint { index: ids[0] },
+                    _ => Pass::Rewind { index: ids[0] },
                 }
             }
             Self::PREFILL => Pass::Prefill(ids),

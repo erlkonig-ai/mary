@@ -155,40 +155,40 @@
 use anyhow::{Context, Result};
 
 #[cfg(any(feature = "tokenizer", test))]
-const MESSAGE_MODEL: &str = "<|message_model|>";
+pub const MESSAGE_MODEL: &str = "<|message_model|>";
 #[cfg(any(feature = "tokenizer", test))]
-const MESSAGE_SYSTEM: &str = "<|message_system|>";
+pub const MESSAGE_SYSTEM: &str = "<|message_system|>";
 /// The world's answer to what she said arrives in the user voice, exactly as
 /// the shipped template renders a user text message. Her shell declares no
 /// tools; her whole message is the command, and this is what came back.
 #[cfg(any(feature = "tokenizer", test))]
-const MESSAGE_USER: &str = "<|message_user|>";
+pub const MESSAGE_USER: &str = "<|message_user|>";
 #[cfg(any(feature = "tokenizer", test))]
-const MESSAGE_TOOL: &str = "<|message_tool|>";
+pub const MESSAGE_TOOL: &str = "<|message_tool|>";
 #[cfg(any(feature = "tokenizer", test))]
-const CONTENT_TEXT: &str = "<|content_text|>";
+pub const CONTENT_TEXT: &str = "<|content_text|>";
 #[cfg(any(feature = "tokenizer", test))]
-const CONTENT_XML: &str = "<|content_xml|>";
+pub const CONTENT_XML: &str = "<|content_xml|>";
 #[cfg(any(feature = "tokenizer", test))]
-const CONTENT_THINKING: &str = "<|content_thinking|>";
+pub const CONTENT_THINKING: &str = "<|content_thinking|>";
 #[cfg(any(feature = "tokenizer", test))]
-const CONTENT_INVOKE_TOOL_JSON: &str = "<|content_invoke_tool_json|>";
+pub const CONTENT_INVOKE_TOOL_JSON: &str = "<|content_invoke_tool_json|>";
 #[cfg(any(feature = "tokenizer", test))]
-const CONTENT_MODEL_END_SAMPLING: &str = "<|content_model_end_sampling|>";
+pub const CONTENT_MODEL_END_SAMPLING: &str = "<|content_model_end_sampling|>";
 #[cfg(any(feature = "tokenizer", test))]
-const END_MESSAGE: &str = "<|end_message|>";
+pub const END_MESSAGE: &str = "<|end_message|>";
 /// The dMel audio input, as the shipped template renders an audio content
 /// part: `<|content_audio_input|>`, one placeholder per 50 ms frame, then
 /// `<|audio_end|>` (`processor_config.json`: `audio_bos_token`, `audio_token`).
-const CONTENT_AUDIO_INPUT: &str = "<|content_audio_input|>";
-const AUDIO_SLOT: &str = "<|unused_200053|>";
+pub const CONTENT_AUDIO_INPUT: &str = "<|content_audio_input|>";
+pub const AUDIO_SLOT: &str = "<|unused_200053|>";
 const AUDIO_END: &str = "<|audio_end|>";
 /// The template's image part: `<|content_image|>`, one placeholder per
 /// patch, then `<|end_message|>` -- there is no image end token
 /// (`processor_config.json`: `image_bos_token`, `image_token`; the template's
 /// `image` branch).
-const CONTENT_IMAGE: &str = "<|content_image|>";
-const IMAGE_SLOT: &str = "<|unused_200054|>";
+pub const CONTENT_IMAGE: &str = "<|content_image|>";
+pub const IMAGE_SLOT: &str = "<|unused_200054|>";
 /// One dMel frame is this many levels, each below `DMEL_LEVELS`
 /// (`audio_config`: `n_mel_bins`, `mel_vocab_size`).
 pub const DMEL_BINS: usize = 80;
@@ -347,6 +347,11 @@ pub enum InklingContext {
     /// a Drive memory-cover response). Its model parts and optional result are
     /// inserted together.
     HistoricalResponse { response: InklingHistoryResponse },
+    /// Several completed responses in a row, as a refresh re-installs the
+    /// part of her cover that changed and the live turns after it: encoded
+    /// like the history of an `Initialize`, without its system messages, and
+    /// attended to, never scored.
+    History { responses: Vec<InklingHistoryResponse> },
     /// Start another autonomous assistant response after a completed text-only
     /// response. A tool result already carries this prompt itself.
     GenerationPrompt,
@@ -701,6 +706,44 @@ impl InklingContextCodec {
     }
 
     /// Encode one typed context record into exact model token ids.
+    /// [`Self::encode`], and the offset at which every history part of an
+    /// `Initialize` or `History` starts within the ids (empty for the other
+    /// contexts). A mind that installs a cover keeps these, as absolute
+    /// positions, to know where a later refresh's first changed recall is.
+    pub fn encode_with_parts(&self, context: &InklingContext) -> Result<(Vec<usize>, Vec<usize>)> {
+        let ids = self.encode(context)?;
+        let responses: &[InklingHistoryResponse] = match context {
+            InklingContext::Initialize { history, .. } => history,
+            InklingContext::History { responses } => responses,
+            _ => return Ok((ids, Vec::new())),
+        };
+        // Re-walk the same encoding, counting: the parts are pushed by the
+        // same function in the same order, so the prefix lengths are exact.
+        let mut parts = Vec::with_capacity(responses.len());
+        let mut probe = Vec::new();
+        if let InklingContext::Initialize { system, .. } = context {
+            probe.push(self.special_ids.message_system as usize);
+            probe.push(self.special_ids.content_text as usize);
+            self.push_content(&mut probe, system)?;
+            probe.push(self.special_ids.end_message as usize);
+            probe.push(self.special_ids.message_system as usize);
+            probe.push(self.special_ids.content_text as usize);
+            self.push_content(&mut probe, DEFAULT_THINKING_EFFORT)?;
+            probe.push(self.special_ids.end_message as usize);
+        }
+        for response in responses {
+            parts.push(probe.len());
+            self.push_historical_response(&mut probe, response)?;
+        }
+        anyhow::ensure!(
+            probe.len() + 1 == ids.len(),
+            "the part walk counted {} ids where the encoding has {}",
+            probe.len() + 1,
+            ids.len()
+        );
+        Ok((ids, parts))
+    }
+
     pub fn encode(&self, context: &InklingContext) -> Result<Vec<usize>> {
         let mut ids = Vec::new();
         match context {
@@ -734,6 +777,12 @@ impl InklingContextCodec {
             }
             InklingContext::HistoricalResponse { response } => {
                 self.push_historical_response(&mut ids, response)?;
+                ids.push(self.special_ids.message_model as usize);
+            }
+            InklingContext::History { responses } => {
+                for response in responses {
+                    self.push_historical_response(&mut ids, response)?;
+                }
                 ids.push(self.special_ids.message_model as usize);
             }
             InklingContext::GenerationPrompt => {
@@ -1544,6 +1593,28 @@ pub trait Model: Send {
     /// sequence's position does not move. A model that cannot says so.
     fn evict(&mut self, from: usize, to: usize) -> Result<()> {
         anyhow::bail!("this model keeps no evictable context ({from}..{to})")
+    }
+
+    /// The absolute start position of every history part installed as cover
+    /// (an `Initialize` or `History` context), in order: where a refresh can
+    /// name its first changed recall. Empty for a model that keeps none.
+    fn installed_parts(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// The position just after the installed cover: where a refresh that
+    /// keeps every recall rewinds to. `None` for a model that keeps none.
+    fn cover_end(&self) -> Option<usize> {
+        None
+    }
+
+    /// Rewind, on every rank, to the nearest rewind point at or before
+    /// `position` inside the installed cover, and stage the unchanged ids from
+    /// that point up to `position` for the next pass, so that what follows
+    /// `position` can be re-installed with [`InklingContext::History`]. Returns
+    /// the position rewound to. A model that cannot says so.
+    fn rewind_before(&mut self, position: usize) -> Result<usize> {
+        anyhow::bail!("this model keeps no rewind points (asked for one before {position})")
     }
 
     fn kill(&mut self) -> Result<()>;

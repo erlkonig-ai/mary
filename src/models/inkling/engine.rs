@@ -149,6 +149,20 @@ pub struct Engine {
     /// 58k-position wake cost a fifth of the wake, and a learning run would
     /// have learned her own memories back every wake.
     delta_unscored: bool,
+    /// Rewind points inside her cover, by index, on every rank: one every
+    /// `INK_COVER_CHECKPOINT` tokens of an unscored delta (default 32768) and
+    /// one at its end. A refresh of the cover rewinds to the nearest point
+    /// before its first changed recall and re-extends from there, so what a
+    /// recompute costs is the cover from that point on, not the whole of it.
+    checkpoints: Vec<super::session::Checkpoint>,
+    /// The ids of the cover region at absolute positions from `cover_base`:
+    /// what a rewind replays, exactly, between the rewind point and the first
+    /// changed recall.
+    cover_ids: Vec<usize>,
+    cover_base: usize,
+    /// The absolute start position of every history part installed as cover
+    /// (`Initialize` or `History`), in order.
+    parts: Vec<usize>,
 }
 
 /// A rank-1 model: a `Session` and nothing else.
@@ -159,6 +173,8 @@ pub struct Follower {
     session: Session,
     digest: blake3::Hasher,
     ready: Ready,
+    /// This rank's rewind points, by the index rank 0 names them by.
+    checkpoints: Vec<super::session::Checkpoint>,
 }
 
 // ── loading ─────────────────────────────────────────────────────────────────
@@ -363,6 +379,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
             session,
             digest: blake3::Hasher::new(),
             ready,
+            checkpoints: Vec::new(),
         }));
     }
 
@@ -390,6 +407,10 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         terminated: false,
         score: std::env::var("INK_SCORE").map(|v| v != "0").unwrap_or(true),
         delta_unscored: false,
+        checkpoints: Vec::new(),
+        cover_ids: Vec::new(),
+        cover_base: 0,
+        parts: Vec::new(),
     }))
 }
 
@@ -488,6 +509,26 @@ impl Follower {
                     self.session
                         .evict(from, to)
                         .context("evict this rank's span")?;
+                }
+                Pass::Checkpoint { index } => {
+                    let cp = self
+                        .session
+                        .checkpoint()
+                        .context("take this rank's rewind point")?;
+                    self.checkpoints.truncate(index);
+                    self.checkpoints.push(cp);
+                }
+                Pass::Rewind { index } => {
+                    let cp = self.checkpoints.get(index).with_context(|| {
+                        format!(
+                            "rewind to point {index}, but this rank keeps {}",
+                            self.checkpoints.len()
+                        )
+                    })?;
+                    self.session
+                        .rewind(cp)
+                        .context("rewind this rank to the point")?;
+                    self.checkpoints.truncate(index + 1);
                 }
                 Pass::Step => {
                     let token = self.session.step().context("advance one token")?;
@@ -750,12 +791,14 @@ impl Engine {
         let carried = ids.len() - delta_ids.len();
 
         let started = std::time::Instant::now();
-        let pass = match self.carry.is_some() {
+        // A session that holds positions is extended, one that holds none is
+        // prefilled -- by position, not by carry: after a rewind into the
+        // cover there is no carry and the session is primed. Never empty on
+        // a primed session: the carry alone is a token, so a consult with no
+        // new context is still a one-row `extend` rather than a bare `step`.
+        let primed = self.session.position() > 0;
+        let pass = match primed {
             false => Pass::Prefill(ids),
-            // Never empty on a primed session: the carry alone is a token, so a
-            // consult with no new context is still a one-row `extend` rather
-            // than a bare `step`. Same pass, and it is the pass that closes the
-            // gap.
             true => Pass::Extend(ids),
         };
         // The delta is scored as it is attended to: every appended id after the
@@ -767,9 +810,28 @@ impl Engine {
         // makes a learning change measurable at all: `INK_SCORE=0` turns it
         // off for a run that wants the head's last row only.
         let unscored = std::mem::take(&mut self.delta_unscored);
-        let (first, scored) = match self.score && !unscored {
-            true => self.pass_scored(pass)?,
-            false => (self.pass(pass)?, super::session::ScoredNll::default()),
+        let (first, scored) = match (self.score && !unscored, unscored) {
+            (true, _) => self.pass_scored(pass)?,
+            // The cover goes in in pieces with a rewind point after each, and
+            // one at its end.
+            (false, true) => {
+                let ids = match pass {
+                    Pass::Prefill(ids) | Pass::Extend(ids) => ids,
+                    other => anyhow::bail!("{other:?} is not a pass that installs a cover"),
+                };
+                let spacing = Self::checkpoint_spacing();
+                let mut first = 0;
+                for piece in ids.chunks(spacing) {
+                    let pass = match self.session.position() > 0 {
+                        false => Pass::Prefill(piece.to_vec()),
+                        true => Pass::Extend(piece.to_vec()),
+                    };
+                    first = self.pass(pass)?;
+                    self.take_checkpoint()?;
+                }
+                (first, super::session::ScoredNll::default())
+            }
+            (false, false) => (self.pass(pass)?, super::session::ScoredNll::default()),
         };
         let super::session::ScoredNll {
             nll: delta_nll,
@@ -848,6 +910,36 @@ impl Engine {
             .evict(from, to)
             .context("evict the span from rank 0's caches")
     }
+
+    /// How far apart the rewind points inside her cover are, in tokens.
+    fn checkpoint_spacing() -> usize {
+        std::env::var("INK_COVER_CHECKPOINT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|n: &usize| *n > 0)
+            .unwrap_or(32_768)
+    }
+
+    /// Take a rewind point here, on every rank. A point closer than half the
+    /// spacing to the previous one replaces it, so refreshes that end where
+    /// the last one ended do not pile points up.
+    fn take_checkpoint(&mut self) -> Result<()> {
+        let pos = self.session.position();
+        let mut index = self.checkpoints.len();
+        if let Some(last) = self.checkpoints.last() {
+            if pos < last.position() + Self::checkpoint_spacing() / 2 {
+                index -= 1;
+            }
+        }
+        self.lead(&Pass::Checkpoint { index })?;
+        let cp = self
+            .session
+            .checkpoint()
+            .context("take a rewind point inside the cover")?;
+        self.checkpoints.truncate(index);
+        self.checkpoints.push(cp);
+        Ok(())
+    }
 }
 
 impl Model for Engine {
@@ -889,12 +981,35 @@ impl Model for Engine {
             self.carry = Some(*last);
             return Ok(());
         }
-        self.delta.extend(ids);
-        // The cover she wakes with is not her word or the world's: attended
-        // to, never scored.
-        if matches!(context, InklingContext::Initialize { .. }) {
+        // The cover she wakes with, and what a refresh re-installs, is not her
+        // word or the world's: attended to, never scored. Its parts' absolute
+        // positions and its ids are kept, so a later refresh can name the
+        // first changed recall and replay the unchanged tail exactly.
+        if matches!(
+            context,
+            InklingContext::Initialize { .. } | InklingContext::History { .. }
+        ) {
+            let (_, offsets) = self
+                .codec
+                .encode_with_parts(context)
+                .context("locate the cover's parts")?;
+            let base = self.session.position() + usize::from(self.carry.is_some()) + self.delta.len();
+            if matches!(context, InklingContext::Initialize { .. }) {
+                self.cover_base = base;
+                self.cover_ids.clear();
+                self.parts.clear();
+                self.checkpoints.clear();
+            }
+            anyhow::ensure!(
+                self.cover_base + self.cover_ids.len() == base,
+                "a cover part is installed at position {base}, but the cover kept ends at {}",
+                self.cover_base + self.cover_ids.len()
+            );
+            self.cover_ids.extend_from_slice(&ids);
+            self.parts.extend(offsets.iter().map(|o| base + o));
             self.delta_unscored = true;
         }
+        self.delta.extend(ids);
         // The payloads behind the slots just emitted, each medium to its own
         // queue, in the order the slots were emitted.
         for record in self.codec.sensed(context) {
@@ -1049,6 +1164,53 @@ impl Model for Engine {
 
     fn evict(&mut self, from: usize, to: usize) -> Result<()> {
         Engine::evict_span(self, from, to)
+    }
+
+    fn installed_parts(&self) -> Vec<usize> {
+        self.parts.clone()
+    }
+
+    fn cover_end(&self) -> Option<usize> {
+        Some(self.cover_base + self.cover_ids.len())
+    }
+
+    fn rewind_before(&mut self, position: usize) -> Result<usize> {
+        anyhow::ensure!(
+            self.delta.is_empty(),
+            "a rewind wants an empty pending delta, but {} id(s) are staged",
+            self.delta.len()
+        );
+        anyhow::ensure!(
+            position >= self.cover_base && position <= self.cover_base + self.cover_ids.len(),
+            "position {position} is outside the cover kept ({}..{})",
+            self.cover_base,
+            self.cover_base + self.cover_ids.len()
+        );
+        let index = self
+            .checkpoints
+            .iter()
+            .rposition(|cp| cp.position() <= position)
+            .with_context(|| format!("no rewind point at or before position {position}"))?;
+        self.lead(&Pass::Rewind { index })?;
+        let cp = &self.checkpoints[index];
+        let at = cp.position();
+        self.session
+            .rewind(cp)
+            .context("rewind rank 0 to the point")?;
+        self.checkpoints.truncate(index + 1);
+        // The unchanged tail between the point and the first changed recall
+        // goes back in first, exactly as it was, unscored.
+        let replay: Vec<usize> = self.cover_ids[at - self.cover_base..position - self.cover_base].to_vec();
+        self.cover_ids.truncate(position - self.cover_base);
+        self.parts.retain(|&p| p < position);
+        self.carry = None;
+        self.delta = replay;
+        self.delta_unscored = true;
+        eprintln!(
+            "inkling: rewound to position {at} for a cover refresh at {position}; {} unchanged id(s) replay first",
+            self.delta.len()
+        );
+        Ok(at)
     }
 
     fn persist_learned(
