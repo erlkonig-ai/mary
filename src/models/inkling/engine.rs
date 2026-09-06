@@ -155,6 +155,9 @@ pub struct Engine {
     /// before its first changed recall and re-extends from there, so what a
     /// recompute costs is the cover from that point on, not the whole of it.
     checkpoints: Vec<super::session::Checkpoint>,
+    /// Whether each rewind point is the end of an installed delta (true) or a
+    /// piece boundary inside one (false); only end points coalesce.
+    checkpoint_ends: Vec<bool>,
     /// The ids of the cover region at absolute positions from `cover_base`:
     /// what a rewind replays, exactly, between the rewind point and the first
     /// changed recall.
@@ -408,6 +411,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         score: std::env::var("INK_SCORE").map(|v| v != "0").unwrap_or(true),
         delta_unscored: false,
         checkpoints: Vec::new(),
+        checkpoint_ends: Vec::new(),
         cover_ids: Vec::new(),
         cover_base: 0,
         parts: Vec::new(),
@@ -821,13 +825,14 @@ impl Engine {
                 };
                 let spacing = Self::checkpoint_spacing();
                 let mut first = 0;
-                for piece in ids.chunks(spacing) {
+                let pieces = ids.len().div_ceil(spacing);
+                for (n, piece) in ids.chunks(spacing).enumerate() {
                     let pass = match self.session.position() > 0 {
                         false => Pass::Prefill(piece.to_vec()),
                         true => Pass::Extend(piece.to_vec()),
                     };
                     first = self.pass(pass)?;
-                    self.take_checkpoint()?;
+                    self.take_checkpoint(n + 1 == pieces)?;
                 }
                 (first, super::session::ScoredNll::default())
             }
@@ -920,13 +925,17 @@ impl Engine {
             .unwrap_or(32_768)
     }
 
-    /// Take a rewind point here, on every rank. A point closer than half the
-    /// spacing to the previous one replaces it, so refreshes that end where
-    /// the last one ended do not pile points up.
-    fn take_checkpoint(&mut self) -> Result<()> {
+    /// Take a rewind point here, on every rank. A point at a piece boundary
+    /// is always kept; the point at the END of an installed delta replaces
+    /// the previous one only when that was an end point too and closer than
+    /// half the spacing, so refreshes that end near where the last one ended
+    /// do not pile points up, while a boundary point is never lost to the
+    /// end point that follows it (gate g3, 2026-09-06: a cover of 608 tokens
+    /// kept only its end point and a refresh at 594 found nothing to rewind to).
+    fn take_checkpoint(&mut self, end: bool) -> Result<()> {
         let pos = self.session.position();
         let mut index = self.checkpoints.len();
-        if let Some(last) = self.checkpoints.last() {
+        if let (true, Some(last), Some(true)) = (end, self.checkpoints.last(), self.checkpoint_ends.last()) {
             if pos < last.position() + Self::checkpoint_spacing() / 2 {
                 index -= 1;
             }
@@ -937,7 +946,13 @@ impl Engine {
             .checkpoint()
             .context("take a rewind point inside the cover")?;
         self.checkpoints.truncate(index);
+        self.checkpoint_ends.truncate(index);
         self.checkpoints.push(cp);
+        self.checkpoint_ends.push(end);
+        eprintln!(
+            "inkling: rewind point {index} at position {pos}{}",
+            if end { " (end of the installed delta)" } else { "" }
+        );
         Ok(())
     }
 }
@@ -999,6 +1014,7 @@ impl Model for Engine {
                 self.cover_ids.clear();
                 self.parts.clear();
                 self.checkpoints.clear();
+                self.checkpoint_ends.clear();
             }
             anyhow::ensure!(
                 self.cover_base + self.cover_ids.len() == base,
@@ -1198,6 +1214,7 @@ impl Model for Engine {
             .rewind(cp)
             .context("rewind rank 0 to the point")?;
         self.checkpoints.truncate(index + 1);
+        self.checkpoint_ends.truncate(index + 1);
         // The unchanged tail between the point and the first changed recall
         // goes back in first, exactly as it was, unscored.
         let replay: Vec<usize> = self.cover_ids[at - self.cover_base..position - self.cover_base].to_vec();
