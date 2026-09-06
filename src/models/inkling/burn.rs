@@ -1062,6 +1062,23 @@ impl AttnCache<Bk> {
         let mut intervals = std::mem::take(&mut self.evicted);
         intervals.push((a, b));
         self.evicted = merge_intervals(intervals);
+        self.upload_gaps(dev);
+    }
+
+    /// [`AttnCache::rewind_to`] with the gap table rebuilt for whatever
+    /// evictions the point keeps before it.
+    pub fn rewind_to_on(&mut self, r: &AttnRewind<Bk>, dev: &burn::backend::cuda::CudaDevice) {
+        self.rewind_to(r);
+        self.upload_gaps(dev);
+    }
+
+    /// The gap table the kernel reads, rebuilt from `evicted`: none when
+    /// nothing is evicted, so the kernel takes the branch-free path.
+    fn upload_gaps(&mut self, dev: &burn::backend::cuda::CudaDevice) {
+        if self.evicted.is_empty() {
+            self.gap_dev = None;
+            return;
+        }
         let (rows, cums) = gap_table(self.base, &self.evicted);
         // Uploaded as `i32` tensors and held by their handles: the kernel reads
         // them as `u32`, the bits are the same, and a handle keeps its buffer
@@ -1284,20 +1301,30 @@ impl<B: Backend> AttnCache<B> {
     ///   since moved, which is a point that cannot restore what was dropped;
     /// * a speculative batch outstanding on either side.
     pub fn rewind_to(&mut self, r: &AttnRewind<B>) {
-        assert_eq!(
-            r.evictions,
-            self.evicted.len(),
-            "a rewind across an eviction: the point was taken with {} eviction(s) and the cache has \
-             made {} -- the rows between are gone",
-            r.evictions,
-            self.evicted.len()
-        );
         assert!(
             self.pending.is_none(),
             "rewinding a cache with an uncommitted speculative batch: commit it first"
         );
         let here = self.base + self.k.len();
         let there = r.position();
+        // Evictions made at or after the point leave with the rows they were
+        // made in; only an eviction that reaches back before the point is a
+        // rewind across one (refresh gate g5, 2026-09-06: a fold after the
+        // cover, then a rewind into the cover, is the ordinary case).
+        let before = self.evicted.iter().filter(|&&(from, _)| from < there).count();
+        assert_eq!(
+            r.evictions, before,
+            "a rewind across an eviction: the point was taken with {} eviction(s) before it and \
+             the cache has made {} -- the rows between are gone",
+            r.evictions, before
+        );
+        self.evicted.truncate(before);
+        // With no eviction left the kernel takes the branch-free path; with
+        // some left the gap table is stale until `rewind_to_on` rebuilds it,
+        // which is what a caller holding the device uses.
+        if self.evicted.is_empty() {
+            self.gap_dev = None;
+        }
         assert!(
             there <= here,
             "a rewind point at position {there} against a cache that only reaches {here} -- a \

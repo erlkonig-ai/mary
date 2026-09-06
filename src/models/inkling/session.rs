@@ -1660,7 +1660,7 @@ impl Session {
         );
         for (slot, l) in cp.layers.iter().enumerate() {
             let c = &mut self.caches[slot];
-            c.attn.rewind_to(&l.attn);
+            c.attn.rewind_to_on(&l.attn, &self.dev);
             c.attn_sconv = l.attn_sconv.clone();
             c.mlp_sconv = l.mlp_sconv.clone();
             c.attn_sconv_pending = None;
