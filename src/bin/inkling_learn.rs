@@ -26,7 +26,7 @@
 //! ```
 use anyhow::{Context, Result};
 use mary::models::inkling::engine::{self, EngineConfig, Loaded, TensorParallel};
-use mary::models::inkling::resident::{Consult, ExecResultContext, InklingContext, Model};
+use mary::models::inkling::resident::{Consult, ExecResultContext, InklingContext, InklingInput, Model};
 use mary::models::inkling::tpcomm::elect_rank;
 
 fn main() -> Result<()> {
@@ -172,12 +172,11 @@ fn main() -> Result<()> {
     for (k, line) in lines.iter().enumerate() {
         // His words, the way the resident meets them: as what the message
         // faculty printed.
-        engine.context(&InklingContext::ToolResult {
-            result: ExecResultContext {
+        engine.context(&InklingContext::Observation {
+            inputs: vec![InklingInput::text_result(ExecResultContext {
                 command: "message poll".to_string(),
                 content: line.clone(),
-            },
-            sensed: Vec::new(),
+            })],
         })?;
         let mut said = String::new();
         let end = engine.consult(&Consult::new(want), &mut |text| {

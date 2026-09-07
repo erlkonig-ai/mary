@@ -1229,8 +1229,8 @@ impl Model for Engine {
         self.delta.extend(ids);
         // The payloads behind the slots just emitted, each medium to its own
         // queue, in the order the slots were emitted.
-        for record in self.codec.sensed(context) {
-            match &record.media {
+        for media in self.codec.media(context) {
+            match media {
                 SenseMedia::Dmel { levels } => self.delta_audio.extend_from_slice(levels),
                 SenseMedia::Text { .. } => {}
                 SenseMedia::Patches { patches } => self.delta_vision.extend_from_slice(patches),
@@ -1301,12 +1301,15 @@ impl Model for Engine {
         // leaked and `'static`, so a fresh stream costs nothing but its own
         // state.
         self.decode = detokenizer(self.tokenizer);
-        self.delta = replacement;
+        self.delta.clear();
         self.delta_unscored = true;
         self.delta_audio.clear();
         self.delta_vision.clear();
         self.carry = None;
         self.turn = 0;
+        // History can contain media as well as text. Use the ordinary typed
+        // installation path to rebuild payload queues and cover boundaries.
+        self.context(initialization)?;
 
         eprintln!(
             "inkling: reinitialized after {} turn(s) at position {}; {} replacement token(s) staged",

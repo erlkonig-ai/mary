@@ -256,9 +256,8 @@ impl InklingSpecialIds {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ExecResultContext {
-    /// The exact command this answers: what she said, trimmed. It binds a
-    /// live result to the outstanding command in `InklingMind` and is the
-    /// text of a reconstructed historical model turn.
+    /// The exact command this answers: what she said, trimmed. Real live
+    /// completion identity is supplied independently by Drive's action ID.
     pub command: String,
     /// Drive's deliberate text projection of its typed result, including any
     /// structural status annotation that adds information.
@@ -270,8 +269,7 @@ pub struct ExecResultContext {
 /// Adjacent parts of the same kind are fragments of one model block. The
 /// codec concatenates them *before* content tokenization, preserving exact
 /// tokens regardless of archival fragment boundaries. There is no part for a
-/// call: what she said IS what ran, so a response that has a `tool_result`
-/// had its text run as the command.
+/// call: what she said IS what ran. A later result is an independent input.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum InklingHistoryPart {
@@ -279,8 +277,8 @@ pub enum InklingHistoryPart {
     Text { content: String },
 }
 
-/// One completed historical model response and, when her words ran, what
-/// her shell answered.
+/// One completed historical model response. Shell results and senses are
+/// independent history items, not fields attached to earlier responses.
 ///
 /// The parts retain model-channel order. This representation can retain
 /// arbitrary thinking/text alternation. Drive's current `Turn` cannot yet
@@ -291,32 +289,57 @@ pub enum InklingHistoryPart {
 #[serde(deny_unknown_fields)]
 pub struct InklingHistoryResponse {
     pub parts: Vec<InklingHistoryPart>,
-    pub tool_result: Option<String>,
 }
 
-impl InklingHistoryResponse {
-    /// One command/result pair as a historical turn: the command is the model
-    /// text, the result is the shell's answer. This is the shape of every
-    /// memory-cover pair and of every archived turn of hers.
-    pub fn exec(result: ExecResultContext) -> Self {
-        Self {
-            parts: vec![InklingHistoryPart::Text {
-                content: result.command,
+/// An independent input between complete model messages. Command results
+/// keep their ordered media in the user voice; senses retain their source.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum InklingInput {
+    CommandResult {
+        command: String,
+        parts: Vec<SenseMedia>,
+    },
+    Sensed {
+        record: SenseRecord,
+    },
+}
+
+impl InklingInput {
+    pub fn text_result(result: ExecResultContext) -> Self {
+        Self::CommandResult {
+            command: result.command,
+            parts: vec![SenseMedia::Text {
+                text: result.content,
             }],
-            tool_result: Some(result.content),
         }
     }
+}
 
-    pub fn validate(&self) -> Result<()> {
-        if self.tool_result.is_some() {
-            anyhow::ensure!(
-                self.parts
-                    .iter()
-                    .any(|part| matches!(part, InklingHistoryPart::Text { .. })),
-                "a historical result answers words, and this response has no text part"
-            );
-        }
-        Ok(())
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "value",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum InklingHistoryItem {
+    Response(InklingHistoryResponse),
+    Input(InklingInput),
+}
+
+impl InklingHistoryItem {
+    /// Synthetic cover pair only: a delayed live result must not replay the
+    /// original command as a new response.
+    pub fn command_pair(result: ExecResultContext) -> [Self; 2] {
+        [
+            Self::Response(InklingHistoryResponse {
+                parts: vec![InklingHistoryPart::Text {
+                    content: result.command.clone(),
+                }],
+            }),
+            Self::Input(InklingInput::text_result(result)),
+        ]
     }
 }
 
@@ -330,44 +353,24 @@ impl InklingHistoryResponse {
 pub enum InklingContext {
     Initialize {
         system: String,
-        history: Vec<InklingHistoryResponse>,
+        history: Vec<InklingHistoryItem>,
     },
-    /// Result of the native call already present in the retained KV sequence,
-    /// and whatever was sensed while it ran: the result's tool message, then
-    /// one tool message per sense record (the order the world released
-    /// them), then the generation prompt. Sensing rides with a result rather
-    /// than waiting behind it, because a mind that acts every turn would
-    /// otherwise never hear or see at all.
-    ToolResult {
-        result: ExecResultContext,
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        sensed: Vec<SenseRecord>,
-    },
-    /// A complete response which predates this live `InklingMind` (for example
-    /// a Drive memory-cover response). Its model parts and optional result are
-    /// inserted together.
-    HistoricalResponse { response: InklingHistoryResponse },
+    /// Inputs in arrival order followed by exactly one generation prompt.
+    /// The adapter inserts this only at a closed-message boundary.
+    Observation { inputs: Vec<InklingInput> },
     /// Several completed responses in a row, as a refresh re-installs the
     /// part of her cover that changed and the live turns after it: encoded
     /// like the history of an `Initialize`, without its system messages, and
     /// attended to, never scored.
-    History { responses: Vec<InklingHistoryResponse> },
-    /// Start another autonomous assistant response after a completed text-only
-    /// response. A tool result already carries this prompt itself.
+    History { items: Vec<InklingHistoryItem> },
+    /// Start another response after any completed response when no inputs
+    /// arrived. An observation batch already carries this prompt itself.
     GenerationPrompt,
     /// Close a response her shell cut: the room above her memories ran out
     /// under her thought. The block she was in, if any, is ended and the
     /// message ended, so the context stays grammatical and the next prompt
     /// is hers again. Nothing here is hers or the world's; it is never scored.
     CloseResponse { open_block: bool },
-    /// Something was sensed and nothing else happened: one tool message per
-    /// record, each named for the faculty that sensed it and holding the
-    /// template's own part for its medium (the audio part for dMel levels,
-    /// the image part for patches). The payloads are numbers inside typed
-    /// records and never text, so free text cannot smuggle the structural
-    /// markers in. Ends with the generation prompt, like a tool result: the
-    /// world spoke or moved, now she thinks.
-    Sensed { records: Vec<SenseRecord> },
 }
 
 /// What a sense delivered: one record from the faculty named `source`, in
@@ -732,14 +735,14 @@ impl InklingContextCodec {
     /// positions, to know where a later refresh's first changed recall is.
     pub fn encode_with_parts(&self, context: &InklingContext) -> Result<(Vec<usize>, Vec<usize>)> {
         let ids = self.encode(context)?;
-        let responses: &[InklingHistoryResponse] = match context {
+        let items: &[InklingHistoryItem] = match context {
             InklingContext::Initialize { history, .. } => history,
-            InklingContext::History { responses } => responses,
+            InklingContext::History { items } => items,
             _ => return Ok((ids, Vec::new())),
         };
         // Re-walk the same encoding, counting: the parts are pushed by the
         // same function in the same order, so the prefix lengths are exact.
-        let mut parts = Vec::with_capacity(responses.len());
+        let mut parts = Vec::with_capacity(items.len());
         let mut probe = Vec::new();
         if let InklingContext::Initialize { system, .. } = context {
             probe.push(self.special_ids.message_system as usize);
@@ -751,9 +754,9 @@ impl InklingContextCodec {
             self.push_content(&mut probe, DEFAULT_THINKING_EFFORT)?;
             probe.push(self.special_ids.end_message as usize);
         }
-        for response in responses {
+        for item in items {
             parts.push(probe.len());
-            self.push_historical_response(&mut probe, response)?;
+            self.push_history_item(&mut probe, item)?;
         }
         anyhow::ensure!(
             probe.len() + 1 == ids.len(),
@@ -783,25 +786,20 @@ impl InklingContextCodec {
                 self.push_content(&mut ids, DEFAULT_THINKING_EFFORT)?;
                 ids.push(self.special_ids.end_message as usize);
 
-                for response in history {
-                    self.push_historical_response(&mut ids, response)?;
+                for item in history {
+                    self.push_history_item(&mut ids, item)?;
                 }
                 ids.push(self.special_ids.message_model as usize);
             }
-            InklingContext::ToolResult { result, sensed } => {
-                self.push_result(&mut ids, &result.content)?;
-                for record in sensed {
-                    self.push_sense_part(&mut ids, record)?;
+            InklingContext::Observation { inputs } => {
+                for input in inputs {
+                    self.push_input(&mut ids, input)?;
                 }
                 ids.push(self.special_ids.message_model as usize);
             }
-            InklingContext::HistoricalResponse { response } => {
-                self.push_historical_response(&mut ids, response)?;
-                ids.push(self.special_ids.message_model as usize);
-            }
-            InklingContext::History { responses } => {
-                for response in responses {
-                    self.push_historical_response(&mut ids, response)?;
+            InklingContext::History { items } => {
+                for item in items {
+                    self.push_history_item(&mut ids, item)?;
                 }
                 ids.push(self.special_ids.message_model as usize);
             }
@@ -814,26 +812,35 @@ impl InklingContextCodec {
                 }
                 ids.push(self.special_ids.content_model_end_sampling as usize);
             }
-            InklingContext::Sensed { records } => {
-                anyhow::ensure!(!records.is_empty(), "a Sensed context with no records");
-                for record in records {
-                    self.push_sense_part(&mut ids, record)?;
-                }
-                ids.push(self.special_ids.message_model as usize);
-            }
         }
         Ok(ids)
     }
 
-    /// The sense records a context carries, in the order [`Self::encode`]
-    /// emitted their slots: what the Session stages behind those slots.
-    /// Empty for everything but `Sensed` and a `ToolResult` with senses.
-    pub fn sensed<'a>(&self, context: &'a InklingContext) -> &'a [SenseRecord] {
+    /// Media in encoding order, including historical inputs. Replacement must
+    /// stage exactly the same payloads as a live observation.
+    pub fn media<'a>(&self, context: &'a InklingContext) -> Vec<&'a SenseMedia> {
+        let mut media = Vec::new();
+        let mut append = |input: &'a InklingInput| match input {
+            InklingInput::CommandResult { parts, .. } => media.extend(parts),
+            InklingInput::Sensed { record } => media.push(&record.media),
+        };
         match context {
-            InklingContext::Sensed { records } => records,
-            InklingContext::ToolResult { sensed, .. } => sensed,
-            _ => &[],
+            InklingContext::Observation { inputs } => {
+                for input in inputs {
+                    append(input);
+                }
+            }
+            InklingContext::Initialize { history: items, .. }
+            | InklingContext::History { items } => {
+                for item in items {
+                    if let InklingHistoryItem::Input(input) = item {
+                        append(input);
+                    }
+                }
+            }
+            _ => {}
         }
+        media
     }
 
     /// The placeholder id a medium stands behind.
@@ -850,26 +857,59 @@ impl InklingContextCodec {
     /// (`content_audio_input`, one slot per frame, `audio_end`) or the image
     /// part (`content_image`, one slot per patch, no end token).
     fn push_sense_part(&self, ids: &mut Vec<usize>, record: &SenseRecord) -> Result<()> {
-        let slots = record.slots()?;
         ids.push(self.special_ids.message_tool as usize);
         self.push_content(ids, &record.source)?;
-        match &record.media {
-            SenseMedia::Dmel { .. } => {
+        self.push_media_part(ids, &record.media)?;
+        ids.push(self.special_ids.end_message as usize);
+        Ok(())
+    }
+
+    fn push_media_part(&self, ids: &mut Vec<usize>, media: &SenseMedia) -> Result<()> {
+        match media {
+            SenseMedia::Dmel { levels } => {
+                let slots = heard_frames(levels)?;
                 ids.push(self.special_ids.content_audio_input as usize);
-                ids.extend(std::iter::repeat_n(self.special_ids.audio_slot as usize, slots));
+                ids.extend(std::iter::repeat_n(
+                    self.special_ids.audio_slot as usize,
+                    slots,
+                ));
                 ids.push(self.special_ids.audio_end as usize);
             }
-            SenseMedia::Patches { .. } => {
+            SenseMedia::Patches { patches } => {
+                let slots = super::patches::count(patches)?;
                 ids.push(self.special_ids.content_image as usize);
-                ids.extend(std::iter::repeat_n(self.special_ids.image_slot as usize, slots));
+                ids.extend(std::iter::repeat_n(
+                    self.special_ids.image_slot as usize,
+                    slots,
+                ));
             }
             SenseMedia::Text { text } => {
                 ids.push(self.special_ids.content_text as usize);
                 self.push_content(ids, text)?;
             }
         }
-        ids.push(self.special_ids.end_message as usize);
         Ok(())
+    }
+
+    fn push_input(&self, ids: &mut Vec<usize>, input: &InklingInput) -> Result<()> {
+        match input {
+            InklingInput::CommandResult { parts, .. } => {
+                ids.push(self.special_ids.message_user as usize);
+                for part in parts {
+                    self.push_media_part(ids, part)?;
+                }
+                ids.push(self.special_ids.end_message as usize);
+                Ok(())
+            }
+            InklingInput::Sensed { record } => self.push_sense_part(ids, record),
+        }
+    }
+
+    fn push_history_item(&self, ids: &mut Vec<usize>, item: &InklingHistoryItem) -> Result<()> {
+        match item {
+            InklingHistoryItem::Response(response) => self.push_historical_response(ids, response),
+            InklingHistoryItem::Input(input) => self.push_input(ids, input),
+        }
     }
 
     fn push_historical_response(
@@ -877,7 +917,6 @@ impl InklingContextCodec {
         ids: &mut Vec<usize>,
         response: &InklingHistoryResponse,
     ) -> Result<()> {
-        response.validate()?;
         let mut parts = response.parts.iter().peekable();
         while let Some(part) = parts.next() {
             match part {
@@ -904,9 +943,6 @@ impl InklingContextCodec {
             }
         }
         ids.push(self.special_ids.content_model_end_sampling as usize);
-        if let Some(content) = &response.tool_result {
-            self.push_result(ids, content)?;
-        }
         Ok(())
     }
 
@@ -1243,7 +1279,10 @@ impl TurnEnd {
     /// One line for a report, carrying its own framing rule.
     pub fn summary(&self) -> String {
         let score = match self.delta_mean_nll() {
-            Some(mean) => format!(", delta nll {mean:.3} nats/token over {}", self.delta_nll.len()),
+            Some(mean) => format!(
+                ", delta nll {mean:.3} nats/token over {}",
+                self.delta_nll.len()
+            ),
             None => String::new(),
         };
         format!(
@@ -1586,10 +1625,7 @@ pub trait Model: Send {
     /// Called before a context is replaced and before shutdown. `Ok(None)`
     /// when this model does not learn, has no key to sign with, or nothing
     /// moved. A collective on a tensor-parallel pair.
-    fn persist_learned(
-        &mut self,
-        recipe: &VersionRecipe,
-    ) -> Result<Option<Persisted>> {
+    fn persist_learned(&mut self, recipe: &VersionRecipe) -> Result<Option<Persisted>> {
         let _ = recipe;
         Ok(None)
     }
@@ -1861,12 +1897,11 @@ mod tests {
         // The engine forbids this token at the head, so the parser never sees
         // it; if it ever did, that is a model fault, not a message.
         let ids = ids();
-        let error = read(
-            &ids,
-            &[(100, "memory".to_string()), (7, at(&ids, 7, ""))],
-        )
-        .unwrap_err();
-        assert!(format!("{error:#}").contains("unsupported generated"), "{error:#}");
+        let error = read(&ids, &[(100, "memory".to_string()), (7, at(&ids, 7, ""))]).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("unsupported generated"),
+            "{error:#}"
+        );
 
         // A block name before text stays hers.
         let script = [
@@ -1886,35 +1921,53 @@ mod tests {
         let ids = ids();
         let error = read(
             &ids,
-            &[(4, at(&ids, 4, "")), (100, "ls".to_string()), (8, at(&ids, 8, ""))],
+            &[
+                (4, at(&ids, 4, "")),
+                (100, "ls".to_string()),
+                (8, at(&ids, 8, "")),
+            ],
         )
         .unwrap_err();
-        assert!(format!("{error:#}").contains("truncated a text block"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("truncated a text block"),
+            "{error:#}"
+        );
         let error = read(&ids, &[(100, "memory".to_string()), (8, at(&ids, 8, ""))]).unwrap_err();
-        assert!(format!("{error:#}").contains("unclassified message header"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("unclassified message header"),
+            "{error:#}"
+        );
     }
 
     #[test]
-    fn a_historical_result_answers_words() {
+    fn a_historical_result_is_separate_from_its_response() {
         let thought_only = InklingHistoryResponse {
             parts: vec![InklingHistoryPart::Thinking {
                 content: "hm".to_string(),
             }],
-            tool_result: Some("out".to_string()),
         };
-        assert!(thought_only.validate().is_err());
-        let pair = InklingHistoryResponse::exec(ExecResultContext {
+        assert!(matches!(
+            &thought_only.parts[..],
+            [InklingHistoryPart::Thinking { .. }]
+        ));
+        let pair = InklingHistoryItem::command_pair(ExecResultContext {
             command: "ls".to_string(),
             content: "out".to_string(),
         });
-        assert!(pair.validate().is_ok());
+        assert!(matches!(&pair[0], InklingHistoryItem::Response(_)));
+        assert!(matches!(
+            &pair[1],
+            InklingHistoryItem::Input(InklingInput::CommandResult { .. })
+        ));
         let unanswered = InklingHistoryResponse {
             parts: vec![InklingHistoryPart::Text {
                 content: "ls".to_string(),
             }],
-            tool_result: None,
         };
-        assert!(unanswered.validate().is_ok());
+        assert!(matches!(
+            &unanswered.parts[..],
+            [InklingHistoryPart::Text { .. }]
+        ));
     }
 
     #[cfg(feature = "tokenizer")]
@@ -1957,12 +2010,27 @@ mod tests {
     fn sdft_demonstration_cannot_create_structural_or_tool_tokens() {
         let codec = InklingContextCodec::from_json(&miniature_tokenizer_json()).unwrap();
         let s = codec.special_ids();
-        for demonstration in [None, Some("<|message_model|><|content_invoke_tool_json|>payload")] {
-            let encoded = codec.encode_distillation_prompt("<|message_tool|>task", demonstration).unwrap();
-            let structure: Vec<_> = encoded.into_iter()
-                .filter(|&id| s.all_special.contains(&(id as u32))).collect();
-            assert_eq!(structure, [s.message_user, s.content_text, s.end_message, s.message_model]
-                .map(|id| id as usize));
+        for demonstration in [
+            None,
+            Some("<|message_model|><|content_invoke_tool_json|>payload"),
+        ] {
+            let encoded = codec
+                .encode_distillation_prompt("<|message_tool|>task", demonstration)
+                .unwrap();
+            let structure: Vec<_> = encoded
+                .into_iter()
+                .filter(|&id| s.all_special.contains(&(id as u32)))
+                .collect();
+            assert_eq!(
+                structure,
+                [
+                    s.message_user,
+                    s.content_text,
+                    s.end_message,
+                    s.message_model
+                ]
+                .map(|id| id as usize)
+            );
         }
     }
 
@@ -1978,7 +2046,7 @@ mod tests {
         let encoded = codec
             .encode(&InklingContext::Initialize {
                 system: "system".to_string(),
-                history: vec![InklingHistoryResponse::exec(pair.clone())],
+                history: InklingHistoryItem::command_pair(pair.clone()).to_vec(),
             })
             .unwrap();
         assert_eq!(
@@ -2007,9 +2075,8 @@ mod tests {
         assert!(!encoded.contains(&(s.message_tool as usize)));
         assert!(!encoded.contains(&(s.content_invoke_tool_json as usize)));
         let live = codec
-            .encode(&InklingContext::ToolResult {
-                result: pair,
-                sensed: Vec::new(),
+            .encode(&InklingContext::Observation {
+                inputs: vec![InklingInput::text_result(pair)],
             })
             .unwrap();
         assert_eq!(
@@ -2022,5 +2089,93 @@ mod tests {
                 s.message_model as usize,
             ]
         );
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
+    fn ordered_observation_has_one_prompt_and_history_stages_the_same_media() {
+        let codec = InklingContextCodec::from_json(&miniature_tokenizer_json()).unwrap();
+        let s = codec.special_ids();
+        let image = SenseMedia::Patches {
+            patches: vec![0; super::super::patches::PATCH_BYTES],
+        };
+        let inputs = vec![
+            InklingInput::CommandResult {
+                command: "read image".to_string(),
+                parts: vec![
+                    SenseMedia::Text {
+                        text: "before".to_string(),
+                    },
+                    image.clone(),
+                    SenseMedia::Text {
+                        text: "after".to_string(),
+                    },
+                ],
+            },
+            InklingInput::Sensed {
+                record: SenseRecord {
+                    source: "orient".to_string(),
+                    media: SenseMedia::Text {
+                        text: "news".to_string(),
+                    },
+                },
+            },
+            InklingInput::text_result(ExecResultContext {
+                command: "old command".to_string(),
+                content: "late".to_string(),
+            }),
+        ];
+        let observation = InklingContext::Observation {
+            inputs: inputs.clone(),
+        };
+        let encoded = codec.encode(&observation).unwrap();
+        assert_eq!(
+            encoded
+                .iter()
+                .filter(|&&id| id == s.message_model as usize)
+                .count(),
+            1
+        );
+        let structure: Vec<_> = encoded
+            .iter()
+            .copied()
+            .filter(|id| s.all_special.contains(&(*id as u32)))
+            .collect();
+        assert_eq!(
+            structure,
+            [
+                s.message_user,
+                s.content_text,
+                s.content_image,
+                s.image_slot,
+                s.content_text,
+                s.end_message,
+                s.message_tool,
+                s.content_text,
+                s.end_message,
+                s.message_user,
+                s.content_text,
+                s.end_message,
+                s.message_model
+            ]
+            .map(|id| id as usize)
+        );
+        let history = InklingContext::History {
+            items: inputs.into_iter().map(InklingHistoryItem::Input).collect(),
+        };
+        let (replayed, offsets) = codec.encode_with_parts(&history).unwrap();
+        assert_eq!(encoded, replayed);
+        assert_eq!(codec.media(&observation), codec.media(&history));
+        assert_eq!(offsets.len(), 3);
+        assert_eq!(offsets[0], 0);
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+        let initialize = InklingContext::Initialize {
+            system: "system".to_string(),
+            history: match history {
+                InklingContext::History { items } => items,
+                _ => unreachable!(),
+            },
+        };
+        assert_eq!(codec.media(&initialize), codec.media(&observation));
     }
 }
