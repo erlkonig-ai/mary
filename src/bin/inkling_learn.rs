@@ -21,7 +21,7 @@
 //! `INK_LEARN_RN=1` is the nearest-rounding control.
 //!
 //! ```text
-//! INK_LEARN_LR=1.0 inkling_learn <pile> <tokenizer.json> <turns.txt> \
+//! INK_LEARN_LR=1.0 inkling_learn <pile> <turns.txt> \
 //!     [--from LINE] [--turns N] [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b]
 //! ```
 use anyhow::{Context, Result};
@@ -32,12 +32,12 @@ use mary::models::inkling::tpcomm::elect_rank;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     anyhow::ensure!(
-        args.len() >= 4,
-        "usage: inkling_learn <pile> <tokenizer.json> <turns.txt> [--from LINE] [--turns N] \
+        args.len() >= 3,
+        "usage: inkling_learn <pile> <turns.txt> [--from LINE] [--turns N] \
          [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--export] \
          [--save | --save-commit --signing-key <path>]"
     );
-    let (pile, tokenizer, corpus) = (&args[1], &args[2], &args[3]);
+    let (pile, corpus) = (&args[1], &args[2]);
     let mut from = 100usize;
     let mut turns = 8usize;
     let mut want = 1usize;
@@ -47,7 +47,7 @@ fn main() -> Result<()> {
     let mut save = Save::No;
     let mut signing_key: Option<String> = None;
     let mut explain: Option<String> = None;
-    let mut i = 4;
+    let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
             // After the last turn, pull every learned expert out of both
@@ -138,8 +138,8 @@ fn main() -> Result<()> {
 
     let t0 = std::time::Instant::now();
     let loaded = engine::load(EngineConfig {
+        distillation: None,
         pile: pile.into(),
-        tokenizer: tokenizer.into(),
         layers,
         prefill_budget: None,
         // The engine's default is the million-position window the resident is

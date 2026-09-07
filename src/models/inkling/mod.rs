@@ -151,6 +151,10 @@ pub mod learned;
 #[cfg(feature = "inkling-cuda")]
 pub mod train_online;
 pub mod session;
+pub mod sdft;
+pub mod sdft_admission;
+pub mod sdft_runtime;
+pub mod sdft_schedule;
 
 // …and the MIND that a held model becomes. `resident` is the vocabulary of an
 // Inkling turn plus the `drive::mind::Mind` that produces one: typed context,
