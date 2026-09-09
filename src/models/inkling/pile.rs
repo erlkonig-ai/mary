@@ -264,11 +264,30 @@ fn mem_total_bytes() -> Result<u64> {
     Ok(host.min(cgroup))
 }
 
+/// Whether one indexed dense leaf belongs in the startup arena.
+///
+/// Explicit globals are caller-required and take precedence over both the
+/// layer range and the drafting flag. Otherwise MTP leaves are optional even
+/// when their layer numbers overlap the main model's range.
+fn dense_in_startup_share(
+    name: &str,
+    layer: Option<i64>,
+    layers: &std::ops::Range<usize>,
+    required_global: bool,
+    drafts: bool,
+) -> bool {
+    required_global
+        || ((drafts || !name.starts_with("model.mtp."))
+            && layer
+                .map(|l| layers.contains(&(l as usize)))
+                .unwrap_or(false))
+}
+
 /// What ONE dense leaf costs the DEVICE POOL, on top of its place in the arena.
 ///
 /// # The term that was missing
 ///
-/// The startup copy writes every weight this node owns into one anonymous
+/// The startup copy writes this run's selected weights into one anonymous
 /// arena, and `total` in [`PileSource::copy_share`] is that arena. Admission
 /// charged it once and stopped there, which was right only while every weight
 /// the GPU read was ALIASED out of it. Two things break that.
@@ -332,10 +351,10 @@ fn mem_total_bytes() -> Result<u64> {
 /// function does not know about shows up as a named discrepancy in the log
 /// rather than as an OOM kill six weeks on.
 ///
-/// The MTP heads live in the same layer range as the LLM's and are copied into
-/// the arena whether or not they are used, but they are only BOUND when
-/// drafting is on -- so they are charged on `policy.drafts` and not on the
-/// range.
+/// The MTP heads live in the same layer range as the LLM's, but startup copies
+/// them only when drafting is on or they are explicit required globals. They
+/// are only BOUND when drafting is on, so this second residency is charged on
+/// `policy.drafts` and not on the range or explicit arena inclusion.
 fn device_weight_bytes(name: &str, leaf: &Leaf, policy: super::budget::AdmissionPolicy) -> u64 {
     use super::budget::DenseWeights;
 
@@ -1678,6 +1697,12 @@ impl PileSource {
     /// anonymous pages have no backing store the kernel can silently re-read
     /// them from, so they cannot be reclaimed while this process owns them.
     ///
+    /// Dense leaves follow the layer range, except `model.mtp.*` leaves are
+    /// omitted when `policy.drafts` is false. Every `global_dense` name is an
+    /// explicit requirement and is copied regardless of range or drafting;
+    /// a missing required global is an error. Unselected leaves retain their
+    /// original file-backed views instead of occupying this arena.
+    ///
     /// # One pass, not two, and why that is a memory question
     ///
     /// This used to be a sequential `fetch+verify` loop that read and BLAKE3'd
@@ -1885,10 +1910,13 @@ impl PileSource {
             .dense
             .iter()
             .filter(|(name, leaf)| {
-                leaf.layer
-                    .map(|l| layers.contains(&(l as usize)))
-                    .unwrap_or(false)
-                    || globals.contains(name.as_str())
+                dense_in_startup_share(
+                    name,
+                    leaf.layer,
+                    &layers,
+                    globals.contains(name.as_str()),
+                    policy.drafts,
+                )
             })
             .map(|(name, _)| name.clone())
             .collect();
@@ -2392,7 +2420,8 @@ impl PileSource {
         println!("{}", mem_line("after fetch+verify+copy"));
 
         // `Bytes` owns the allocator's Vec; `View` proves and retains the new
-        // anonymous backing before subviews replace every mmap-backed payload.
+        // anonymous backing before subviews replace the selected mmap-backed
+        // payloads.
         let bytes = anybytes::Bytes::from_source(arena);
         let view: anybytes::View<[u8]> = bytes
             .clone()
@@ -2479,6 +2508,66 @@ mod tests {
     use crate::models::inkling::pool::AllocatorConfig;
     use triblespace::core::blob::encodings::tensor::TensorView;
 
+    #[test]
+    fn startup_dense_selection_preserves_non_mtp_layer_and_global_rules() {
+        let layers = 2..4;
+        let cases = [
+            ("model.llm.layers.2.attn_norm.weight", Some(2), false, true),
+            ("model.llm.layers.3.attn_norm.weight", Some(3), false, true),
+            ("model.llm.layers.1.attn_norm.weight", Some(1), false, false),
+            ("model.llm.layers.4.attn_norm.weight", Some(4), false, false),
+            // Selection uses the indexed layer, not a second parse of the name.
+            ("model.llm.layers.2.attn_norm.weight", None, false, false),
+            ("model.llm.embed.weight", None, false, false),
+            ("model.llm.embed.weight", None, true, true),
+            ("model.llm.layers.12.attn_norm.weight", Some(12), true, true),
+            // Only the exact MTP namespace is optional.
+            ("model.mtp_extra.layers.2.weight", Some(2), false, true),
+        ];
+        for drafts in [false, true] {
+            for (name, layer, required_global, expected) in cases {
+                assert_eq!(
+                    dense_in_startup_share(name, layer, &layers, required_global, drafts),
+                    expected,
+                    "{name}, layer={layer:?}, global={required_global}, drafts={drafts}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn startup_dense_selection_gates_mtp_but_honors_explicit_globals() {
+        let layers = 2..4;
+        let cases = [
+            ("model.mtp.layers.2.input_proj.weight", Some(2), true),
+            (
+                "model.mtp.layers.3.transformer_block.attn.wq_du.weight",
+                Some(3),
+                true,
+            ),
+            ("model.mtp.layers.1.input_proj.weight", Some(1), false),
+            ("model.mtp.layers.4.input_proj.weight", Some(4), false),
+            ("model.mtp.output.weight", None, false),
+        ];
+        for (name, layer, in_range) in cases {
+            for drafts in [false, true] {
+                assert_eq!(
+                    dense_in_startup_share(name, layer, &layers, false, drafts),
+                    drafts && in_range,
+                    "implicit {name}, drafts={drafts}",
+                );
+                assert!(
+                    dense_in_startup_share(name, layer, &layers, true, drafts),
+                    "explicit {name}, drafts={drafts}",
+                );
+                assert!(
+                    dense_in_startup_share(name, layer, &(2..2), true, drafts),
+                    "explicit globals remain required even for an empty layer range",
+                );
+            }
+        }
+    }
+
     /// A dense leaf with the checkpoint's real dims, as `copy_share` sees it.
     fn leaf(dims: &[u64], layer: Option<i64>) -> Leaf {
         let bytes: usize = dims.iter().product::<u64>() as usize * 2;
@@ -2557,7 +2646,8 @@ mod tests {
             "model.llm.unembed.weight".into(),
             leaf(&[201024, 4096], None),
         ));
-        // Copied into the arena by layer number, bound only when drafting.
+        // Candidate MTP leaves: selected into the arena and bound only when
+        // drafting. This fixture tests the device charge independently.
         for l in 0..8i64 {
             let p = format!("model.mtp.layers.{l}.");
             share.push((
@@ -2589,7 +2679,7 @@ mod tests {
         );
         // The win's whole memory cost, which is what the gate could not see.
         assert_eq!(device - aliased, 3_794_272_256);
-        // Drafting binds the MTP heads that the range already pays arena for.
+        // Drafting binds the MTP heads as well as selecting their arena bytes.
         let drafting = sum(placed(DenseWeights::DevicePool).with_drafting(true));
         assert_eq!(drafting - device, 8 * (67_108_864 + 33_554_432));
     }
