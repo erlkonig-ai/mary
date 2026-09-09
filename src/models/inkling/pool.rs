@@ -517,10 +517,17 @@ impl CleanupGate {
                     Ok(avail) => avail,
                     Err(_) => return false,
                 };
-                let yes = stranded() > avail;
+                let stranded = stranded();
+                let yes = stranded > avail;
                 if yes {
                     self.acted = true;
                     self.per_layer = true;
+                    if std::env::var("INK_HOST_STALL_TRACE").as_deref() == Ok("1") {
+                        let epoch = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+                        eprintln!("inkling-pool: cleanup_requested end_unix_ms={epoch} pid={} stranded_bytes={stranded} available_bytes={avail}",
+                            std::process::id());
+                    }
                 }
                 yes
             }

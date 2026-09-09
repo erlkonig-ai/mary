@@ -22,6 +22,7 @@ pub mod attn;
 pub mod block;
 pub mod burn;
 pub mod config;
+pub mod cache_pile;
 #[cfg(feature = "dmel")]
 pub mod dmel;
 pub mod patches;
@@ -151,6 +152,7 @@ pub mod learned;
 #[cfg(feature = "inkling-cuda")]
 pub mod train_online;
 pub mod session;
+pub mod cache_state;
 pub mod sdft;
 pub mod sdft_admission;
 pub mod sdft_runtime;

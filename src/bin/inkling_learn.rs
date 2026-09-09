@@ -138,6 +138,7 @@ fn main() -> Result<()> {
 
     let t0 = std::time::Instant::now();
     let loaded = engine::load(EngineConfig {
+        cache: None,
         distillation: None,
         pile: pile.into(),
         layers,

@@ -533,6 +533,12 @@ impl Group {
             Err(error) => return Err(error).context("read the next pass command"),
         }
         let count = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if header[0] == Pass::CACHE {
+            anyhow::ensure!(count <= Pass::MAX_DISTILL_BYTES, "rank-link cache frame exceeds its byte budget");
+            let mut bytes = vec![0; count];
+            peer.read_exact(&mut bytes).context("read cache control")?;
+            return Ok(Pass::Cache(serde_json::from_slice(&bytes).context("decode cache control")?));
+        }
         if header[0] == Pass::DISTILL {
             anyhow::ensure!(count <= Pass::MAX_DISTILL_BYTES, "rank-link SDFT frame exceeds its byte budget");
             let mut bytes = vec![0; count];
@@ -561,6 +567,35 @@ impl Group {
             ids.push(u32::from_be_bytes(word) as usize);
         }
         Pass::decode(header[0], ids)
+    }
+
+    /// Acknowledgements at cache boundaries, never on the token path. Followers
+    /// report even a local storage error and wait for rank zero's next command;
+    /// rank zero can abort coherently instead of entering a stranded collective.
+    pub fn cache_replies(
+        &mut self,
+        local: super::cache_pile::CacheReply,
+    ) -> Result<Vec<super::cache_pile::CacheReply>> {
+        if self.tp.rank() != 0 {
+            let bytes = serde_json::to_vec(&local)?;
+            anyhow::ensure!(bytes.len() <= Pass::MAX_DISTILL_BYTES, "cache reply exceeds byte budget");
+            let peer = self.socks.first_mut().context("cache reply has no leader")?;
+            peer.write_all(&(bytes.len() as u32).to_be_bytes())?;
+            peer.write_all(&bytes)?;
+            peer.flush()?;
+            return Ok(Vec::new());
+        }
+        let mut replies = vec![local];
+        for peer in &mut self.socks {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).context("read cache acknowledgement length")?;
+            let count = u32::from_be_bytes(header) as usize;
+            anyhow::ensure!(count <= Pass::MAX_DISTILL_BYTES, "cache reply exceeds byte budget");
+            let mut bytes = vec![0; count];
+            peer.read_exact(&mut bytes).context("read cache acknowledgement")?;
+            replies.push(serde_json::from_slice(&bytes).context("decode cache acknowledgement")?);
+        }
+        Ok(replies)
     }
 
     /// Exchange one 32-byte sequence digest with every peer and require
@@ -759,6 +794,8 @@ fn connect_with_deadline(addr: &str, wait: Duration) -> Result<TcpStream> {
 /// and the order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pass {
+    /// Durable prepared-prefix storage; no generated or learned work.
+    Cache(super::cache_pile::CacheCommand),
     /// Background work ordered by rank zero. Only an explicitly included
     /// foreground row produces a token in the live conversation.
     Distill(super::sdft::Work),
@@ -827,6 +864,7 @@ impl Pass {
     const REWIND: u8 = 0x0F;
     // A private command ordinal, not a durable schema or model identifier.
     const DISTILL: u8 = Self::REWIND + 1;
+    const CACHE: u8 = Self::DISTILL + 1;
     const MAX_DISTILL_BYTES: usize = 16 * 1024 * 1024;
 
     /// `[tag u8][count u32be][count x u32be ids]`.
@@ -836,6 +874,15 @@ impl Pass {
     /// generated token after the first costs — is NINE bytes: one tag, one
     /// u32be count, one u32be id.
     fn encode(&self) -> Vec<u8> {
+        if let Pass::Cache(command) = self {
+            let bytes = serde_json::to_vec(command).expect("integer-valued cache control serializes");
+            assert!(bytes.len() <= Self::MAX_DISTILL_BYTES, "cache command exceeds frame budget");
+            let mut frame = Vec::with_capacity(5 + bytes.len());
+            frame.push(Self::CACHE);
+            frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&bytes);
+            return frame;
+        }
         if let Pass::Distill(work) = self {
             // Structured learning work is infrequent control data; the
             // ordinary one-token serving frame remains nine bytes. One bulk
@@ -889,7 +936,7 @@ impl Pass {
                 one_id = [*index];
                 (Self::REWIND, &one_id[..])
             }
-            Pass::Audio { .. } | Pass::Vision { .. } | Pass::Distill(_) => unreachable!("encoded above"),
+            Pass::Audio { .. } | Pass::Vision { .. } | Pass::Distill(_) | Pass::Cache(_) => unreachable!("encoded above"),
         };
         let mut frame = Vec::with_capacity(5 + 4 * ids.len());
         frame.push(tag);
@@ -917,7 +964,7 @@ impl Pass {
             Ok(())
         }
         Ok(match tag {
-            Self::AUDIO | Self::VISION | Self::DISTILL => {
+            Self::AUDIO | Self::VISION | Self::DISTILL | Self::CACHE => {
                 anyhow::bail!("a byte payload frame is read by Group::follow itself")
             }
             Self::EVICT => {
