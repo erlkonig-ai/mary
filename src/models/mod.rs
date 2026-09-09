@@ -49,6 +49,8 @@ pub mod inkling;
 // `mary::models::inkling::spectree`.
 #[cfg(not(feature = "inkling-cuda"))]
 pub mod inkling {
+    #[path = "cache_pile.rs"]
+    pub mod cache_pile;
     #[path = "spectree.rs"]
     pub mod spectree;
 

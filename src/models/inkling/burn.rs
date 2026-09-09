@@ -1095,6 +1095,38 @@ impl AttnCache<Bk> {
         });
     }
 
+    pub(crate) fn export_cache(
+        &self,
+        sink: &mut super::cache_state::BlobSink<'_>,
+    ) -> anyhow::Result<super::cache_state::AttnCacheState> {
+        use super::cache_state::{self, AttnCacheState};
+        anyhow::ensure!(self.pending.is_none(), "cannot export uncommitted attention rows");
+        Ok(AttnCacheState {
+            k: self.k.export_cache(sink)?, v: self.v.export_cache(sink)?,
+            k_pre: cache_state::export_float(&self.k_pre, 0..self.k_pre.dims()[0], sink)?,
+            v_pre: cache_state::export_float(&self.v_pre, 0..self.v_pre.dims()[0], sink)?,
+            base: self.base, evicted: self.evicted.clone(),
+        })
+    }
+
+    pub(crate) fn restore_cache(
+        state: &super::cache_state::AttnCacheState,
+        client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
+        dev: &burn::backend::cuda::CudaDevice,
+        source: &mut super::cache_state::BlobSource<'_>,
+    ) -> anyhow::Result<Self> {
+        use super::cache_state;
+        let mut cache = Self {
+            k: super::kvpages::KvStore::restore_cache(&state.k, client, dev, source)?,
+            v: super::kvpages::KvStore::restore_cache(&state.v, client, dev, source)?,
+            k_pre: cache_state::restore_float(&state.k_pre, client, dev, source)?,
+            v_pre: cache_state::restore_float(&state.v_pre, client, dev, source)?,
+            base: state.base, pending: None, evicted: state.evicted.clone(), gap_dev: None,
+        };
+        cache.upload_gaps(dev);
+        Ok(cache)
+    }
+
     /// DEBUG: host-side absolute sums of everything this cache carries to the
     /// next decode step, in the order (K pages, V pages, k_pre, v_pre).
     ///

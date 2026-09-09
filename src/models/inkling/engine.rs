@@ -68,6 +68,7 @@ use super::resident::{
     InklingContext, InklingContextCodec, Model, Ready, Reinitialized, TurnEnd, context_preflight, SenseMedia,
 };
 use super::session::{Session, SessionConfig};
+use super::cache_pile::{CacheCommand, CacheConfig, CacheKey, CacheReply, CacheStore, Prefix};
 use super::tp::Tp;
 use super::tpcomm::{Group, Pass, transport_note};
 
@@ -82,6 +83,8 @@ type Detokenizer = Box<dyn FnMut(u32) -> Result<Option<String>> + Send>;
 
 /// How to load one rank of the model.
 pub struct EngineConfig {
+    /// Optional durable, inference-only prepared-prefix cache on this rank.
+    pub cache: Option<CacheConfig>,
     /// The model collection: weights, config.json AND the tokenizer graph.
     pub pile: std::path::PathBuf,
     /// Layers this rank runs. A tensor-parallel rank must run all of them.
@@ -115,6 +118,7 @@ pub struct TensorParallel {
 /// A loaded rank-0 model: the [`Model`] `InklingMind` consults.
 pub struct Engine {
     session: Session,
+    cache: Option<CacheStore>,
     distillation: Option<super::sdft_runtime::Runtime>,
     distillation_schedule: Option<super::sdft_schedule::Scheduler>,
     distillation_config: Option<super::sdft::Config>,
@@ -181,6 +185,7 @@ pub struct Engine {
 /// needs to stay in lockstep arrives as a [`Pass`].
 pub struct Follower {
     session: Session,
+    cache: Option<CacheStore>,
     distillation: Option<super::sdft_runtime::Runtime>,
     digest: blake3::Hasher,
     ready: Ready,
@@ -199,6 +204,15 @@ pub struct Follower {
 /// EVERY tensor rather than all of some layers. Getting it backwards is a
 /// refusal at load rather than a wrong answer, which is the good failure.
 pub fn load(config: EngineConfig) -> Result<Loaded> {
+    if let Some(cache) = &config.cache {
+        anyhow::ensure!(config.distillation.is_none(),
+            "durable inference caches do not snapshot an SDFT teacher, optimizer or sampler");
+        if cache.pile.exists() {
+            anyhow::ensure!(std::fs::canonicalize(&cache.pile)? != std::fs::canonicalize(&config.pile)?,
+                "the cache must not be the model pile");
+        }
+    }
+    let cache = config.cache.as_ref().map(CacheStore::open).transpose()?;
     if config.sealed {
         reject_sealed_environment()?;
     }
@@ -396,6 +410,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         }).transpose()?;
         return Ok(Loaded::Follower(Follower {
             session,
+            cache,
             distillation,
             digest: blake3::Hasher::new(),
             ready,
@@ -428,6 +443,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     Ok(Loaded::Engine(Engine {
         signing_key: config.signing_key.clone(),
         session,
+        cache,
         distillation,
         distillation_schedule,
         distillation_config: config.distillation,
@@ -505,6 +521,16 @@ impl Follower {
                 group.follow()?
             };
             match pass {
+                Pass::Cache(command) => {
+                    let result = rank_cache(&mut self.session, self.cache.as_mut(), &self.ready, &command);
+                    if result.is_ok() && let CacheCommand::Restore(prefix) = command {
+                        self.checkpoints.clear();
+                        self.digest = restored_digest(prefix, self.session.next_token()
+                            .context("restored cache has no next prediction")?);
+                    }
+                    let reply = CacheReply::from_result(result);
+                    self.session.group_mut().context("follower lost rank link")?.cache_replies(reply)?;
+                }
                 Pass::Distill(work) => {
                     let runtime = self.distillation.as_mut()
                         .context("rank zero requested SDFT without an admitted teacher")?;
@@ -585,6 +611,7 @@ impl Follower {
                 Pass::Reset => {
                     self.session.reset();
                     self.digest = blake3::Hasher::new();
+                    self.checkpoints.clear();
                 }
                 Pass::Agree => {
                     let digest = *self.digest.clone().finalize().as_bytes();
@@ -635,6 +662,73 @@ fn fold_pass(digest: &mut blake3::Hasher, token: usize, position: usize) {
     digest.update(&(position as u64).to_be_bytes());
 }
 
+fn restored_digest(prefix: Prefix, token: usize) -> blake3::Hasher {
+    let mut digest = blake3::Hasher::new();
+    digest.update(&prefix.hash);
+    fold_pass(&mut digest, token, prefix.position);
+    digest
+}
+
+/// Rank-local disk work. All failures are acknowledged before another rank
+/// may enter a collective; no partially successful restore is continued.
+fn rank_cache(
+    session: &mut Session,
+    cache: Option<&mut CacheStore>,
+    ready: &Ready,
+    command: &CacheCommand,
+) -> Result<Vec<Prefix>> {
+    let cache = cache.context("every rank must configure its own --kv-cache and --kv-cache-key")?;
+    let compatibility = session.cache_identity()?;
+    if let CacheCommand::Candidates { limit } = command {
+        return Ok(cache.candidates(compatibility, *limit)?.into_iter().map(|c| c.prefix).collect());
+    }
+    let prefix = match command {
+        CacheCommand::Save(prefix) | CacheCommand::Restore(prefix) => *prefix,
+        CacheCommand::Candidates { .. } => unreachable!(),
+    };
+    let key = CacheKey {
+        model: session.model_identity(), compatibility,
+        rank: ready.tp_rank.unwrap_or(0), world: ready.tp_world, prefix,
+    };
+    match command {
+        CacheCommand::Save(_) => {
+            anyhow::ensure!(session.position() == prefix.position, "cache save position differs between ranks");
+            cache.begin();
+            let state = session.export_cache(&mut |bytes| cache.put_chunk(bytes))?;
+            cache.publish(key, serde_json::to_value(state)?)?;
+        }
+        CacheCommand::Restore(_) => {
+            anyhow::ensure!(session.position() == 0, "cache restore requires a fresh session");
+            let candidate = cache.candidates(compatibility, prefix.position)?.into_iter()
+                .find(|candidate| candidate.prefix == prefix).context("the agreed cache prefix disappeared")?;
+            let reader = cache.read(&candidate, &key)?;
+            let state = serde_json::from_value(reader.state.clone()).context("decode session cache state")?;
+            session.restore_cache(&state, &mut |hash, bytes| reader.chunk(hash, bytes))?;
+            anyhow::ensure!(session.position() == prefix.position && session.next_token().is_some(),
+                "restored session does not match the agreed prefix");
+        }
+        CacheCommand::Candidates { .. } => unreachable!(),
+    }
+    Ok(vec![prefix])
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WarmupProgress {
+    pub restored_tokens: usize,
+    pub prepared_tokens: usize,
+    pub saved_tokens: usize,
+    pub total_tokens: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WarmupReport {
+    pub restored_tokens: usize,
+    pub prepared_tokens: usize,
+    pub saved_tokens: usize,
+    pub total_tokens: usize,
+    pub cancelled: bool,
+}
+
 fn distillation_recipe(
     requested: &super::resident::VersionRecipe,
     config: &super::sdft::Config,
@@ -663,6 +757,139 @@ fn distillation_recipe(
 // ── the engine ──────────────────────────────────────────────────────────────
 
 impl Engine {
+    /// Prepare an initial text context without consulting the model, generating
+    /// a turn, or running any learner. The caller owns shutdown on every path.
+    pub fn warmup(
+        &mut self,
+        context: &InklingContext,
+        cancelled: &dyn Fn() -> bool,
+        on_progress: &mut dyn FnMut(&WarmupProgress),
+    ) -> Result<WarmupReport> {
+        anyhow::ensure!(!self.terminated && self.session.position() == 0 && self.turn == 0
+            && self.delta.is_empty() && self.carry.is_none(), "warmup requires an unused engine");
+        anyhow::ensure!(self.cache.is_some() && self.distillation.is_none() && !self.session.learning(),
+            "warmup requires a durable cache and an inference-only model");
+        anyhow::ensure!(matches!(context, InklingContext::Initialize { .. }),
+            "warmup prepares exactly one Initialize context");
+        anyhow::ensure!(self.codec.media(context).into_iter().all(|m| matches!(m, SenseMedia::Text { .. })),
+            "initial warmup caches support text only; staged media is not a token-prefix identity");
+        self.context(context)?;
+        let ids = std::mem::take(&mut self.delta);
+        self.delta_unscored = false;
+        self.prepare_cached_prefix(&ids, cancelled, on_progress)
+    }
+
+    fn cache_command(&mut self, command: CacheCommand) -> Result<Vec<Vec<Prefix>>> {
+        self.lead(&Pass::Cache(command.clone()))?;
+        let local = CacheReply::from_result(rank_cache(
+            &mut self.session, self.cache.as_mut(), &self.ready, &command,
+        ));
+        if local.error.is_none() && let CacheCommand::Restore(prefix) = command {
+            self.checkpoints.clear();
+            self.checkpoint_ends.clear();
+            self.digest = restored_digest(prefix, self.session.next_token()
+                .context("restored cache has no next prediction")?);
+        }
+        let replies = match self.session.group_mut() {
+            Some(group) => group.cache_replies(local)?,
+            None => vec![local],
+        };
+        for (rank, reply) in replies.iter().enumerate() {
+            if let Some(error) = &reply.error {
+                // A restored half is never allowed to continue after its peer
+                // failed. A normal shutdown is not a successful restore.
+                let _ = self.kill();
+                anyhow::bail!("cache operation failed on rank {rank}: {error}");
+            }
+        }
+        Ok(replies.into_iter().map(|reply| reply.prefixes).collect())
+    }
+
+    fn restore_common_prefix(&mut self, ids: &[usize]) -> Result<usize> {
+        anyhow::ensure!(self.session.position() == 0, "resume requires a fresh cache");
+        let offers = self.cache_command(CacheCommand::Candidates { limit: ids.len() })?;
+        let selected = super::cache_pile::common_prefix(ids, &offers)?;
+        if let Some(prefix) = selected {
+            let start = std::time::Instant::now();
+            self.cache_command(CacheCommand::Restore(prefix))?;
+            self.agree_sequence()?;
+            self.take_checkpoint(true)?;
+            eprintln!("inkling-cache: restored_tokens={} restore_host_seconds={:.6}",
+                prefix.position, start.elapsed().as_secs_f64());
+            return Ok(prefix.position);
+        }
+        Ok(0)
+    }
+
+    fn save_prefix(&mut self, ids: &[usize], position: usize) -> Result<()> {
+        self.agree_sequence()?;
+        let prefix = super::cache_pile::token_prefix(&ids[..position])?;
+        let start = std::time::Instant::now();
+        self.cache_command(CacheCommand::Save(prefix))?;
+        eprintln!("inkling-cache: saved_tokens={position} checkpoint_host_seconds={:.6}",
+            start.elapsed().as_secs_f64());
+        Ok(())
+    }
+
+    fn prepare_cached_prefix(
+        &mut self,
+        ids: &[usize],
+        cancelled: &dyn Fn() -> bool,
+        on_progress: &mut dyn FnMut(&WarmupProgress),
+    ) -> Result<WarmupReport> {
+        anyhow::ensure!(!ids.is_empty() && ids.len() <= self.context_budget,
+            "prepared prefix must fit the admitted context budget");
+        anyhow::ensure!(!self.session.learning() && self.distillation.is_none()
+            && self.delta_audio.is_empty() && self.delta_vision.is_empty(),
+            "prepared-prefix caching requires text-only inference without learning");
+        if cancelled() {
+            on_progress(&WarmupProgress { total_tokens: ids.len(), ..Default::default() });
+            return Ok(WarmupReport { total_tokens: ids.len(), cancelled: true, ..Default::default() });
+        }
+        let restored = self.restore_common_prefix(ids)?;
+        let mut progress = WarmupProgress {
+            restored_tokens: restored, prepared_tokens: restored,
+            saved_tokens: restored, total_tokens: ids.len(),
+        };
+        on_progress(&progress);
+        let spacing = self.cache.as_ref().context("prefix caching is not configured")?.checkpoint_tokens;
+        let width = self.ready.prefill_budget.max(1);
+        let mut next_save = restored.checked_div(spacing).and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(spacing)).unwrap_or(usize::MAX);
+        let mut was_cancelled = cancelled();
+        while progress.prepared_tokens < ids.len() && !was_cancelled {
+            let from = progress.prepared_tokens;
+            let to = from.saturating_add(width).min(ids.len()).min(next_save);
+            let pass = if from == 0 { Pass::Prefill(ids[from..to].to_vec()) }
+                else { Pass::Extend(ids[from..to].to_vec()) };
+            let start = std::time::Instant::now();
+            self.pass(pass)?;
+            progress.prepared_tokens = self.session.position();
+            anyhow::ensure!(progress.prepared_tokens == to, "warmup pass advanced an unexpected number of rows");
+            let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
+            eprintln!("inkling-warmup: chunk_start={from} chunk_end={to} end_unix_ms={epoch} model_host_seconds={:.6}",
+                start.elapsed().as_secs_f64());
+            if to >= next_save || to == ids.len() {
+                self.take_checkpoint(to == ids.len())?;
+                self.save_prefix(ids, to)?;
+                progress.saved_tokens = to;
+                next_save = next_save.saturating_add(spacing);
+            }
+            on_progress(&progress);
+            was_cancelled = cancelled();
+        }
+        if progress.prepared_tokens > progress.saved_tokens {
+            self.take_checkpoint(true)?;
+            self.save_prefix(ids, progress.prepared_tokens)?;
+            progress.saved_tokens = progress.prepared_tokens;
+            on_progress(&progress);
+        }
+        Ok(WarmupReport {
+            restored_tokens: restored, prepared_tokens: progress.prepared_tokens,
+            saved_tokens: progress.saved_tokens, total_tokens: ids.len(), cancelled: was_cancelled,
+        })
+    }
+
     /// What loaded, and whether its tokens are the model's.
     pub fn ready(&self) -> &Ready {
         &self.ready
@@ -1016,18 +1243,28 @@ impl Engine {
                     Pass::Prefill(ids) | Pass::Extend(ids) => ids,
                     other => anyhow::bail!("{other:?} is not a pass that installs a cover"),
                 };
-                let spacing = Self::checkpoint_spacing();
-                let mut first = 0;
-                let pieces = ids.len().div_ceil(spacing);
-                for (n, piece) in ids.chunks(spacing).enumerate() {
-                    let pass = match self.session.position() > 0 {
-                        false => Pass::Prefill(piece.to_vec()),
-                        true => Pass::Extend(piece.to_vec()),
-                    };
-                    first = self.pass(pass)?;
-                    self.take_checkpoint(n + 1 == pieces)?;
+                if self.cache.is_some() && self.session.position() == 0
+                    && self.carry.is_none() && self.cover_base == 0
+                {
+                    self.prepare_cached_prefix(&ids, &|| false, &mut |_| {})?;
+                    // A fully restored prefix already has its next prediction.
+                    // Extend([]) would Step and silently append an extra token.
+                    let first = self.session.next_token().context("prepared prefix has no prediction")?;
+                    (first, super::session::ScoredNll::default())
+                } else {
+                    let spacing = Self::checkpoint_spacing();
+                    let mut first = 0;
+                    let pieces = ids.len().div_ceil(spacing);
+                    for (n, piece) in ids.chunks(spacing).enumerate() {
+                        let pass = match self.session.position() > 0 {
+                            false => Pass::Prefill(piece.to_vec()),
+                            true => Pass::Extend(piece.to_vec()),
+                        };
+                        first = self.pass(pass)?;
+                        self.take_checkpoint(n + 1 == pieces)?;
+                    }
+                    (first, super::session::ScoredNll::default())
                 }
-                (first, super::session::ScoredNll::default())
             }
             (false, false) => (self.pass(pass)?, super::session::ScoredNll::default()),
         };
@@ -1409,16 +1646,30 @@ impl Model for Engine {
         let index = self
             .checkpoints
             .iter()
-            .rposition(|cp| cp.position() <= position)
-            .with_context(|| format!("no rewind point at or before position {position}"))?;
-        self.lead(&Pass::Rewind { index })?;
-        let cp = &self.checkpoints[index];
-        let at = cp.position();
-        self.session
-            .rewind(cp)
-            .context("rewind rank 0 to the point")?;
-        self.checkpoints.truncate(index + 1);
-        self.checkpoint_ends.truncate(index + 1);
+            .rposition(|cp| cp.position() <= position);
+        let at = if let Some(index) = index {
+            self.lead(&Pass::Rewind { index })?;
+            let cp = &self.checkpoints[index];
+            let at = cp.position();
+            self.session.rewind(cp).context("rewind rank 0 to the point")?;
+            self.checkpoints.truncate(index + 1);
+            self.checkpoint_ends.truncate(index + 1);
+            at
+        } else if self.cache.is_some() && self.cover_base == 0 {
+            // A restarted process keeps only the restored boundary in RAM.
+            // Older rewind points remain in the pile. Restore one, or replay
+            // from zero if the changed recall predates every durable point.
+            // No learned or conversational state is claimed by this cache.
+            let ids = self.cover_ids[..position].to_vec();
+            self.lead(&Pass::Reset)?;
+            self.session.reset();
+            self.digest = blake3::Hasher::new();
+            self.checkpoints.clear();
+            self.checkpoint_ends.clear();
+            self.restore_common_prefix(&ids)?
+        } else {
+            anyhow::bail!("no rewind point at or before position {position}")
+        };
         // The unchanged tail between the point and the first changed recall
         // goes back in first, exactly as it was, unscored.
         let replay: Vec<usize> = self.cover_ids[at - self.cover_base..position - self.cover_base].to_vec();
@@ -1591,13 +1842,16 @@ fn sealed_environment_rejections(names: impl IntoIterator<Item = String>) -> Vec
         "NCCL_SOCKET_IFNAME",
         "NCCL_IB_HCA",
     ];
+    // These time existing host calls only. They select no numerical lane and
+    // introduce no device fences, so sealed warmup may diagnose its own stalls.
+    const HOST_DIAGNOSTICS: &[&str] = &["INK_HOST_STALL_TRACE", "CUBECL_HOST_STALL_TRACE"];
     let mut rejected = names
         .into_iter()
         .filter(|name| {
             let rank_local = RANK_LOCAL_EXACT.contains(&name.as_str())
                 || name == "NCCL_DEBUG"
                 || name.starts_with("NCCL_DEBUG_");
-            !rank_local
+            !rank_local && !HOST_DIAGNOSTICS.contains(&name.as_str())
                 && (EXACT.contains(&name.as_str())
                     || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
         })
@@ -1961,7 +2215,7 @@ mod tests {
         }
 
         let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .arg("tests::sealed_tp_child_accepts_deployed_rank_local_environment")
+            .arg("models::inkling::engine::tests::sealed_tp_child_accepts_deployed_rank_local_environment")
             .arg("--exact")
             .arg("--nocapture")
             .env_clear()
@@ -1973,6 +2227,8 @@ mod tests {
             .env("NCCL_DEBUG", "INFO")
             .env("NCCL_DEBUG_SUBSYS", "INIT,NET")
             .env("NCCL_DEBUG_FILE", "/tmp/nccl.%h.%p.log")
+            .env("INK_HOST_STALL_TRACE", "1")
+            .env("CUBECL_HOST_STALL_TRACE", "1")
             .output()
             .expect("launch the sealed-environment fixture child");
         assert!(
@@ -1991,6 +2247,16 @@ mod tests {
                 .map(str::to_owned),
         );
         assert_eq!(rejected, ["CUBECL_MEMORY_CONFIG", "NCCL_ALGO"]);
+    }
+
+    #[test]
+    fn sealed_diagnostics_exception_is_exact_not_a_prefix() {
+        let rejected = sealed_environment_rejections(
+            ["INK_HOST_STALL_TRACE", "CUBECL_HOST_STALL_TRACE",
+             "INK_HOST_STALL_TRACE_EXTRA", "CUBECL_HOST_STALL_TRACE_EXTRA"]
+                .into_iter().map(str::to_owned),
+        );
+        assert_eq!(rejected, ["CUBECL_HOST_STALL_TRACE_EXTRA", "INK_HOST_STALL_TRACE_EXTRA"]);
     }
 
     #[test]

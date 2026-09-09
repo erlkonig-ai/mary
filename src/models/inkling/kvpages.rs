@@ -1998,6 +1998,91 @@ impl<B: Backend> KvStore<B> {
 }
 
 impl KvStore<Bk> {
+    /// A portable image of every retained row, preserving physical page
+    /// boundaries and moving packed planes without invoking a quantizer.
+    pub(crate) fn export_cache(
+        &self,
+        sink: &mut super::cache_state::BlobSink<'_>,
+    ) -> anyhow::Result<super::cache_state::KvCacheState> {
+        use super::cache_state::{self, CacheDType, KvCacheState, KvPageState};
+
+        fn image<R: PageRows>(
+            pages: &Pages<R>, width: usize, fp4: bool, dtype: CacheDType,
+            payloads: Vec<KvPageState>,
+        ) -> KvCacheState {
+            KvCacheState {
+                width, fp4, dtype, head: pages.head, len: pages.len,
+                fill: pages.fill, reserved: pages.reserved, epoch: pages.epoch,
+                read: pages.read, pages: payloads,
+            }
+        }
+
+        let state = match self {
+            Self::Wide(store) => {
+                let mut payloads = Vec::with_capacity(store.pages.pages.len());
+                for (i, page) in store.pages.pages.iter().enumerate() {
+                    let start = if i == 0 { store.pages.head } else { 0 };
+                    let end = store.pages.rows_at(i);
+                    payloads.push(KvPageState {
+                        values: cache_state::export_float(page, start..end, sink)?, scales: None,
+                    });
+                }
+                let dtype = payloads.first().map(|p| p.values.dtype).unwrap_or(CacheDType::F32);
+                image(&store.pages, store.width, false, dtype, payloads)
+            }
+            Self::Fp4(store) => {
+                let mut payloads = Vec::with_capacity(store.pages.pages.len());
+                for (i, page) in store.pages.pages.iter().enumerate() {
+                    let start = if i == 0 { store.pages.head } else { 0 };
+                    let end = store.pages.rows_at(i);
+                    payloads.push(KvPageState {
+                        values: cache_state::export_int(&page.codes, start..end, sink)?,
+                        scales: Some(cache_state::export_int(&page.scales, start..end, sink)?),
+                    });
+                }
+                image(&store.pages, store.width, true, CacheDType::from_dtype(store.dtype)?, payloads)
+            }
+        };
+        state.validate(state.width, usize::MAX, usize::MAX)?;
+        Ok(state)
+    }
+
+    /// Rebuild one already-validated store. Dead capacity rows are zeroed;
+    /// live code/scales bits, page boundaries and all counters are restored.
+    pub(crate) fn restore_cache(
+        state: &super::cache_state::KvCacheState,
+        client: &ComputeClient<CudaRuntime>,
+        dev: &burn::backend::cuda::CudaDevice,
+        source: &mut super::cache_state::BlobSource<'_>,
+    ) -> anyhow::Result<Self> {
+        use super::cache_state;
+        state.validate(state.width, usize::MAX, usize::MAX)?;
+        fn pages<R: PageRows>(state: &cache_state::KvCacheState, payloads: Vec<R>) -> Pages<R> {
+            Pages { pages: payloads, head: state.head, len: state.len, fill: state.fill,
+                reserved: state.reserved, epoch: state.epoch, read: state.read }
+        }
+        if state.fp4 {
+            let mut payloads = Vec::with_capacity(state.pages.len());
+            for page in &state.pages {
+                payloads.push(Fp4Rows {
+                    codes: cache_state::restore_int(&page.values, client, dev, source)?,
+                    scales: cache_state::restore_int(page.scales.as_ref().expect("validated scale plane"), client, dev, source)?,
+                    width: state.width,
+                });
+            }
+            Ok(Self::Fp4(Fp4PageStore {
+                pages: pages(state, payloads), width: state.width,
+                dtype: state.dtype.dtype(), client: Some(client.clone()),
+            }))
+        } else {
+            let mut payloads = Vec::with_capacity(state.pages.len());
+            for page in &state.pages {
+                payloads.push(cache_state::restore_float(&page.values, client, dev, source)?);
+            }
+            Ok(Self::Wide(PageStore { pages: pages(state, payloads), width: state.width }))
+        }
+    }
+
     /// An empty store for `width`-column rows of `dtype`, on whichever arm
     /// [`fp4_kv`] selects.
     ///
@@ -2339,6 +2424,83 @@ mod tests {
     type B = burn::backend::Cuda<f32>;
 
     const W: usize = 4;
+
+    #[test]
+    #[ignore = "requires an explicitly reserved CUDA device; tiny raw cache transport diagnostic"]
+    fn portable_cache_packed_roundtrip_keeps_bits_heads_and_append_behavior() {
+        use std::collections::BTreeMap;
+        let dev = fp4_dev();
+        let rows = frows(0, 145).cast(DType::BF16);
+        let client = seam::client_of(&rows);
+        for reserved in [false, true] {
+            let mut original = KvStore::Fp4(Fp4PageStore::new(FW, DType::BF16));
+            original.append(rows.clone());
+            if reserved { original = original.into_reserved(512, 128, &dev); }
+            original.drop_front(9);
+            original.assert_sound();
+            let mut blobs = BTreeMap::<[u8; 32], Vec<u8>>::new();
+            let image = original.export_cache(&mut |raw| {
+                let hash = *blake3::hash(raw).as_bytes();
+                blobs.insert(hash, raw.to_vec());
+                Ok(hash)
+            }).unwrap();
+            assert_eq!(image.head, 9);
+            assert_eq!(image.reserved > 0, reserved);
+            let mut restored = KvStore::restore_cache(&image, &client, &dev, &mut |hash, bytes| {
+                let raw = blobs.get(&hash).unwrap();
+                assert_eq!(raw.len(), bytes);
+                Ok(raw.clone())
+            }).unwrap();
+            restored.assert_sound();
+            let copied = restored.export_cache(&mut |raw| Ok(*blake3::hash(raw).as_bytes())).unwrap();
+            assert_eq!(copied, image, "live code and scale bits or page metadata moved");
+            let KvStore::Fp4(store) = &restored else { unreachable!() };
+            assert_eq!(fcontents(store), (9..145).collect::<Vec<_>>());
+
+            // A restored page must support the same future write and trim, not
+            // merely read back the right initial shape.
+            for store in [&mut original, &mut restored] {
+                store.append(frows(145, 7).cast(DType::BF16));
+                store.drop_front(3);
+            }
+            let a = original.export_cache(&mut |raw| Ok(*blake3::hash(raw).as_bytes())).unwrap();
+            let b = restored.export_cache(&mut |raw| Ok(*blake3::hash(raw).as_bytes())).unwrap();
+            assert_eq!(a, b);
+
+            let error = KvStore::restore_cache(&image, &client, &dev, &mut |hash, _| {
+                let mut raw = blobs.get(&hash).unwrap().clone();
+                raw[0] ^= 1;
+                Ok(raw)
+            }).err().expect("corrupt payload must be refused");
+            assert!(error.to_string().contains("content hash mismatch"));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly reserved CUDA device; tiny dense cache transport diagnostic"]
+    fn portable_cache_dense_roundtrip_preserves_f32_and_bf16_bits() {
+        use std::collections::BTreeMap;
+        let dev = fp4_dev();
+        for dtype in [DType::F32, DType::BF16] {
+            let values = rows(0, 19).cast(dtype);
+            let client = seam::client_of(&values);
+            let mut original = KvStore::Wide(PageStore::<B>::new(W));
+            original.append(values);
+            original.drop_front(3);
+            let mut blobs = BTreeMap::<[u8; 32], Vec<u8>>::new();
+            let image = original.export_cache(&mut |raw| {
+                let hash = *blake3::hash(raw).as_bytes();
+                blobs.insert(hash, raw.to_vec());
+                Ok(hash)
+            }).unwrap();
+            let restored = KvStore::restore_cache(&image, &client, &dev, &mut |hash, _| {
+                Ok(blobs.get(&hash).unwrap().clone())
+            }).unwrap();
+            restored.assert_sound();
+            let copied = restored.export_cache(&mut |raw| Ok(*blake3::hash(raw).as_bytes())).unwrap();
+            assert_eq!(copied, image);
+        }
+    }
 
     /// Rows whose every element is the row's absolute index, so `materialize`
     /// can be checked for CONTENT and ORDER rather than only for shape — a
@@ -2696,7 +2858,11 @@ mod tests {
         if s.is_empty() {
             return Vec::new();
         }
-        let flat: Vec<f32> = s.materialize(&fp4_dev()).into_data().to_vec().unwrap();
+        // Materialization retains the store's read dtype. Widen BF16 explicitly
+        // for this sign/magnitude diagnostic; packed-byte assertions elsewhere
+        // compare the original code and scale payloads without conversion.
+        let flat: Vec<f32> = s.materialize(&fp4_dev()).into_data()
+            .convert::<f32>().to_vec().unwrap();
         flat.chunks(FW)
             .map(|row| {
                 let bits = |o: usize| -> usize {

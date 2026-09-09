@@ -138,6 +138,38 @@ fn next_seq() -> u64 {
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Opt-in host wall time, not GPU elapsed time. Wraps only calls the pool gate
+/// already makes: tracing must not add a poll or a device synchronization.
+/// Only INK_HOST_STALL_TRACE=1 enables it. Completed calls of at least 100 ms
+/// are emitted; process-wide counters include all completed pool calls, even
+/// fast ones. No per-poll begin line on a million-token prefill's hot path.
+fn trace_pool_call<T>(layer: usize, phase: &str, call: impl FnOnce() -> T) -> T {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("INK_HOST_STALL_TRACE")
+        .map(|v| v == "1").unwrap_or(false))
+    {
+        return call();
+    }
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static SLOW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    static HOST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    use std::sync::atomic::Ordering::Relaxed;
+    let start = std::time::Instant::now();
+    let result = call();
+    let elapsed = start.elapsed();
+    let calls_total = COUNT.fetch_add(1, Relaxed) + 1;
+    let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
+    let host_ns_total = HOST_NS.fetch_add(ns, Relaxed).saturating_add(ns);
+    if elapsed >= std::time::Duration::from_millis(100) {
+        let slow_calls_total = SLOW_COUNT.fetch_add(1, Relaxed) + 1;
+        let end_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
+        eprintln!("[session-host-stall] end_unix_ms={end_unix_ms} pid={} layer={layer} phase=session_pool_{phase} host_seconds={:.6} calls_total={calls_total} slow_calls_total={slow_calls_total} host_seconds_total={:.6} timing=host_call_not_gpu counters=all_pool_phases",
+            std::process::id(), elapsed.as_secs_f64(), host_ns_total as f64 / 1e9);
+    }
+    result
+}
+
 /// `(base, len)` of the complete cache a layer must hold at `position`.
 fn required_cache_span(kind: AttnKind, position: usize, window: usize) -> (usize, usize) {
     match kind {
@@ -357,6 +389,9 @@ impl SessionConfig {
 /// between conversations rather than dropping and reloading.
 pub struct Session {
     cfg: InklingConfig,
+    /// Canonical source JSON, including any explicit single-rank override.
+    /// This is a cache compatibility fact, not the identity of the executable.
+    config_identity: [u8; 32],
     src: Weights,
     dev: burn::backend::cuda::CudaDevice,
     client: cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
@@ -881,6 +916,9 @@ impl Session {
                 .to_string(),
         };
         let conf = InklingConfig::from_json(&text).context("parsing config.json")?;
+        let config_identity = *blake3::hash(&serde_json::to_vec(
+            &serde_json::from_str::<serde_json::Value>(&text)?,
+        )?).as_bytes();
         let t = &conf.text_config;
         let tp = group.as_ref().map(Group::tp);
 
@@ -1186,6 +1224,7 @@ impl Session {
 
         Ok(Self {
             cfg: conf,
+            config_identity,
             src,
             dev,
             client,
@@ -1263,6 +1302,160 @@ impl Session {
     /// length of the sequence this session has attended to.
     pub fn position(&self) -> usize {
         self.pos
+    }
+
+    fn ensure_cache_inference_only(&self) -> Result<()> {
+        anyhow::ensure!(!self.torn, "a torn Session cannot export or restore a cache");
+        anyhow::ensure!(!self.learning() && self.trainable_layer().is_none()
+            && !self.teacher_bank_available && self.sequence_teacher_version.is_none()
+            && self.moe.teacher.is_none(),
+            "portable caches are inference-only; learner and teacher state is not included");
+        #[cfg(feature = "inkling-cuda")]
+        anyhow::ensure!(self.anchor.is_empty() && self.moe.learn.is_none()
+            && self.moe.learn_layer.is_none(), "portable caches cannot omit pending learning state");
+        anyhow::ensure!(self.audio.as_ref().is_none_or(|a| a.queue.pending.is_empty())
+            && self.vision.as_ref().is_none_or(|v| v.queue.pending.is_empty()),
+            "portable caches cannot omit staged sensory input");
+        anyhow::ensure!(self.caches.iter().all(|cache| cache.attn.pending_rows().is_none()
+            && cache.attn_sconv_pending.is_none() && cache.mlp_sconv_pending.is_none()),
+            "portable caches require a settled target transaction");
+        Ok(())
+    }
+
+    fn cache_geometry(&self) -> Result<super::cache_state::CacheGeometry> {
+        use super::cache_state::{CacheGeometry, LayerGeometry};
+        let t = &self.cfg.text_config;
+        let tp = self.group.as_ref().map(Group::tp);
+        let layers = (self.lo..self.hi).map(|layer| {
+            let kind = t.attn_kind(layer);
+            let (_, heads, dim) = t.heads(kind);
+            let heads = match tp { Some(tp) => tp.share("kv_heads", heads)?, None => heads };
+            Ok(LayerGeometry {
+                layer,
+                kv_width: heads.checked_mul(dim).context("cache KV width overflow")?,
+                window: (kind == AttnKind::Local).then_some(t.sliding_window_size),
+            })
+        }).collect::<Result<Vec<_>>>()?;
+        Ok(CacheGeometry {
+            model_identity: self.model_identity(),
+            model_root: self.model_root().map(|id| id.raw()),
+            config_identity: self.config_identity,
+            rank: tp.map_or(0, |tp| tp.rank()),
+            world: tp.map_or(1, |tp| tp.world()),
+            hidden: t.hidden_size,
+            kernel: t.sconv_kernel_size,
+            sliding_window: t.sliding_window_size,
+            vocab: t.effective_vocab(),
+            context_budget: self.context_budget,
+            extend_batch: self.extend_batch,
+            prefill_budget: self.prefill_budget,
+            forbidden: self.forbidden.clone(),
+            router: match RouterArm::from_env() {
+                RouterArm::Transpose => "transpose", RouterArm::Pre => "pre", RouterArm::Bf16 => "bf16",
+            }.to_owned(),
+            shared_halved: self.shared_halved,
+            kv_prealloc: super::kvpages::KvPlan::from_env(t.sliding_window_size).map(|p| p.context),
+            kv_epoch: super::kvpages::kv_epoch(),
+            fp4: super::kvpages::fp4_kv(),
+            attn_bf16: dev_lane::attn_bf16(),
+            act_bf16: dev_lane::act_bf16(),
+            resid_bf16: super::resid::resid_bf16(),
+            flash: dev_lane::flash_lane(),
+            flash_fp4: dev_lane::flash_fp4(),
+            head_rms_native: super::headnorm::head_rms_native(),
+            sink_down_fused: super::assembly::sink_down_fused(),
+            dense_fake_quant: super::assembly::dense_fake_quant(),
+            layers,
+        })
+    }
+
+    /// Cheap rank-local lookup identity: no GPU readback or cache allocation.
+    /// Pins model/configuration and numerical/cache layout choices, not a build
+    /// hash, so compatible performance-only rebuilds can reuse the same cache.
+    pub fn cache_identity(&self) -> Result<[u8; 32]> {
+        self.ensure_cache_inference_only()?;
+        self.cache_geometry()?.identity()
+    }
+
+    /// Validate every layer's metadata against this fresh Session before
+    /// fetching any payload or allocating KV. A reset Session is fresh too.
+    pub fn validate_cache(&self, state: &super::cache_state::SessionCacheState) -> Result<()> {
+        self.ensure_cache_inference_only()?;
+        anyhow::ensure!(self.pos == 0 && self.last.is_none() && self.caches.is_empty(),
+            "restore requires a fresh Session; reset before replacing a live sequence");
+        anyhow::ensure!(state.audio_slot.is_none() || self.audio.is_some(),
+            "cache carries an audio slot but this Session has no audio input");
+        anyhow::ensure!(state.vision_slot.is_none() || self.vision.is_some(),
+            "cache carries a vision slot but this Session has no vision input");
+        state.validate(&self.cache_geometry()?)
+    }
+
+    /// Export settled inference state using at most 4 MiB per host transfer.
+    /// The sink must return BLAKE3(raw); publication/durability belongs to the
+    /// caller. Failed export can leave unpublished blobs, never a valid image.
+    /// Packed KV codes and scales are copied exactly, without requantization.
+    pub fn export_cache(&self, sink: &mut super::cache_state::BlobSink<'_>)
+        -> Result<super::cache_state::SessionCacheState>
+    {
+        use super::cache_state::{self, LayerCacheState, SessionCacheState};
+        self.ensure_cache_inference_only()?;
+        anyhow::ensure!(self.pos > 0 && self.caches.len() == self.hi - self.lo,
+            "portable cache export requires a complete nonempty sequence");
+        let geometry = self.cache_geometry()?;
+        let mut layers = Vec::with_capacity(self.caches.len());
+        for cache in &self.caches {
+            let mlp = cache.mlp_sconv.as_ref().context("cache has no settled MLP convolution history")?;
+            layers.push(LayerCacheState {
+                attn: cache.attn.export_cache(sink)?,
+                attn_sconv: cache_state::export_float(&cache.attn_sconv, 0..cache.attn_sconv.dims()[0], sink)?,
+                mlp_sconv: cache_state::export_float(mlp, 0..mlp.dims()[0], sink)?,
+            });
+        }
+        let state = SessionCacheState {
+            version: cache_state::CACHE_FORMAT_VERSION,
+            identity: geometry.identity()?,
+            geometry,
+            position: self.pos,
+            last_prediction: self.last,
+            audio_slot: self.audio.as_ref().and_then(|a| a.queue.slot),
+            vision_slot: self.vision.as_ref().and_then(|v| v.queue.slot),
+            layers,
+        };
+        state.validate(&state.geometry)?;
+        Ok(state)
+    }
+
+    /// Restore only into a fresh compatible inference Session. Metadata is
+    /// checked before the first allocation, each blob is length/hash checked,
+    /// and replacement caches are installed together only after the final sync.
+    /// An upload/source failure poisons this Session until an explicit reset;
+    /// no partially reconstructed layer can be used as a continuation.
+    pub fn restore_cache(&mut self, state: &super::cache_state::SessionCacheState,
+        source: &mut super::cache_state::BlobSource<'_>) -> Result<()>
+    {
+        use super::cache_state;
+        self.validate_cache(state)?;
+        self.torn = true;
+        let mut caches = Vec::with_capacity(state.layers.len());
+        for layer in &state.layers {
+            caches.push(LayerCache {
+                attn: dev_lane::AttnCache::restore_cache(&layer.attn, &self.client, &self.dev, source)?,
+                attn_sconv: cache_state::restore_float(&layer.attn_sconv, &self.client, &self.dev, source)?,
+                mlp_sconv: Some(cache_state::restore_float(&layer.mlp_sconv, &self.client, &self.dev, source)?),
+                attn_sconv_pending: None,
+                mlp_sconv_pending: None,
+            });
+        }
+        cubecl::future::block_on(self.client.sync())
+            .map_err(|e| anyhow::anyhow!("device sync before installing restored caches: {e:?}"))?;
+        self.caches = caches;
+        self.pos = state.position;
+        self.last = state.last_prediction;
+        if let Some(audio) = self.audio.as_mut() { audio.queue.slot = state.audio_slot; }
+        if let Some(vision) = self.vision.as_mut() { vision.queue.slot = state.vision_slot; }
+        self.seq = next_seq();
+        self.torn = false;
+        Ok(())
     }
 
     /// Prove that every layer still holds the complete attention span its kind
@@ -2438,7 +2631,7 @@ impl Session {
             // global-cache size it has visited.
             let last_layer = layer + 1 == self.hi;
             let client = &self.client;
-            let want_cleanup = self.cleanup_gate.at_layer(last_layer, || {
+            let want_cleanup = self.cleanup_gate.at_layer(last_layer, || trace_pool_call(layer, "poll", || {
                 client
                     .memory_usage()
                     .map(|usage| {
@@ -2449,11 +2642,13 @@ impl Session {
                         )
                     })
                     .unwrap_or(0)
-            });
+            }));
             if want_cleanup {
-                <Bk as burn::tensor::backend::Backend>::sync(&self.dev)
-                    .expect("sync before Session pool cleanup");
-                self.client.memory_cleanup();
+                trace_pool_call(layer, "sync", || {
+                    <Bk as burn::tensor::backend::Backend>::sync(&self.dev)
+                        .expect("sync before Session pool cleanup");
+                });
+                trace_pool_call(layer, "cleanup", || self.client.memory_cleanup());
             }
         }
 
@@ -2809,6 +3004,127 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Explicit real weights, two diagnostic layers, synthetic input only.
+    /// Run alone under a CUDA reservation with INK_CACHE_TEST_MODEL pointing
+    /// at an existing model pile. This never feeds a prediction back as input.
+    #[test]
+    #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
+    fn portable_cache_session_roundtrip_after_local_window_rollover() -> Result<()> {
+        use super::super::cache_state::{MAX_CHUNK_BYTES, SessionCacheState};
+        const CONTEXT: usize = 2048;
+        const PREFILL: usize = 128;
+        const TAIL: usize = 17;
+        const HOST_LIMIT: usize = 64 * 1024 * 1024;
+
+        let path = std::env::var_os("INK_CACHE_TEST_MODEL")
+            .filter(|p| !p.is_empty())
+            .context("set INK_CACHE_TEST_MODEL to an explicit existing real-model pile")?;
+        let path = std::path::PathBuf::from(path);
+        anyhow::ensure!(path.is_absolute() && path.is_file(),
+            "INK_CACHE_TEST_MODEL must be an absolute path to an existing file");
+        for name in ["INK_TP", "INK_PIPE", "INK_CONFIG", "INK_LEARN_LR"] {
+            anyhow::ensure!(std::env::var_os(name).is_none(),
+                "unset {name}: this test is one inference-only diagnostic rank, with authoritative config");
+        }
+        // In particular, do not inherit a deployment's million-row reservation
+        // into this tiny test. No process-global environment is changed here.
+        if let Ok(raw) = std::env::var("INK_KV_PREALLOC") {
+            anyhow::ensure!(matches!(raw.as_str(), "" | "0" | "off")
+                || raw.parse::<usize>().is_ok_and(|n| n > 1 && n <= CONTEXT),
+                "INK_KV_PREALLOC must be off or an explicit count in 2..={CONTEXT} for this test");
+        }
+        let mut config = SessionConfig::new(path).layers(0..2);
+        config.config_override = None;
+        config.context_budget = CONTEXT;
+        config.prefill_budget = PREFILL;
+        config.extend_batch = PREFILL;
+        config.target_budget = 0;
+        let mut session = Session::load(config)?;
+        let identity = session.cache_identity()?; // also refuses any armed learner/teacher
+        let t = &session.config().text_config;
+        anyhow::ensure!((0..2).all(|layer| t.attn_kind(layer) == AttnKind::Local),
+            "the explicit test model must have local attention in diagnostic layers 0..2");
+        anyhow::ensure!(t.effective_vocab() > 256 && t.sliding_window_size > 0,
+            "the test needs nonempty local windows and at least 257 valid token IDs");
+        let window = t.sliding_window_size;
+        let prefix_rows = window.checked_add(129).context("test prefix overflow")?.max(641);
+        anyhow::ensure!(prefix_rows + TAIL <= CONTEXT,
+            "the model's local window is too wide for this bounded diagnostic");
+        let synthetic = |i: usize| 32 + (i * 37 % 191);
+        let prefix: Vec<usize> = (0..prefix_rows).map(synthetic).collect();
+        let tail: Vec<usize> = (prefix_rows..prefix_rows + TAIL).map(synthetic).collect();
+
+        fn save(session: &Session, blobs: &mut BTreeMap<[u8; 32], Vec<u8>>,
+            held: &mut usize) -> Result<SessionCacheState>
+        {
+            session.export_cache(&mut |raw| {
+                anyhow::ensure!(!raw.is_empty() && raw.len() <= MAX_CHUNK_BYTES,
+                    "cache sink exceeded its per-transfer bound");
+                let hash = *blake3::hash(raw).as_bytes();
+                if let std::collections::btree_map::Entry::Vacant(entry) = blobs.entry(hash) {
+                    let total = held.checked_add(raw.len()).context("test payload size overflow")?;
+                    anyhow::ensure!(total <= HOST_LIMIT, "test exceeded its bounded in-memory blob sink");
+                    entry.insert(raw.to_vec());
+                    *held = total;
+                }
+                Ok(hash)
+            })
+        }
+        let mut blobs = BTreeMap::<[u8; 32], Vec<u8>>::new();
+        let mut held = 0usize;
+        session.prefill(&prefix)?;
+        assert_eq!(session.position(), prefix_rows);
+        assert_eq!(session.validate_cache_completeness()?, 2);
+        let checkpoint = save(&session, &mut blobs, &mut held)?;
+        assert_eq!(checkpoint.identity, identity);
+        for layer in &checkpoint.layers {
+            assert_eq!(layer.attn.base, prefix_rows - window);
+            assert_eq!(layer.attn.k.len, window);
+            assert_eq!(layer.attn.v.len, window);
+            assert!(layer.attn.k.fp4 && layer.attn.v.fp4);
+        }
+        let expected_prediction = session.extend(&tail)?;
+        let expected = save(&session, &mut blobs, &mut held)?;
+        assert_eq!(expected.position, prefix_rows + TAIL);
+
+        // A failed restore may allocate temporary pages, but cannot install any
+        // of them or leave a fresh-looking usable Session behind.
+        session.reset();
+        session.validate_cache(&checkpoint)?;
+        let first = checkpoint.chunks().next().context("nonempty cache has no payload")?.handle;
+        let error = session.restore_cache(&checkpoint, &mut |hash, bytes| {
+            let mut raw = blobs.get(&hash).context("missing test blob")?.clone();
+            anyhow::ensure!(raw.len() == bytes && bytes <= MAX_CHUNK_BYTES, "invalid test blob size");
+            if hash == first { raw[0] ^= 1; }
+            Ok(raw)
+        }).expect_err("a corrupted raw cache chunk must not restore");
+        assert!(error.to_string().contains("content hash mismatch"), "{error:#}");
+        assert!(session.torn && session.caches.is_empty());
+        assert_eq!(session.position(), 0);
+        assert_eq!(session.next_token(), None);
+        assert!(session.cache_identity().is_err(), "a failed restore remained usable");
+
+        session.reset();
+        session.validate_cache(&checkpoint)?;
+        session.restore_cache(&checkpoint, &mut |hash, bytes| {
+            let raw = blobs.get(&hash).context("missing test blob")?;
+            anyhow::ensure!(raw.len() == bytes && bytes <= MAX_CHUNK_BYTES, "invalid test blob size");
+            Ok(raw.clone())
+        })?;
+        assert_eq!(session.position(), prefix_rows);
+        assert_eq!(session.next_token(), checkpoint.last_prediction);
+        assert_eq!(session.validate_cache_completeness()?, 2);
+        assert_eq!(save(&session, &mut blobs, &mut held)?, checkpoint,
+            "restoring the prefix changed packed KV, histories, or page metadata");
+        let actual_prediction = session.extend(&tail)?;
+        assert_eq!(actual_prediction, expected_prediction);
+        let actual = save(&session, &mut blobs, &mut held)?;
+        assert_eq!(actual, expected,
+            "identical explicit tail changed complete KV/history state after restore");
+        eprintln!("portable Session cache: layers=0..2 prefix_rows={prefix_rows} local_window={window} tail_rows={TAIL} prediction={actual_prediction} distinct_payload_bytes={held}");
+        Ok(())
+    }
 
     #[test]
     #[cfg(feature = "inkling-cuda")]
