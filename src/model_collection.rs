@@ -25,6 +25,7 @@ use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit
 use triblespace::core::collection::{
     AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
     CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt, Support,
+    read_capability, write_capability,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
@@ -136,9 +137,24 @@ fn named_collections_from_handles(
         if &*name != wanted {
             continue;
         }
-        match ModelCollection::open(store, handle) {
-            Ok(collection) => collections.push(collection),
-            Err(_) => retired.push(handle),
+        // Opening checks the member encoding, not the policy vocabulary.
+        // Older descriptors can still name SimpleArchive while their policy
+        // links are no longer understood. Keep them out of current discovery
+        // so an additive migration can coexist with its original records.
+        // Do not filter by admitted support: a current, empty collection is
+        // still current, including when this snapshot admits no writer.
+        // Ordinary policy admission accepts supported alternatives; the scalar
+        // descriptor inspector would incorrectly reject plural policy bindings.
+        let has_current_policies = [read_capability(), write_capability()]
+            .into_iter()
+            .all(|capability| {
+                descriptor::admission_policies(&facts, capability, Some(SimpleArchive::id()))
+                    .next()
+                    .is_some()
+            });
+        match (ModelCollection::open(store, handle), has_current_policies) {
+            (Ok(collection), true) => collections.push(collection),
+            _ => retired.push(handle),
         }
     }
     collections.sort_unstable();
@@ -877,5 +893,161 @@ pub fn project_legacy_model_attributes(facts: &TribleSet) -> ModelAttributeProje
         historical_facts,
         aliases_added,
         mappings,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::OpenOptions;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use triblespace::core::capability::policy::resource_policy;
+    use triblespace::core::collection::records::{
+        KIND_COLLECTION_DESCRIPTOR, collection_name, collection_representation,
+    };
+    use triblespace::core::repo::pile::Pile;
+
+    use super::*;
+
+    static NEXT_TEST_PILE: AtomicU64 = AtomicU64::new(0);
+
+    struct TestPile(PathBuf);
+
+    impl TestPile {
+        fn new() -> Self {
+            let ordinal = NEXT_TEST_PILE.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "mary-collection-discovery-{}-{nanos}-{ordinal}.pile",
+                std::process::id()
+            ));
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+                .expect("create isolated collection discovery pile");
+            Self(path)
+        }
+    }
+
+    impl Drop for TestPile {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    #[test]
+    fn named_collection_discovery_accepts_supported_plural_policies() {
+        let path = TestPile::new();
+        let mut pile = Pile::open(&path.0).unwrap();
+        let first = SigningKey::from_bytes(&[0x71; 32]);
+        let second = SigningKey::from_bytes(&[0x72; 32]);
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_name: mary_model_graph_name().to_owned(),
+            collection_representation: SimpleArchive::id(),
+            resource_policy*: AdmissionPolicy::direct(first.verifying_key()).binding(read_capability())
+                + AdmissionPolicy::direct(second.verifying_key()).binding(read_capability()),
+            resource_policy*: AdmissionPolicy::direct(first.verifying_key()).binding(write_capability())
+                + AdmissionPolicy::direct(second.verifying_key()).binding(write_capability()),
+        };
+        // The scalar inspector is deliberately stricter than ordinary
+        // admission. Discovery must not substitute it for supported rows.
+        assert!(descriptor::policy(descriptor.facts()).is_err());
+        for capability in [read_capability(), write_capability()] {
+            assert_eq!(
+                descriptor::admission_policies(
+                    descriptor.facts(),
+                    capability,
+                    Some(SimpleArchive::id()),
+                )
+                .count(),
+                2,
+            );
+        }
+        let collection = pile
+            .register_collection::<SimpleArchive>(descriptor)
+            .unwrap();
+        let a = entity! { metadata::name: "first admitted leaf" };
+        let b = entity! { metadata::name: "second admitted leaf" };
+        let expected = a.facts().clone() + b.facts().clone();
+        pile.commit(collection, &first, a).unwrap();
+        pile.commit(collection, &second, b).unwrap();
+
+        let snapshot = pile.snapshot().unwrap();
+        let (current, retired) = named_collections_from_handles(
+            &snapshot,
+            mary_model_graph_name(),
+            [collection.handle()],
+        );
+        assert_eq!(current, vec![collection]);
+        assert!(retired.is_empty());
+        assert_eq!(
+            model_graph_collections_in(&snapshot).unwrap(),
+            vec![collection],
+        );
+        let materialized = snapshot_model_collection_in(&snapshot).unwrap();
+        assert_eq!(materialized.facts(), &expected);
+        assert_eq!(materialized.support().len(), 2);
+        drop(materialized);
+        drop(snapshot);
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn named_collection_discovery_keeps_current_collection_without_admitted_commits() {
+        let path = TestPile::new();
+        let mut pile = Pile::open(&path.0).unwrap();
+        let root = SigningKey::from_bytes(&[0x73; 32]);
+        let outsider = SigningKey::from_bytes(&[0x74; 32]);
+        let collection = pile
+            .collection(
+                mary_model_bundle_name(),
+                direct_model_policy(root.verifying_key()),
+            )
+            .unwrap();
+
+        // Even before any COMMIT references it, an explicitly supplied
+        // current descriptor is not retired just because its support is empty.
+        let snapshot = pile.snapshot().unwrap();
+        let (current, retired) = named_collections_from_handles(
+            &snapshot,
+            mary_model_bundle_name(),
+            [collection.handle()],
+        );
+        assert_eq!(current, vec![collection]);
+        assert!(retired.is_empty());
+        assert!(collection.admitted(&snapshot).unwrap().is_empty());
+        drop(snapshot);
+
+        // A valid signed claim supplies a discovery reference, not WRITE
+        // authorization. This snapshot still admits no committed data.
+        let claim = pile
+            .commit(
+                collection,
+                &outsider,
+                entity! { metadata::name: "unadmitted leaf" },
+            )
+            .unwrap();
+        claim.verify_strict().unwrap();
+        let snapshot = pile.snapshot().unwrap();
+        assert!(!collection
+            .writer_is_admitted(&snapshot, outsider.verifying_key())
+            .unwrap());
+        assert_eq!(
+            model_bundle_collections_in(&snapshot).unwrap(),
+            vec![collection],
+        );
+        let materialized = snapshot_model_bundle_collection_in(&snapshot).unwrap();
+        assert!(materialized.support().is_empty());
+        assert!(materialized.facts().is_empty());
+        drop(materialized);
+        drop(snapshot);
+        pile.close().unwrap();
     }
 }
