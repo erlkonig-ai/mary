@@ -7,6 +7,11 @@
 //! root, and publishes the resulting union as one native model-collection
 //! commit. It never pushes, creates, deletes, or otherwise advances a branch.
 //!
+//! The policy-transfer bridge likewise preserves exact retired descriptors
+//! and COMMIT records. It recognizes only the audited pre-authority,
+//! mandatory-authority, and identical direct independent-policy Mary shapes;
+//! it re-signs only valid claims authored by the descriptor's single root.
+//!
 //! Storage policy stays with the caller: this crate takes an already-open
 //! [`Pile`], never reopens it, and neither flushes nor closes it. The caller
 //! supplies the signing key and chooses the explicit durability boundary.
@@ -70,6 +75,21 @@ mod retired_collection {
         /// encoding has always participated in the attribute identity.
         "7C31D328E9C369CCB6049D05CC8E8C77" as pub collection_authority:
             ED25519PublicKey;
+    }
+}
+
+/// Published independent READ/WRITE policy links before capability-handle
+/// bindings replaced them in Core cd8b2b7208b85bcb4de6169167a9bad07048e909.
+/// These are the original safe anchors and GenId encodings from that commit's
+/// parent, not new attributes or a runtime policy compatibility layer.
+mod independent_policy_collection {
+    use super::*;
+
+    attributes! {
+        "4108A59A03E8F8EC9DCDCC3C8597A292" as pub collection_read_policy:
+            inlineencodings::GenId;
+        "06930EAD5B83C83A30B6061B53A2840B" as pub collection_write_policy:
+            inlineencodings::GenId;
     }
 }
 
@@ -265,6 +285,16 @@ fn retired_collection_descriptor(name: &str, authority: VerifyingKey) -> Fragmen
     }
 }
 
+fn independent_policy_collection_descriptor(name: &str, policy: &CollectionPolicy) -> Fragment {
+    entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_name: name.to_owned(),
+        independent_policy_collection::collection_read_policy*: policy.read().fragment(),
+        independent_policy_collection::collection_write_policy*: policy.write().fragment(),
+        collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+    }
+}
+
 fn preauthority_union_recipe_description() -> Fragment {
     let id = preauthority_collection::TRIBLE_SET_UNION_RECIPE_V1;
     entity! {
@@ -304,6 +334,52 @@ fn decode_exact_retired_collection(
         .context("decode retired collection descriptor SimpleArchive")?;
     let descriptor = triblespace::core::collection::descriptor::entity(&facts)
         .context("find retired collection descriptor entity")?;
+    if exists!((policy: Id), or!(
+        pattern!(&facts, [{ descriptor @
+            independent_policy_collection::collection_read_policy: ?policy,
+        }]),
+        pattern!(&facts, [{ descriptor @
+            independent_policy_collection::collection_write_policy: ?policy,
+        }]),
+    )) {
+        // This bridge recognizes only the historical Mary constructor:
+        // identical direct, single-root READ and WRITE policies. A matching
+        // root row is just a candidate; the complete descriptor hash below
+        // also proves the thresholds, policy kinds, name, representation,
+        // intrinsic identities, and absence of extra facts. In particular we
+        // do not collapse independent roots, open policies, quorums, or
+        // delegation evidence into an assumed root-only authorization law.
+        let roots = find!(root: Inline<ED25519PublicKey>, pattern!(&facts, [
+            { descriptor @
+                independent_policy_collection::collection_read_policy: _?policy,
+                independent_policy_collection::collection_write_policy: _?policy,
+            },
+            { _?policy @
+                triblespace::core::capability::policy::admission_policy_root: ?root,
+            },
+        ]))
+        .collect::<Vec<_>>();
+        let [root] = roots.as_slice() else {
+            bail!("source is not the exact direct independent-policy Mary descriptor");
+        };
+        let authority = VerifyingKey::from_bytes(&root.raw)
+            .context("independent-policy collection root is invalid")?;
+        // Use the fallible constructor: Ed25519 decoding alone does not
+        // reject every noncanonical or weak capability principal.
+        let admission = AdmissionPolicy::quorum([authority], 1, None)
+            .context("independent-policy collection root is not a usable principal")?;
+        let policy = CollectionPolicy::new(admission.clone(), admission);
+        let expected = collection_descriptor_handle(&independent_policy_collection_descriptor(
+            kind.name(),
+            &policy,
+        ));
+        anyhow::ensure!(
+            expected == source,
+            "source is not the exact direct independent-policy Mary descriptor for {:?}",
+            kind.name(),
+        );
+        return Ok(authority);
+    }
     let authorities = facts
         .iter()
         .filter(|fact| {
@@ -469,6 +545,8 @@ fn prepare_policy_transfer(
 /// copied. A source with no COMMITs still registers its current descriptor.
 /// MERGE and DERIVE records are deliberately left as rebuildable cache
 /// exhaust. Replay is idempotent because exact successor records form a set.
+/// Independent-policy predecessors must have the same direct single-root
+/// policy for both actions; other policy geometries are not silently adopted.
 pub fn transfer_retired_model_collection(
     pile: &mut Pile,
     signing_key: &SigningKey,
@@ -1129,8 +1207,9 @@ mod tests {
     use super::*;
     use mary::format::{F32Array, U64Array};
     use mary::model_collection::{
-        local_model_support, model_bundle_collections_in, publish_model_bundle_fragment,
-        snapshot_model_bundle_collection_exact, snapshot_model_collection_for,
+        local_model_support, model_bundle_collections_in, model_graph_collections_in,
+        publish_model_bundle_fragment, snapshot_model_bundle_collection_exact,
+        snapshot_model_collection_for, snapshot_model_collection_named_in,
     };
 
     static NEXT_TEMP_PILE: AtomicU64 = AtomicU64::new(0);
@@ -1705,6 +1784,278 @@ mod tests {
             collection_descriptor_handle(&descriptor).raw,
             bytes32("dd89e395ddc466e3ff5e9d002e4e7feef4b0055fb55c6cbdd9e9d3a3e96b0417"),
         );
+    }
+
+    #[test]
+    fn independent_policy_descriptor_reconstructs_the_frozen_inkling_identity() {
+        // Descriptor census of inkling-small-complete-policy-20260831.pile:
+        // 704 bytes / 11 facts, two old action links to one direct policy.
+        // This test never opens the production checkpoint.
+        let authority = VerifyingKey::from_bytes(&bytes32(
+            "622f1356348389185f3bc07e04ad0de50bdb4344194522b850271d5b42a22609",
+        ))
+        .unwrap();
+        let descriptor = independent_policy_collection_descriptor(
+            ModelCollectionKind::Graph.name(),
+            &direct_policy(authority),
+        );
+        assert_eq!(descriptor.facts().len(), 11);
+        assert_eq!(
+            collection_descriptor_handle(&descriptor).raw,
+            bytes32("47f12177261336552ea95058671a5c77b27ee28056ed054a177d451ee7ba83a3"),
+        );
+    }
+
+    #[test]
+    fn independent_policy_transfer_preserves_evidence_admits_leaves_and_replays_exactly() {
+        for kind in [ModelCollectionKind::Graph, ModelCollectionKind::Bundle] {
+            let path = TempPilePath::new("independent-policy-transfer");
+            let old = key(0x61);
+            let new = key(0x62);
+            let descriptor = independent_policy_collection_descriptor(
+                kind.name(),
+                &direct_policy(old.verifying_key()),
+            );
+            let mut pile = Pile::open(path.path()).unwrap();
+            let source = put_descriptor(&mut pile, &descriptor);
+            let mut retired = Vec::new();
+            let mut expected_facts = TribleSet::new();
+            for marker in [0x63, 0x64] {
+                let facts = entity! { metadata::tag: test_id(marker) }.into_facts();
+                let metadata = pile
+                    .put::<blobencodings::SimpleArchive, _>(entity! {
+                        metadata::name: format!("source evidence {marker}"),
+                    })
+                    .unwrap();
+                let data_handle = pile
+                    .put::<blobencodings::SimpleArchive, _>(facts.clone())
+                    .unwrap();
+                expected_facts += facts;
+                let data =
+                    inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(data_handle);
+                let commit = CollectionCommit::sign(&old, source, data, metadata);
+                pile.insert(CollectionRecord::Commit(commit)).unwrap();
+                retired.push(commit);
+            }
+            let before = std::fs::read(path.path()).unwrap();
+            let snapshot = pile.snapshot().unwrap();
+            let historical = ModelCollection::open(&snapshot, source).unwrap();
+            assert!(historical.admitted(&snapshot).unwrap().is_empty());
+            let discovery = match kind {
+                ModelCollectionKind::Graph => model_graph_collections_in(&snapshot),
+                ModelCollectionKind::Bundle => model_bundle_collections_in(&snapshot),
+            };
+            assert!(discovery
+                .unwrap_err()
+                .to_string()
+                .contains("found only retired descriptors"));
+            drop(snapshot);
+
+            let first = transfer_retired_model_collection(&mut pile, &new, source, kind).unwrap();
+            assert_eq!(first.source_authority, old.verifying_key());
+            assert_ne!(first.collection.handle(), source);
+            assert_eq!(first.appended_commits, retired.len());
+            let successors: BTreeSet<_> = retired
+                .iter()
+                .map(|commit| {
+                    CollectionCommit::sign(
+                        &new,
+                        first.collection.handle(),
+                        commit.data(),
+                        commit.metadata(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                first.commits.iter().copied().collect::<BTreeSet<_>>(),
+                successors,
+            );
+            assert!(std::fs::read(path.path()).unwrap().starts_with(&before));
+
+            let snapshot = pile.snapshot().unwrap();
+            let source_blob: Blob<blobencodings::SimpleArchive> = snapshot.get(source).unwrap();
+            assert_eq!(
+                &TribleSet::try_from_blob(source_blob).unwrap(),
+                descriptor.facts(),
+            );
+            let records: Vec<_> = snapshot.records().unwrap().map(Result::unwrap).collect();
+            for commit in &retired {
+                assert!(records.contains(&CollectionRecord::Commit(*commit)));
+            }
+            let discovered = match kind {
+                ModelCollectionKind::Graph => model_graph_collections_in(&snapshot),
+                ModelCollectionKind::Bundle => model_bundle_collections_in(&snapshot),
+            }
+            .unwrap();
+            assert_eq!(discovered, vec![first.collection]);
+            // Ordinary admission remains unchanged: old links admit nothing,
+            // while the explicit successor descriptor admits precisely the
+            // re-signed data leaves under its new capability policy.
+            assert!(historical.admitted(&snapshot).unwrap().is_empty());
+            let materialized = snapshot_model_collection_named_in(&snapshot, kind.name()).unwrap();
+            assert_eq!(materialized.facts(), &expected_facts);
+            assert_eq!(materialized.support().len(), retired.len());
+            drop(materialized);
+            drop(snapshot);
+
+            let after = std::fs::read(path.path()).unwrap();
+            let replay = transfer_retired_model_collection(&mut pile, &new, source, kind).unwrap();
+            assert_eq!(replay.commits, first.commits);
+            assert_eq!(replay.appended_commits, 0);
+            assert_eq!(std::fs::read(path.path()).unwrap(), after);
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn independent_policy_transfer_rejects_other_policy_geometries_before_publication() {
+        let old = key(0x65).verifying_key();
+        let other = key(0x66).verifying_key();
+        let policies = [
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::direct(old)),
+            CollectionPolicy::new(AdmissionPolicy::direct(old), AdmissionPolicy::direct(other)),
+            CollectionPolicy::new(
+                AdmissionPolicy::delegable(old),
+                AdmissionPolicy::delegable(old),
+            ),
+            CollectionPolicy::new(
+                AdmissionPolicy::quorum([old, other], 2, None).unwrap(),
+                AdmissionPolicy::quorum([old, other], 2, None).unwrap(),
+            ),
+        ];
+        for policy in policies {
+            let path = TempPilePath::new("independent-policy-other-geometry");
+            let mut pile = Pile::open(path.path()).unwrap();
+            let descriptor =
+                independent_policy_collection_descriptor(ModelCollectionKind::Graph.name(), &policy);
+            let source = put_descriptor(&mut pile, &descriptor);
+            assert_policy_transfer_fails_before_publication(
+                &mut pile,
+                path.path(),
+                &key(0x67),
+                source,
+                ModelCollectionKind::Graph,
+                "source is not the exact direct independent-policy Mary descriptor",
+            );
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn independent_policy_transfer_rejects_extensions_and_wrong_kind_before_publication() {
+        let base = independent_policy_collection_descriptor(
+            ModelCollectionKind::Graph.name(),
+            &direct_policy(key(0x68).verifying_key()),
+        );
+        let mut extended = base.clone();
+        let root = base.root().unwrap();
+        extended += entity! {
+            ExclusiveId::force_ref(&root) @ metadata::description: "unexpected extension",
+        };
+        let mut extra_entity = base.clone();
+        extra_entity += entity! { metadata::name: "unlinked policy evidence" };
+        for (descriptor, kind) in [
+            (extended, ModelCollectionKind::Graph),
+            (extra_entity, ModelCollectionKind::Graph),
+            (base, ModelCollectionKind::Bundle),
+        ] {
+            let path = TempPilePath::new("independent-policy-wrong-shape");
+            let mut pile = Pile::open(path.path()).unwrap();
+            let source = put_descriptor(&mut pile, &descriptor);
+            assert_policy_transfer_fails_before_publication(
+                &mut pile,
+                path.path(),
+                &key(0x69),
+                source,
+                kind,
+                "source is not the exact direct independent-policy Mary descriptor",
+            );
+            pile.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn independent_policy_transfer_rejects_a_weak_root_without_panicking() {
+        use triblespace::core::capability::policy::{
+            admission_invoke_threshold, admission_policy_root, KIND_ADMISSION_POLICY_QUORUM,
+        };
+
+        let mut identity = [0_u8; 32];
+        identity[0] = 1;
+        let weak = VerifyingKey::from_bytes(&identity).unwrap();
+        let policy = entity! {
+            metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
+            admission_policy_root: weak,
+            admission_invoke_threshold: 1_u32,
+        };
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_name: ModelCollectionKind::Graph.name().to_owned(),
+            independent_policy_collection::collection_read_policy*: policy.clone(),
+            independent_policy_collection::collection_write_policy*: policy,
+            collection_representation*: <blobencodings::SimpleArchive as MetaDescribe>::describe(),
+        };
+        let path = TempPilePath::new("independent-policy-weak-root");
+        let mut pile = Pile::open(path.path()).unwrap();
+        let source = put_descriptor(&mut pile, &descriptor);
+        assert_policy_transfer_fails_before_publication(
+            &mut pile,
+            path.path(),
+            &key(0x6E),
+            source,
+            ModelCollectionKind::Graph,
+            "independent-policy collection root is not a usable principal",
+        );
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn independent_policy_transfer_rejects_invalid_and_non_root_commits_before_publication() {
+        for invalid_signature in [false, true] {
+            let path = TempPilePath::new("independent-policy-invalid-source");
+            let old = key(0x6A);
+            let other = key(0x6B);
+            let new = key(0x6C);
+            let descriptor = independent_policy_collection_descriptor(
+                ModelCollectionKind::Graph.name(),
+                &direct_policy(old.verifying_key()),
+            );
+            let mut pile = Pile::open(path.path()).unwrap();
+            let source = put_descriptor(&mut pile, &descriptor);
+            let metadata = pile
+                .put::<blobencodings::SimpleArchive, _>(TribleSet::new())
+                .unwrap();
+            let data_handle = pile
+                .put::<blobencodings::SimpleArchive, _>(entity! { metadata::tag: test_id(0x6D) })
+                .unwrap();
+            let data = inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(data_handle);
+            let valid = CollectionCommit::sign(&old, source, data, metadata);
+            pile.insert(CollectionRecord::Commit(valid)).unwrap();
+            let rejected = if invalid_signature {
+                let mut bytes = valid.to_bytes();
+                bytes[5 * 32] ^= 1;
+                CollectionCommit::from_bytes(bytes)
+            } else {
+                let commit = CollectionCommit::sign(&other, source, data, metadata);
+                commit.verify_strict().unwrap();
+                commit
+            };
+            pile.insert(CollectionRecord::Commit(rejected)).unwrap();
+            assert_policy_transfer_fails_before_publication(
+                &mut pile,
+                path.path(),
+                &new,
+                source,
+                ModelCollectionKind::Graph,
+                if invalid_signature {
+                    "invalid signature"
+                } else {
+                    "authored by a non-root writer"
+                },
+            );
+            pile.close().unwrap();
+        }
     }
 
     #[test]
