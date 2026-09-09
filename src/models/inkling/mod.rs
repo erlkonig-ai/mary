@@ -51,6 +51,7 @@ pub mod seam;
 // per-buffer cap is `budget`; this is the other thing the allocator does, which
 // is to reserve three to five times what the prefill holds.
 pub mod pool;
+pub(crate) mod host_trace;
 // The residual stream: the switch that decides its dtype, and the two kernels
 // -- the residual add and RMS normalization -- that let it be BF16 without
 // widening back at every seam. It was the last wide storage in an otherwise

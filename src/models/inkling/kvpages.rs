@@ -1925,6 +1925,7 @@ impl<B: Backend> KvStore<B> {
 
     /// Drop `n` rows from the FRONT — the sliding window advancing.
     pub fn drop_front(&mut self, n: usize) {
+        let _trace = super::host_trace::span("kv_drop_front");
         match self {
             Self::Wide(s) => s.drop_front(n),
             Self::Fp4(s) => s.drop_front(n),
@@ -1934,6 +1935,7 @@ impl<B: Backend> KvStore<B> {
     /// Remove `n` logical rows starting at `from` — an eviction. See
     /// [`Pages::remove`].
     pub fn remove(&mut self, from: usize, n: usize) {
+        let _trace = super::host_trace::span("kv_remove");
         match self {
             Self::Wide(s) => s.remove(from, n),
             Self::Fp4(s) => s.remove(from, n),
@@ -1974,6 +1976,7 @@ impl<B: Backend> KvStore<B> {
 
     /// Truncate to `keep` logical rows — a speculative batch being rejected.
     pub fn truncate(&mut self, keep: usize) {
+        let _trace = super::host_trace::span("kv_truncate");
         match self {
             Self::Wide(s) => s.truncate(keep),
             Self::Fp4(s) => s.truncate(keep),
@@ -2125,6 +2128,7 @@ impl KvStore<Bk> {
         epoch: usize,
         dev: &burn::backend::cuda::CudaDevice,
     ) -> Self {
+        let _trace = super::host_trace::span("kv_reserve");
         match self {
             Self::Wide(s) => Self::Wide(s.into_reserved(rows, epoch, dev)),
             Self::Fp4(s) => Self::Fp4(s.into_reserved(rows, epoch, dev)),
@@ -2143,6 +2147,7 @@ impl KvStore<Bk> {
 
     /// Append `rows`, quantizing first on the NVFP4 arm.
     pub fn append(&mut self, rows: Tensor<Bk, 2>) {
+        let _trace = super::host_trace::span("kv_append_quantize");
         match self {
             Self::Wide(s) => s.append(rows),
             Self::Fp4(s) => s.append(rows),

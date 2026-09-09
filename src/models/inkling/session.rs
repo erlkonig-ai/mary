@@ -114,6 +114,7 @@ use super::assembly::{
 };
 use super::attn::{AttnDims, LogScaling};
 use super::config::{AttnKind, InklingConfig};
+use super::host_trace;
 use super::pile::Elem;
 use super::pool::{CleanupGate, CleanupPolicy};
 use super::source::Weights;
@@ -136,38 +137,6 @@ pub use sequence::Sequence;
 fn next_seq() -> u64 {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Opt-in host wall time, not GPU elapsed time. Wraps only calls the pool gate
-/// already makes: tracing must not add a poll or a device synchronization.
-/// Only INK_HOST_STALL_TRACE=1 enables it. Completed calls of at least 100 ms
-/// are emitted; process-wide counters include all completed pool calls, even
-/// fast ones. No per-poll begin line on a million-token prefill's hot path.
-fn trace_pool_call<T>(layer: usize, phase: &str, call: impl FnOnce() -> T) -> T {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("INK_HOST_STALL_TRACE")
-        .map(|v| v == "1").unwrap_or(false))
-    {
-        return call();
-    }
-    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static SLOW_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static HOST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    use std::sync::atomic::Ordering::Relaxed;
-    let start = std::time::Instant::now();
-    let result = call();
-    let elapsed = start.elapsed();
-    let calls_total = COUNT.fetch_add(1, Relaxed) + 1;
-    let ns = elapsed.as_nanos().min(u64::MAX as u128) as u64;
-    let host_ns_total = HOST_NS.fetch_add(ns, Relaxed).saturating_add(ns);
-    if elapsed >= std::time::Duration::from_millis(100) {
-        let slow_calls_total = SLOW_COUNT.fetch_add(1, Relaxed) + 1;
-        let end_unix_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis();
-        eprintln!("[session-host-stall] end_unix_ms={end_unix_ms} pid={} layer={layer} phase=session_pool_{phase} host_seconds={:.6} calls_total={calls_total} slow_calls_total={slow_calls_total} host_seconds_total={:.6} timing=host_call_not_gpu counters=all_pool_phases",
-            std::process::id(), elapsed.as_secs_f64(), host_ns_total as f64 / 1e9);
-    }
-    result
 }
 
 /// `(base, len)` of the complete cache a layer must hold at `position`.
@@ -2280,6 +2249,11 @@ impl Session {
     /// any error, and it can only do that if the errors have somewhere to
     /// return to.
     fn forward_pass(&mut self, ids: &[usize], mode: PassMode) -> Result<PassOutput> {
+        let _trace_context = host_trace::pass(self.pos, ids.len(),
+            self.group.as_ref().map_or(0, |group| group.tp().rank()));
+        // Declared first so the inclusive span also sees end-of-pass tensor
+        // drops. These guards hold only timestamps/context, never GPU handles.
+        let _trace_forward = host_trace::span("forward_pass");
         let t = &self.cfg.text_config;
         let h = t.hidden_size;
         let n = ids.len();
@@ -2305,6 +2279,7 @@ impl Session {
 
         // The embedding is a host gather over the stored BF16, normed on the
         // host, and uploaded once. It is the only host arithmetic left in a pass.
+        let trace_embedding = host_trace::span("embedding_media_upload");
         let x_in = embed_and_norm_bf16(
             ids,
             &self.embed,
@@ -2326,6 +2301,7 @@ impl Session {
             None => x_in,
         };
         let mut xd: T2 = dev_lane_resid::as_resid(up2::<Bk>(x_in, n, h, &self.dev));
+        drop(trace_embedding);
 
         // Read once per pass, exactly as the binary does: `RouterArm::from_env`
         // is a `OnceLock` behind an env var and the arm cannot change under a
@@ -2334,6 +2310,9 @@ impl Session {
         let t_read = std::cell::Cell::new(0f64);
 
         for layer in self.lo..self.hi {
+            let _trace_layer_context = host_trace::layer(layer);
+            // Inclusive of temporaries dropped at this iteration's end.
+            let _trace_layer = host_trace::span("layer_total");
             let mut tp_calls = 0usize;
             // Cache SLOT, not layer number. A rank running 20..42 keeps 22
             // caches and its first layer is slot 0 — indexing by the absolute
@@ -2354,6 +2333,7 @@ impl Session {
             let p = format!("model.llm.layers.{layer}.");
 
             if !self.layers.contains_key(&p) {
+                let _trace_bind = host_trace::span("layer_bind");
                 let b = bind_layer(
                     &self.src,
                     &self.dev,
@@ -2373,6 +2353,7 @@ impl Session {
             let shared_halved = self.shared_halved;
 
             // ---- attention ------------------------------------------------
+            let trace_attention = host_trace::span("attention_block");
             let hn = dev_lane_resid::rms_norm(xd.clone(), ld.attn_norm.clone(), t.rms_norm_eps);
             let dims = AttnDims {
                 hidden: h,
@@ -2505,13 +2486,16 @@ impl Session {
                 }
             };
             xd = dev_lane_resid::add_resid(xd, a);
+            drop(trace_attention);
 
             // ---- MLP ------------------------------------------------------
+            let trace_mlp = host_trace::span("mlp_block");
             let hn = dev_lane_resid::rms_norm(xd.clone(), ld.mlp_norm.clone(), t.rms_norm_eps);
             #[cfg(feature = "inkling-cuda")]
             let mlp_sconv_taps = ld.mlp_sconv.clone();
             let y = match t.is_dense(layer) {
                 true => {
+                    let _trace_dense = host_trace::span("dense_forward");
                     let w = self.dense.dense_for(
                         &self.src,
                         &self.client,
@@ -2523,6 +2507,9 @@ impl Session {
                     dense_mlp_bf16(hn, w)
                 }
                 false => {
+                    // Includes the MoE lane's existing host routing readbacks,
+                    // expert binding and enqueue work; adds no readback itself.
+                    let _trace_moe = host_trace::span("moe_forward");
                     let r = ld.router.as_ref().expect("a MoE layer has a router");
                     // The router's PROJECTION is a matmul and runs on the
                     // device; its DECISION is control plane. On the default lane
@@ -2615,6 +2602,7 @@ impl Session {
                 keep.hist0 = mlp_hist0;
             }
             xd = dev_lane_resid::add_resid(xd, out);
+            drop(trace_mlp);
 
             let expected = if group.is_some() { 2 } else { 0 };
             assert_eq!(
@@ -2631,7 +2619,7 @@ impl Session {
             // global-cache size it has visited.
             let last_layer = layer + 1 == self.hi;
             let client = &self.client;
-            let want_cleanup = self.cleanup_gate.at_layer(last_layer, || trace_pool_call(layer, "poll", || {
+            let want_cleanup = self.cleanup_gate.at_layer(last_layer, || host_trace::call("pool_poll", || {
                 client
                     .memory_usage()
                     .map(|usage| {
@@ -2644,11 +2632,11 @@ impl Session {
                     .unwrap_or(0)
             }));
             if want_cleanup {
-                trace_pool_call(layer, "sync", || {
+                host_trace::call("pool_sync", || {
                     <Bk as burn::tensor::backend::Backend>::sync(&self.dev)
                         .expect("sync before Session pool cleanup");
                 });
-                trace_pool_call(layer, "cleanup", || self.client.memory_cleanup());
+                host_trace::call("pool_cleanup", || self.client.memory_cleanup());
             }
         }
 
@@ -2659,6 +2647,7 @@ impl Session {
         // to find its accepted prefix. The explicit target path pays that wider
         // head; the default path keeps slicing before the projection, where the
         // difference is a 16 KB GEMM versus an `n x 200058` one.
+        let _trace_head = host_trace::span("head_total");
         let eps = t.rms_norm_eps;
         let mup = t.logits_mup_width_multiplier as f32;
         let vocab = t.effective_vocab();
@@ -2666,6 +2655,7 @@ impl Session {
         let final_norm = &self.final_norm;
         let forbidden = &self.forbidden;
         let head = |hx: T2| -> T2 {
+            let _trace_projection = host_trace::span("head_projection");
             let hs = dev_lane_resid::rms_norm(hx, final_norm.clone(), eps).div_scalar(mup);
             let rows = hs.dims()[0];
             let mut logits = dev_lane::linear_w(hs, uw).slice([0..rows, 0..vocab]);
@@ -2693,7 +2683,7 @@ impl Session {
             }
             PassMode::Commit => {
                 let logits = head(xd.clone().slice([n - 1..n, 0..h]));
-                let best = argmax_row_dev(logits.clone());
+                let best = host_trace::call("prediction_readback", || argmax_row_dev(logits.clone()));
                 // A one-row commit is a token she generated: keep the row and
                 // the distribution it was drawn from, for the anchor at the
                 // next scored pass. Wider commits are context, not hers.
@@ -2748,14 +2738,15 @@ impl Session {
                     let logits = head(xd.clone().slice([lo..hi, 0..h]));
                     let scored = targets.len().min(hi) - lo;
                     if scored > 0 {
-                        nll.extend(row_nll_dev(
+                        nll.extend(host_trace::call("score_readback", || row_nll_dev(
                             logits.clone().slice([0..scored, 0..vocab]),
                             &targets[lo..lo + scored],
-                        ));
+                        )));
                     }
                     if hi == n {
                         let last = hi - lo - 1;
-                        best = Some(argmax_row_dev(logits.slice([last..last + 1, 0..vocab])));
+                        best = Some(host_trace::call("prediction_readback", ||
+                            argmax_row_dev(logits.slice([last..last + 1, 0..vocab]))));
                     }
                     lo = hi;
                 }
@@ -2996,7 +2987,10 @@ impl Session {
                     },
                 })
             }
-            PassMode::Target => Ok(PassOutput::Target(argmax_rows_dev(head(xd)))),
+            PassMode::Target => {
+                let logits = head(xd);
+                Ok(PassOutput::Target(host_trace::call("prediction_readback", || argmax_rows_dev(logits))))
+            }
         }
     }
 }

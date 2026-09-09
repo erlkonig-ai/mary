@@ -1255,6 +1255,7 @@ impl<B: Backend> AttnCache<B> {
     /// Idempotent and safe with no batch outstanding — it still trims, which is
     /// what makes it correct to call after every verify pass.
     pub fn commit(&mut self, keep: usize, window: Option<usize>) {
+        let _trace = super::host_trace::span("attention_commit_histories");
         if let Some(p) = self.pending.take() {
             assert!(keep <= p.rows, "kept {keep} of a {}-row batch", p.rows);
             let drop = p.rows - keep;
