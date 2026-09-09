@@ -763,6 +763,24 @@ fn distillation_recipe(
     })
 }
 
+/// Durable cache preparation and live cover initialization share inference,
+/// not RAM rewind ownership. Cache-only warmup exits instead of refreshing a
+/// live cover; retaining tensor clones there only pins obsolete allocations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrefixMode {
+    WarmupOnly,
+    LivePrefix,
+}
+
+impl PrefixMode {
+    fn checkpoint(self, take: impl FnOnce() -> Result<()>) -> Result<()> {
+        match self {
+            Self::WarmupOnly => Ok(()),
+            Self::LivePrefix => take(),
+        }
+    }
+}
+
 // ── the engine ──────────────────────────────────────────────────────────────
 
 impl Engine {
@@ -775,7 +793,9 @@ impl Engine {
         on_progress: &mut dyn FnMut(&WarmupProgress),
     ) -> Result<WarmupReport> {
         anyhow::ensure!(!self.terminated && self.session.position() == 0 && self.turn == 0
-            && self.delta.is_empty() && self.carry.is_none(), "warmup requires an unused engine");
+            && self.delta.is_empty() && self.carry.is_none()
+            && self.checkpoints.is_empty() && self.checkpoint_ends.is_empty(),
+            "warmup requires an unused engine without RAM rewind points");
         anyhow::ensure!(self.cache.is_some() && self.distillation.is_none() && !self.session.learning(),
             "warmup requires a durable cache and an inference-only model");
         anyhow::ensure!(matches!(context, InklingContext::Initialize { .. }),
@@ -785,7 +805,7 @@ impl Engine {
         self.context(context)?;
         let ids = std::mem::take(&mut self.delta);
         self.delta_unscored = false;
-        self.prepare_cached_prefix(&ids, cancelled, on_progress)
+        self.prepare_cached_prefix(&ids, PrefixMode::WarmupOnly, cancelled, on_progress)
     }
 
     fn cache_command(&mut self, command: CacheCommand) -> Result<Vec<Vec<Prefix>>> {
@@ -814,7 +834,7 @@ impl Engine {
         Ok(replies.into_iter().map(|reply| reply.prefixes).collect())
     }
 
-    fn restore_common_prefix(&mut self, ids: &[usize]) -> Result<usize> {
+    fn restore_common_prefix(&mut self, ids: &[usize], mode: PrefixMode) -> Result<usize> {
         anyhow::ensure!(self.session.position() == 0, "resume requires a fresh cache");
         let offers = self.cache_command(CacheCommand::Candidates { limit: ids.len() })?;
         let selected = super::cache_pile::common_prefix(ids, &offers)?;
@@ -822,7 +842,7 @@ impl Engine {
             let start = std::time::Instant::now();
             self.cache_command(CacheCommand::Restore(prefix))?;
             self.agree_sequence()?;
-            self.take_checkpoint(true)?;
+            mode.checkpoint(|| self.take_checkpoint(true))?;
             eprintln!("inkling-cache: restored_tokens={} restore_host_seconds={:.6}",
                 prefix.position, start.elapsed().as_secs_f64());
             return Ok(prefix.position);
@@ -843,6 +863,7 @@ impl Engine {
     fn prepare_cached_prefix(
         &mut self,
         ids: &[usize],
+        mode: PrefixMode,
         cancelled: &dyn Fn() -> bool,
         on_progress: &mut dyn FnMut(&WarmupProgress),
     ) -> Result<WarmupReport> {
@@ -855,7 +876,7 @@ impl Engine {
             on_progress(&WarmupProgress { total_tokens: ids.len(), ..Default::default() });
             return Ok(WarmupReport { total_tokens: ids.len(), cancelled: true, ..Default::default() });
         }
-        let restored = self.restore_common_prefix(ids)?;
+        let restored = self.restore_common_prefix(ids, mode)?;
         let mut progress = WarmupProgress {
             restored_tokens: restored, prepared_tokens: restored,
             saved_tokens: restored, total_tokens: ids.len(),
@@ -879,7 +900,7 @@ impl Engine {
             eprintln!("inkling-warmup: chunk_start={from} chunk_end={to} end_unix_ms={epoch} model_host_seconds={:.6}",
                 start.elapsed().as_secs_f64());
             if to >= next_save || to == ids.len() {
-                self.take_checkpoint(to == ids.len())?;
+                mode.checkpoint(|| self.take_checkpoint(to == ids.len()))?;
                 self.save_prefix(ids, to)?;
                 progress.saved_tokens = to;
                 next_save = next_save.saturating_add(spacing);
@@ -888,7 +909,7 @@ impl Engine {
             was_cancelled = cancelled();
         }
         if progress.prepared_tokens > progress.saved_tokens {
-            self.take_checkpoint(true)?;
+            mode.checkpoint(|| self.take_checkpoint(true))?;
             self.save_prefix(ids, progress.prepared_tokens)?;
             progress.saved_tokens = progress.prepared_tokens;
             on_progress(&progress);
@@ -1255,7 +1276,7 @@ impl Engine {
                 if self.cache.is_some() && self.session.position() == 0
                     && self.carry.is_none() && self.cover_base == 0
                 {
-                    self.prepare_cached_prefix(&ids, &|| false, &mut |_| {})?;
+                    self.prepare_cached_prefix(&ids, PrefixMode::LivePrefix, &|| false, &mut |_| {})?;
                     // A fully restored prefix already has its next prediction.
                     // Extend([]) would Step and silently append an extra token.
                     let first = self.session.next_token().context("prepared prefix has no prediction")?;
@@ -1675,7 +1696,7 @@ impl Model for Engine {
             self.digest = blake3::Hasher::new();
             self.checkpoints.clear();
             self.checkpoint_ends.clear();
-            self.restore_common_prefix(&ids)?
+            self.restore_common_prefix(&ids, PrefixMode::LivePrefix)?
         } else {
             anyhow::bail!("no rewind point at or before position {position}")
         };
@@ -2163,6 +2184,32 @@ mod tests {
     use super::{
         reject_sealed_environment, sealed_environment_rejections, validate_reinitialize_boundary,
     };
+
+    #[test]
+    fn warmup_only_never_requests_ram_rewind_points() {
+        let mut requests = Vec::new();
+        for boundary in ["restore", "periodic_save", "final_or_cancelled_save"] {
+            super::PrefixMode::WarmupOnly.checkpoint(|| {
+                requests.push(boundary);
+                anyhow::bail!("warmup must not request a checkpoint on either rank")
+            }).unwrap();
+        }
+        assert!(requests.is_empty());
+    }
+
+    #[test]
+    fn live_prefix_keeps_every_existing_rewind_boundary_and_error() {
+        let mut requests = Vec::new();
+        let boundaries = ["restore", "periodic_save", "final_or_cancelled_save"];
+        for boundary in boundaries {
+            super::PrefixMode::LivePrefix.checkpoint(|| {
+                requests.push(boundary);
+                Ok(())
+            }).unwrap();
+        }
+        assert_eq!(requests, boundaries);
+        assert!(super::PrefixMode::LivePrefix.checkpoint(|| anyhow::bail!("checkpoint failed")).is_err());
+    }
 
     #[test]
     fn sdft_recipe_uses_optimizer_steps_and_typed_config_not_live_sft() {
