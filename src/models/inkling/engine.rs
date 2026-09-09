@@ -634,6 +634,7 @@ impl Follower {
                     group.send_cuts(&cuts, identity)?;
                 }
                 Pass::Finish => {
+                    if let Some(cache) = self.cache.take() { cache.close()?; }
                     eprintln!("inkling: rank 0 ended the run; this rank is stopping cleanly");
                     return Ok(());
                 }
@@ -649,6 +650,14 @@ impl Follower {
 
     fn fold(&mut self, token: usize) {
         fold_pass(&mut self.digest, token, self.session.position());
+    }
+}
+
+impl Drop for Follower {
+    fn drop(&mut self) {
+        if let Some(cache) = self.cache.take() && let Err(error) = cache.close() {
+            eprintln!("inkling: could not close follower cache on drop: {error:#}");
+        }
     }
 }
 
@@ -1739,12 +1748,16 @@ impl Model for Engine {
     }
 
     fn shutdown(&mut self) -> Result<()> {
-        if self.terminated {
-            return Ok(());
-        }
-        self.terminated = true;
-        self.announce(Pass::Finish)
-            .context("tell the peer rank the run is over")
+        let finish = if self.terminated {
+            Ok(())
+        } else {
+            self.terminated = true;
+            self.announce(Pass::Finish).context("tell the peer rank the run is over")
+        };
+        // Release the peer even if local storage fails to close, and close
+        // locally even when the peer link is already gone after an abort.
+        let close = self.cache.take().map(CacheStore::close).unwrap_or(Ok(()));
+        finish.and(close)
     }
 }
 
@@ -1763,7 +1776,7 @@ impl Model for Engine {
 /// one of them is a clean exit. This makes every early return the first one.
 impl Drop for Engine {
     fn drop(&mut self) {
-        if self.terminated {
+        if self.terminated && self.cache.is_none() {
             return;
         }
         if let Err(error) = self.shutdown() {

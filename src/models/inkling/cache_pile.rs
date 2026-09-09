@@ -131,6 +131,12 @@ impl CacheStore {
         self.staged.clear();
     }
 
+    /// Finish the local writer explicitly. Published checkpoints were already
+    /// flushed; closing does not publish any merely staged payloads.
+    pub fn close(self) -> Result<()> {
+        self.pile.close().context("close inference cache pile")
+    }
+
     pub fn put_chunk(&mut self, bytes: &[u8]) -> Result<[u8; 32]> {
         anyhow::ensure!(!bytes.is_empty() && bytes.len() <= MAX_CHUNK_BYTES,
             "cache chunks must contain 1..={MAX_CHUNK_BYTES} bytes");
@@ -337,6 +343,7 @@ mod tests {
             store.begin();
             let hash = store.put_chunk(b"packed codes, not floats")?;
             store.publish(key(prefix), serde_json::json!({"chunk": hash}))?;
+            // Deliberately omit close here: publication itself must be durable.
         }
         {
             let mut store = CacheStore::open_with_key(&config, signing)?;
@@ -352,6 +359,7 @@ mod tests {
             let mut wrong = key(prefix);
             wrong.rank = 1;
             assert!(store.read(&found[0], &wrong).is_err());
+            store.close()?;
         }
         std::fs::remove_file(config.pile)?;
         Ok(())
@@ -367,6 +375,7 @@ mod tests {
             assert!(store.put_chunk(&[]).is_err());
             assert!(store.put_chunk(&vec![0; MAX_CHUNK_BYTES + 1]).is_err());
             assert!(store.candidates([2; 32], 99)?.is_empty());
+            store.close()?;
         }
         std::fs::remove_file(config.pile)?;
         Ok(())
