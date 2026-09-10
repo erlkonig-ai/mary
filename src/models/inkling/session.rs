@@ -115,7 +115,7 @@ use super::assembly::{
 use super::attn::{AttnDims, LogScaling};
 use super::config::{AttnKind, InklingConfig};
 use super::host_trace;
-use super::pile::Elem;
+use super::pile::{Elem, WeightStorage};
 use super::pool::{CleanupGate, CleanupPolicy};
 use super::source::Weights;
 use super::stack::{embed_and_norm_bf16, embed_row_bf16};
@@ -270,9 +270,9 @@ pub struct SessionConfig {
     /// Local stores also reserve enough room for a full prefill-sized append.
     pub preallocate_kv: bool,
 
-    /// Seal the dedicated host weight arena read-only after startup swizzling.
-    /// Inference only; requires direct host aliases, never a full copied arena.
-    pub read_only_weights: bool,
+    /// Explicit weight backing; non-Host arms are inference-only and require
+    /// direct aliases, never a second full copied weight arena.
+    pub weight_storage: WeightStorage,
 
     /// Additional independent sequences, in creation order. Each entry reserves
     /// its own persistent KV and convolution histories before weights load.
@@ -345,7 +345,7 @@ impl SessionConfig {
             target_budget: DEFAULT_TARGET_BUDGET,
             context_budget: 4096,
             preallocate_kv: false,
-            read_only_weights: false,
+            weight_storage: WeightStorage::Host,
             sequence_context_budgets: Vec::new(),
             extra_reserved_bytes: 0,
             distillation: None,
@@ -360,30 +360,32 @@ impl SessionConfig {
     }
 }
 
-fn validate_weight_writers(read_only: bool, distillation: bool, learner: bool) -> Result<()> {
+fn validate_weight_writers(storage: WeightStorage, distillation: bool, learner: bool) -> Result<()> {
     anyhow::ensure!(
-        !read_only || (!distillation && !learner),
-        "read-only weights require inference only: disable SDFT and the active INK_LEARN_LR learner"
+        !storage.inference_only() || (!distillation && !learner),
+        "{} weights require inference only: disable SDFT and the active INK_LEARN_LR learner",
+        storage.as_str()
     );
     Ok(())
 }
 
 /// Refuse a writer before an engine opens its cache or a session loads weights.
-pub(super) fn validate_weight_protection(read_only: bool, distillation: bool) -> Result<()> {
+pub(super) fn validate_weight_storage(storage: WeightStorage, distillation: bool) -> Result<()> {
     #[cfg(feature = "inkling-cuda")]
     let learner = super::learn::Learner::from_env().is_some();
     #[cfg(not(feature = "inkling-cuda"))]
     let learner = false;
-    validate_weight_writers(read_only, distillation, learner)
+    validate_weight_writers(storage, distillation, learner)
 }
 
 fn require_weight_aliases(
     registered: Option<super::fp4gemm::Aliases>,
-    read_only: bool,
+    storage: WeightStorage,
 ) -> Result<super::fp4gemm::Aliases> {
-    if read_only {
+    if storage.inference_only() {
         anyhow::ensure!(registered.as_ref().is_some_and(|aliases| !aliases.is_empty()),
-            "read-only weights require zero-copy host registration; refusing a second copied weight arena");
+            "{} weights require zero-copy host registration; refusing a second copied weight arena",
+            storage.as_str());
     }
     Ok(registered.unwrap_or_else(super::fp4gemm::Aliases::disabled))
 }
@@ -888,14 +890,15 @@ impl Session {
     }
 
     fn load_inner(mut cfg: SessionConfig, group: Option<Group>) -> Result<Self> {
-        validate_weight_protection(cfg.read_only_weights, cfg.distillation.is_some())?;
-        if cfg.read_only_weights {
+        validate_weight_storage(cfg.weight_storage, cfg.distillation.is_some())?;
+        if cfg.weight_storage.inference_only() {
             // The capability helper caches failures; cuDeviceGet before cuInit
             // would otherwise mark a supported fresh process as unsupported.
             cudarc::driver::result::init()
-                .context("initialize CUDA for the read-only weight capability check")?;
+                .context("initialize CUDA for the weight storage capability check")?;
             anyhow::ensure!(cubecl::cuda::supports_zero_copy_host(0),
-                "read-only weights require pageable host access through host page tables; refusing a copied weight arena");
+                "{} weights require pageable host access through host page tables; refusing a copied weight arena",
+                cfg.weight_storage.as_str());
         }
         super::fatal::arm();
 
@@ -1098,7 +1101,7 @@ impl Session {
         // Always: a Session has to be able to answer, so it always binds the
         // unembedding.
         globals.push("model.llm.unembed.weight");
-        src.copy_share(lo..hi, &globals, attention_bytes, admission, tp, cfg.read_only_weights)?;
+        src.copy_share(lo..hi, &globals, attention_bytes, admission, tp, cfg.weight_storage)?;
 
         // The compute client taken FROM a Burn tensor rather than constructed
         // beside it: `seam::handle_of` hands a Burn allocation to a raw kernel on
@@ -1136,7 +1139,7 @@ impl Session {
         }
         let aliases = Some(require_weight_aliases(
             super::fp4gemm::Aliases::register(&client, src.mappings()?),
-            cfg.read_only_weights,
+            cfg.weight_storage,
         )?);
 
         anyhow::ensure!(
@@ -3093,20 +3096,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn read_only_weights_reject_every_admitted_writer() {
-        assert!(validate_weight_writers(true, false, false).is_ok());
-        for (distillation, learner) in [(true, false), (false, true), (true, true)] {
-            assert!(validate_weight_writers(true, distillation, learner).is_err());
-            assert!(validate_weight_writers(false, distillation, learner).is_ok());
+    fn inference_weight_storage_rejects_every_admitted_writer() {
+        for storage in [WeightStorage::HostReadOnly, WeightStorage::CudaManaged] {
+            assert!(validate_weight_writers(storage, false, false).is_ok());
+            for (distillation, learner) in [(true, false), (false, true), (true, true)] {
+                assert!(validate_weight_writers(storage, distillation, learner).is_err());
+                assert!(validate_weight_writers(WeightStorage::Host, distillation, learner).is_ok());
+            }
         }
-        assert!(!SessionConfig::new("not-opened.pile").read_only_weights);
+        assert_eq!(SessionConfig::new("not-opened.pile").weight_storage, WeightStorage::Host);
     }
 
     #[test]
-    fn read_only_weights_never_select_the_copying_alias_fallback() {
-        assert!(require_weight_aliases(None, true).is_err());
-        assert!(require_weight_aliases(Some(super::super::fp4gemm::Aliases::disabled()), true).is_err());
-        assert!(require_weight_aliases(None, false).unwrap().is_empty());
+    fn inference_weight_storage_never_selects_the_copying_alias_fallback() {
+        for storage in [WeightStorage::HostReadOnly, WeightStorage::CudaManaged] {
+            assert!(require_weight_aliases(None, storage).is_err());
+            assert!(require_weight_aliases(Some(super::super::fp4gemm::Aliases::disabled()), storage).is_err());
+        }
+        assert!(require_weight_aliases(None, WeightStorage::Host).unwrap().is_empty());
     }
 
     /// Explicit real weights, two diagnostic layers, synthetic input only.
@@ -3115,22 +3122,28 @@ mod tests {
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_session_roundtrip_after_local_window_rollover() -> Result<()> {
-        session_cache_roundtrip(false, false, 128, 17)
+        session_cache_roundtrip(false, WeightStorage::Host, 128, 17)
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_preallocated_session_roundtrip_with_wide_append() -> Result<()> {
-        session_cache_roundtrip(true, false, 1024, 777)
+        session_cache_roundtrip(true, WeightStorage::Host, 1024, 777)
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_read_only_weights_session_roundtrip() -> Result<()> {
-        session_cache_roundtrip(true, true, 1024, 777)
+        session_cache_roundtrip(true, WeightStorage::HostReadOnly, 1024, 777)
     }
 
-    fn session_cache_roundtrip(preallocate_kv: bool, read_only_weights: bool,
+    #[test]
+    #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
+    fn portable_cache_cuda_managed_weights_session_roundtrip() -> Result<()> {
+        session_cache_roundtrip(true, WeightStorage::CudaManaged, 1024, 777)
+    }
+
+    fn session_cache_roundtrip(preallocate_kv: bool, weight_storage: WeightStorage,
         prefill: usize, tail_rows: usize) -> Result<()>
     {
         use super::super::cache_state::{MAX_CHUNK_BYTES, SessionCacheState};
@@ -3158,7 +3171,7 @@ mod tests {
         config.config_override = None;
         config.context_budget = CONTEXT;
         config.preallocate_kv = preallocate_kv;
-        config.read_only_weights = read_only_weights;
+        config.weight_storage = weight_storage;
         config.prefill_budget = prefill;
         config.extend_batch = prefill;
         config.target_budget = 0;
@@ -3249,7 +3262,7 @@ mod tests {
         let actual = save(&session, &mut blobs, &mut held)?;
         assert_eq!(actual, expected,
             "identical explicit tail changed complete KV/history state after restore");
-        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} read_only_weights={read_only_weights} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}");
+        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} weight_storage={} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}", weight_storage.as_str());
         Ok(())
     }
 

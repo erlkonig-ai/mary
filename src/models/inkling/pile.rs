@@ -42,6 +42,183 @@ use triblespace::prelude::Id;
 
 use super::load::PackedExpert;
 
+/// Startup weight backing. Experimental placement changes no tensor layout.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WeightStorage {
+    #[default]
+    Host,
+    HostReadOnly,
+    CudaManaged,
+}
+
+impl WeightStorage {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Host => "host",
+            Self::HostReadOnly => "host-read-only",
+            Self::CudaManaged => "cuda-managed",
+        }
+    }
+
+    pub const fn inference_only(self) -> bool {
+        !matches!(self, Self::Host)
+    }
+}
+
+fn validate_managed_concurrent_access(concurrent: i32) -> Result<()> {
+    anyhow::ensure!(concurrent != 0,
+        "cuda-managed weights require concurrent managed access: CPU metadata reads may overlap GPU work");
+    Ok(())
+}
+
+/// CPU-readable CUDA managed storage, fully initialized before any slice exists.
+/// Its primary context is the same device-0 primary retained by CubeCL.
+struct ManagedWeightArena {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+    context: Option<std::sync::Arc<cudarc::driver::CudaContext>>,
+}
+
+// SAFETY: the allocation never moves. Startup lends only disjoint mutable
+// slices to scoped workers; publication occurs after all workers join. Then
+// only immutable CPU/GPU reads are allowed (learning is rejected beforehand).
+unsafe impl Send for ManagedWeightArena {}
+unsafe impl Sync for ManagedWeightArena {}
+
+impl ManagedWeightArena {
+    fn new(len: usize) -> Result<Self> {
+        anyhow::ensure!(len > 0 && len <= isize::MAX as usize,
+            "managed weight arena length must be in 1..=isize::MAX");
+        let context = cudarc::driver::CudaContext::new(0)
+            .context("retain CUDA primary context for managed weights")?;
+        validate_managed_concurrent_access(context.attribute(
+            cudarc::driver::sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_CONCURRENT_MANAGED_ACCESS,
+        ).context("query concurrent managed weight access")?)?;
+        let allocated_at = std::time::Instant::now();
+        // SAFETY: the retained primary context is current. This returns raw,
+        // UNINITIALIZED CPU-readable managed memory, not a Rust byte slice.
+        let raw = unsafe {
+            cudarc::driver::result::malloc_managed(
+                len, cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL,
+            )
+        }.with_context(|| format!("allocate {len} bytes of CUDA managed weights"))?;
+        let ptr = std::ptr::NonNull::new(raw as *mut u8)
+            .context("CUDA returned a null managed weight allocation")?;
+        let arena = Self { ptr, len, context: Some(context) };
+        eprintln!("    managed weight allocation: bytes={len} alloc_seconds={:.6}",
+            allocated_at.elapsed().as_secs_f64());
+        let started = std::time::Instant::now();
+        // SAFETY: the allocation is uniquely owned, len bytes long, and has
+        // no GPU alias yet. Initialize ALL bytes, including alignment padding,
+        // before ever forming &[u8] or &mut [u8]. This eager sweep is deliberate:
+        // unlike mmap it touches the whole allocation before the copy workers.
+        unsafe { std::ptr::write_bytes(arena.ptr.as_ptr(), 0, len) };
+        eprintln!("    managed weight initialization: bytes={len} zero_seconds={:.6}",
+            started.elapsed().as_secs_f64());
+        Ok(arena)
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        // SAFETY: new initialized every byte, and self retains its allocation.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: only startup has mutable access, before Bytes/GPU publication.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+// SAFETY: every byte is initialized; moving this owner does not move storage.
+// Bytes keeps this same owner alive across all slices and external GPU aliases.
+unsafe impl anybytes::ByteSource for ManagedWeightArena {
+    type Owner = Self;
+
+    fn as_bytes(&self) -> &[u8] { self.as_slice() }
+    fn get_owner(self) -> Self { self }
+}
+
+impl Drop for ManagedWeightArena {
+    fn drop(&mut self) {
+        use cudarc::driver::result;
+        let Some(context) = self.context.take() else { return };
+        // An alias can be released on CubeCL's server thread. Never call back
+        // into its client here: bind and synchronize the driver directly.
+        let previous = match result::ctx::get_current() {
+            Ok(previous) => previous,
+            Err(error) => {
+                std::mem::forget(context);
+                eprintln!("managed weight arena: cannot inspect CUDA context ({error}); leaking allocation and context for safety");
+                return;
+            }
+        };
+        let own = context.cu_ctx();
+        let released = context.bind_to_thread()
+            .and_then(|()| result::ctx::synchronize())
+            // SAFETY: successful context synchronization proves all submitted
+            // GPU work complete; the final owner holds the only free operation.
+            .and_then(|()| unsafe { result::memory_free(self.ptr.as_ptr() as u64) });
+        match released {
+            Ok(()) => drop(context),
+            Err(error) => {
+                std::mem::forget(context);
+                eprintln!("managed weight arena: CUDA cleanup failed ({error}); leaking allocation and context for safety");
+            }
+        }
+        // CudaContext::drop itself binds its context. Restore a different
+        // caller context afterward; never resurrect our own possibly released
+        // last primary-context reference.
+        if previous != Some(own) {
+            // SAFETY: a different context belonged to this thread on entry and
+            // has not been released here; null restores no current context.
+            if let Err(error) = unsafe {
+                result::ctx::set_current(previous.unwrap_or(std::ptr::null_mut()))
+            } {
+                eprintln!("managed weight arena: cannot restore caller CUDA context: {error}");
+            }
+        }
+    }
+}
+
+enum WeightArena {
+    Host(memmap2::MmapMut),
+    Managed(ManagedWeightArena),
+}
+
+impl WeightArena {
+    fn new(len: usize, storage: WeightStorage) -> Result<Self> {
+        match storage {
+            WeightStorage::Host | WeightStorage::HostReadOnly => {
+                Ok(Self::Host(memmap2::MmapMut::map_anon(len)
+                    .with_context(|| format!("map {len} bytes for the startup weight arena"))?))
+            }
+            WeightStorage::CudaManaged => Ok(Self::Managed(ManagedWeightArena::new(len)?)),
+        }
+    }
+
+    fn finish(self, storage: WeightStorage) -> Result<Bytes> {
+        match (self, storage) {
+            (Self::Host(arena), WeightStorage::Host) => finish_weight_arena(arena, false),
+            (Self::Host(arena), WeightStorage::HostReadOnly) => finish_weight_arena(arena, true),
+            (Self::Managed(arena), WeightStorage::CudaManaged) => Ok(Bytes::from_source(arena)),
+            _ => anyhow::bail!("weight arena backing differs from its admitted storage"),
+        }
+    }
+}
+
+impl std::ops::Deref for WeightArena {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self { Self::Host(arena) => arena, Self::Managed(arena) => arena.as_slice() }
+    }
+}
+
+impl std::ops::DerefMut for WeightArena {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        match self { Self::Host(arena) => arena, Self::Managed(arena) => arena.as_mut_slice() }
+    }
+}
+
 /// Finish a dedicated anonymous allocation before publishing any byte views
 /// or GPU aliases. Both arms have the same lazy mmap backing; only protection
 /// differs. The caller must have joined every startup copy/swizzle worker.
@@ -1701,13 +1878,16 @@ impl PileSource {
     }
 
     /// Copy exactly one node's share out of the file-backed pile mapping into
-    /// one dedicated anonymous mmap. Aliases retain its owner; unlike discarded
-    /// file-backed pages, these bytes cannot be reloaded from the source pile.
-    /// This is not physical pinning: anonymous pages may still swap or incur
-    /// GPU/host page-table fault servicing.
+    /// one dedicated arena. Host arms use the same anonymous mmap; CudaManaged
+    /// uses CPU-readable CUDA-managed storage with the same payload layout.
+    /// Aliases retain its owner; no second full host weight allocation is made.
+    /// Neither arm promises physical pinning or fault-free GPU access.
     ///
-    /// `read_only_weights` seals this mapping after every copy/swizzle worker
-    /// joins and before publishing any view. Callers must exclude all learners.
+    /// `HostReadOnly` seals this mapping after every copy/swizzle worker
+    /// joins and before publishing any view. Both non-Host choices require
+    /// inference-only callers. Managed initialization zeroes the entire arena
+    /// before workers start, including padding; allocation/zero time is logged
+    /// separately because this changes startup first-touch/reclaim scheduling.
     ///
     /// Dense leaves follow the layer range, except `model.mtp.*` leaves are
     /// omitted when `policy.drafts` is false. Every `global_dense` name is an
@@ -1779,7 +1959,7 @@ impl PileSource {
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
         shard: Option<super::tp::Tp>,
-        read_only_weights: bool,
+        weight_storage: WeightStorage,
     ) -> Result<(usize, usize, u64, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
@@ -2142,16 +2322,13 @@ impl PileSource {
             gib(available),
         );
 
-        // Dedicated, lazy anonymous pages: do not populate or zero the whole
-        // arena before copying. SourceRelease can shed source pages as each
-        // destination is written. No allocator metadata shares these pages,
-        // so the inference arm can safely seal this exact allocation later.
-        // Keep the same relative alignment/layout in the RW and RO arms.
+        // Host arms retain the same lazy dedicated mmap. Managed storage is
+        // initialized eagerly before any slice exists; this extra first-touch
+        // sweep is separately timed. All arms have the same relative layout.
         let (mut arena, skew) = {
             let bytes = total.checked_add(VIEW_ALIGN - 1)
                 .context("startup weight arena size overflow")?;
-            let arena = memmap2::MmapMut::map_anon(bytes)
-                .with_context(|| format!("map {bytes} bytes for the startup weight arena"))?;
+            let arena = WeightArena::new(bytes, weight_storage)?;
             let skew = arena.as_ptr().align_offset(VIEW_ALIGN);
             (arena, skew)
         };
@@ -2414,14 +2591,15 @@ impl PileSource {
         println!("{}", mem_line("after fetch+verify+copy"));
 
         // All workers have joined. Seal before any subview or GPU alias can
-        // escape, retaining the mmap owner through Bytes in either arm.
+        // escape, retaining the mmap or managed owner through Bytes.
         let arena_base = arena.as_ptr() as usize;
         let arena_len = arena.len();
         let seal_start = std::time::Instant::now();
-        let bytes = finish_weight_arena(arena, read_only_weights)?;
+        let bytes = arena.finish(weight_storage)?;
         println!(
-            "    startup weight arena: base={arena_base:#x} bytes={arena_len} protection={} seal_seconds={:.6}",
-            if read_only_weights { "read-only" } else { "read-write" },
+            "    startup weight arena: base={arena_base:#x} bytes={arena_len} storage={} protection={} seal_seconds={:.6}",
+            weight_storage.as_str(),
+            if weight_storage == WeightStorage::HostReadOnly { "read-only" } else { "read-write" },
             seal_start.elapsed().as_secs_f64(),
         );
         let view: anybytes::View<[u8]> = bytes
@@ -2510,12 +2688,68 @@ mod tests {
     use triblespace::core::blob::encodings::tensor::TensorView;
 
     #[test]
+    fn weight_storage_names_and_default_are_explicit() {
+        assert_eq!(WeightStorage::default(), WeightStorage::Host);
+        assert_eq!(WeightStorage::Host.as_str(), "host");
+        assert_eq!(WeightStorage::HostReadOnly.as_str(), "host-read-only");
+        assert_eq!(WeightStorage::CudaManaged.as_str(), "cuda-managed");
+        assert!(!WeightStorage::Host.inference_only());
+        assert!(WeightStorage::HostReadOnly.inference_only());
+        assert!(WeightStorage::CudaManaged.inference_only());
+    }
+
+    #[test]
+    fn managed_weight_lengths_are_rejected_before_cuda_initialization() {
+        assert!(ManagedWeightArena::new(0).is_err());
+        assert!(ManagedWeightArena::new(usize::MAX).is_err());
+    }
+
+    #[test]
+    fn managed_weight_cpu_metadata_requires_concurrent_access() {
+        assert!(validate_managed_concurrent_access(0).is_err());
+        assert!(validate_managed_concurrent_access(1).is_ok());
+    }
+
+    /// No model or kernels: exercise the final ByteSource owner independently
+    /// of CubeCL's long-lived external-registration table.
+    #[test]
+    #[ignore = "requires an exclusive CUDA reservation"]
+    fn managed_weight_arena_owner_drops_on_foreign_thread() -> Result<()> {
+        // Keep the primary alive independently of the allocation under test.
+        let _primary = cudarc::driver::CudaContext::new(0)?;
+        let mut arena = ManagedWeightArena::new(8192)?;
+        assert!(arena.as_slice().iter().all(|byte| *byte == 0));
+        arena.as_mut_slice()[32..40].copy_from_slice(b"weights!");
+        let base = arena.ptr.as_ptr() as usize;
+        let bytes = Bytes::from_source(arena);
+        let weak = bytes.downgrade();
+        let slice = bytes.slice(32..40);
+        let (mapped_base, len, keepalive) = weight_arena_mapping(&bytes);
+        assert_eq!((mapped_base, len), (base, 8192));
+        assert_eq!(slice.as_ref(), b"weights!");
+        drop(slice);
+        drop(bytes);
+        let retained = weak.upgrade().expect("alias keepalive retains managed bytes");
+        assert_eq!(&retained[32..40], b"weights!");
+        drop(retained);
+        std::thread::spawn(move || -> Result<()> {
+            assert!(cudarc::driver::result::ctx::get_current()?.is_none());
+            drop(keepalive);
+            assert!(cudarc::driver::result::ctx::get_current()?.is_none(),
+                "managed owner cleanup must restore no current context");
+            Ok(())
+        }).join().map_err(|_| anyhow::anyhow!("managed owner drop thread panicked"))??;
+        assert!(weak.upgrade().is_none(), "the final managed byte owner expired");
+        Ok(())
+    }
+
+    #[test]
     fn mmap_weight_arena_reads_and_alias_keepalive_preserve_the_same_storage() -> Result<()> {
-        for read_only in [false, true] {
-            let mut arena = memmap2::MmapMut::map_anon(8192)?;
+        for storage in [WeightStorage::Host, WeightStorage::HostReadOnly] {
+            let mut arena = WeightArena::new(8192, storage)?;
             arena[32..40].copy_from_slice(b"weights!");
             let base = arena.as_ptr() as usize;
-            let bytes = finish_weight_arena(arena, read_only)?;
+            let bytes = arena.finish(storage)?;
             let weak = bytes.downgrade();
             let slice = bytes.slice(32..40);
             let (mapped_base, len, keepalive) = weight_arena_mapping(&bytes);
@@ -2536,10 +2770,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn mmap_weight_arena_protection_matches_the_selected_arm() -> Result<()> {
-        for read_only in [false, true] {
-            let mut arena = memmap2::MmapMut::map_anon(8192)?;
+        for storage in [WeightStorage::Host, WeightStorage::HostReadOnly] {
+            let mut arena = WeightArena::new(8192, storage)?;
             arena.fill(7);
-            let bytes = finish_weight_arena(arena, read_only)?;
+            let bytes = arena.finish(storage)?;
             let ptr = bytes.as_ptr() as usize;
             let maps = std::fs::read_to_string("/proc/self/maps")?;
             let permissions = maps.lines().find_map(|line| {
@@ -2551,7 +2785,7 @@ mod tests {
                 (lo <= ptr && ptr < hi).then_some(permissions)
             }).expect("the dedicated arena is mapped");
             assert!(permissions.starts_with('r'));
-            assert_eq!(permissions.as_bytes()[1] == b'w', !read_only);
+            assert_eq!(permissions.as_bytes()[1] == b'w', storage == WeightStorage::Host);
             assert!(bytes.iter().all(|byte| *byte == 7));
         }
         Ok(())

@@ -2453,7 +2453,7 @@ fn main() -> Result<()> {
             attention_bytes + slot_kv_bytes,
             admission,
             tp_shard,
-            false,
+            mary::models::inkling::pile::WeightStorage::Host,
         )?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",

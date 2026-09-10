@@ -151,7 +151,7 @@ fn main() -> Result<()> {
         // misses the moment by 4.45. The bench asks for what it uses.
         context_budget: Some(16384),
         preallocate_kv: false,
-        read_only_weights: false,
+        weight_storage: mary::models::inkling::pile::WeightStorage::Host,
         tensor_parallel,
         sealed: false,
         // The bench writes a version through its own --save flow, if at all.
