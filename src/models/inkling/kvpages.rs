@@ -67,6 +67,10 @@ pub const PAGE: usize = 128;
 /// nothing merges at all and the read is simply the pages, one chunk each.
 pub const MAX_PAGES: usize = 8;
 
+/// Fixed read epoch used by explicit Session reservations. The diagnostic
+/// environment path may choose another epoch through [`kv_epoch`].
+pub const DEFAULT_KV_EPOCH: usize = 512;
+
 /// What a page is made of: fixed-width rows that can be cut and rejoined.
 ///
 /// Three operations and no arithmetic. That is deliberate — [`Pages`] must not
@@ -2246,7 +2250,7 @@ pub fn kv_epoch() -> usize {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|n: &usize| *n >= 1)
-            .unwrap_or(512)
+            .unwrap_or(DEFAULT_KV_EPOCH)
     })
 }
 
@@ -2328,15 +2332,42 @@ pub struct KvPlan {
     pub context: usize,
     /// Rows one GLOBAL store reserves: the whole context.
     pub global_rows: usize,
-    /// Rows one LOCAL store reserves: its window plus one epoch, which is all a
-    /// compacting store can ever hold. NOT the context -- multiplying the
-    /// context by all 42 layers over-counts this model by 5.98x.
+    /// Rows one LOCAL store reserves: its window plus space for an epoch or
+    /// the widest admitted append, whichever is larger, rounded to an epoch.
+    /// NOT the context -- multiplying the context by all 42 layers over-counts
+    /// this model by 5.98x.
     pub local_rows: usize,
     /// See [`kv_epoch`].
     pub epoch: usize,
 }
 
 impl KvPlan {
+    /// An explicit Session reservation, independent of environment variables.
+    ///
+    /// Local KV cannot trim until a whole pass commits, so it must hold its
+    /// window PLUS the widest prefill/continuation batch. Session admits
+    /// extend and target widths no larger than `prefill_budget`. A zero window
+    /// is allowed for a model with no windowed layers.
+    pub fn for_session(
+        context: usize,
+        window: usize,
+        prefill_budget: usize,
+    ) -> anyhow::Result<Self> {
+        use anyhow::Context;
+
+        anyhow::ensure!(context > 0 && prefill_budget > 0 && prefill_budget <= context,
+            "KV reservation needs 0 < prefill_budget <= context, got {prefill_budget} and {context}");
+        let epoch = DEFAULT_KV_EPOCH;
+        let global_rows = context.checked_next_multiple_of(epoch)
+            .context("global KV reservation row count overflow")?;
+        let local_rows = window.checked_add(epoch.max(prefill_budget))
+            .and_then(|rows| rows.checked_next_multiple_of(epoch))
+            .context("local KV reservation row count overflow")?;
+        anyhow::ensure!(global_rows <= u32::MAX as usize && local_rows <= u32::MAX as usize,
+            "KV reservation capacities exceed the u32 row-index domain");
+        Ok(Self { context, global_rows, local_rows, epoch })
+    }
+
     /// The plan for a `context`-token run of a model with this window.
     pub fn new(context: usize, window: usize) -> Self {
         let epoch = kv_epoch();
@@ -3285,6 +3316,33 @@ mod tests {
     }
 
     #[test]
+    fn session_plan_sizes_wide_appends_without_environment() {
+        let plan = KvPlan::for_session(32_768, 512, 4_096).unwrap();
+        assert_eq!(plan.epoch, DEFAULT_KV_EPOCH);
+        assert_eq!(plan.global_rows, 32_768);
+        assert_eq!(plan.local_rows, 4_608);
+        assert_eq!(plan.rows_for(Some(512)), 4_608);
+
+        let rounded = KvPlan::for_session(1_025, 513, 513).unwrap();
+        assert_eq!(rounded.global_rows, 1_536);
+        assert_eq!(rounded.local_rows, 1_536);
+        let narrow = KvPlan::for_session(1_024, 512, 1).unwrap();
+        assert_eq!(narrow.local_rows, 1_024, "keep a full epoch even for decode");
+    }
+
+    #[test]
+    fn session_plan_rejects_invalid_widths_and_capacity_overflow() {
+        for (context, window, prefill) in [
+            (0, 512, 1), (1_024, 512, 0), (1_024, 512, 1_025),
+            (usize::MAX, 512, 1), (1_024, usize::MAX, 1),
+            (u32::MAX as usize, 512, 1),
+        ] {
+            assert!(KvPlan::for_session(context, window, prefill).is_err(),
+                "accepted context={context}, window={window}, prefill={prefill}");
+        }
+    }
+
+    #[test]
     fn a_plan_charges_retained_rows_and_not_context_times_layers() {
         // The 5.98x this exists to avoid. Inkling: 42 layers, 7 of them global,
         // a 512-token window, a 1024-wide KV row.
@@ -3412,6 +3470,25 @@ mod tests {
             live(&demand),
             "the two arms hold different rows"
         );
+    }
+
+    #[test]
+    fn host_session_reservation_holds_wide_continuations_before_trim() {
+        const WINDOW: usize = 512;
+        const BATCH: usize = 4_096;
+        let plan = KvPlan::for_session(32_768, WINDOW, BATCH).unwrap();
+        both_arms(|pages| {
+            pages.append(HostRows::of(0, WINDOW, HW));
+            let mut end = WINDOW;
+            for _ in 0..4 {
+                pages.append(HostRows::of(end, BATCH, HW));
+                assert_eq!(pages.len(), WINDOW + BATCH);
+                end += BATCH;
+                pages.drop_front(BATCH);
+                pages.assert_sound(HW);
+                assert_eq!(live(pages), (end - WINDOW..end).collect::<Vec<_>>());
+            }
+        }, plan.local_rows, plan.epoch);
     }
 
     #[test]
