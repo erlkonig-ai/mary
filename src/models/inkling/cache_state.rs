@@ -12,6 +12,7 @@ use cubecl::prelude::ComputeClient;
 use cubecl::server::Handle;
 use serde::{Deserialize, Serialize};
 
+use super::flash::CachedAttentionPolicy;
 use super::seam::{self, Bk};
 
 pub const CACHE_FORMAT_VERSION: u32 = 1;
@@ -225,6 +226,10 @@ pub struct CacheGeometry {
     pub resid_bf16: bool,
     pub flash: bool,
     pub flash_fp4: bool,
+    /// Legacy emits no new bytes, preserving already-published cache identity.
+    /// The versioned candidate also pins its different tile/reduction grouping.
+    #[serde(default, skip_serializing_if = "CachedAttentionPolicy::is_legacy")]
+    pub cached_attention: CachedAttentionPolicy,
     pub head_rms_native: bool,
     pub sink_down_fused: bool,
     pub dense_fake_quant: bool,
@@ -519,6 +524,7 @@ mod tests {
             router: "bf16".to_owned(), shared_halved: true, kv_prealloc: None, kv_local_rows: None, kv_epoch: 512,
             fp4: true, attn_bf16: true, act_bf16: true, resid_bf16: true, flash: true,
             flash_fp4: true, head_rms_native: false, sink_down_fused: false, dense_fake_quant: false,
+            cached_attention: CachedAttentionPolicy::Legacy,
             layers: vec![
                 LayerGeometry { layer: 0, kv_width: 64, window: None },
                 LayerGeometry { layer: 1, kv_width: 64, window: Some(4) },
@@ -553,11 +559,57 @@ mod tests {
     }
 
     #[test]
+    fn cached_attention_legacy_preserves_serialized_geometry_and_identity() {
+        let geometry = fixture().geometry;
+        // The old field order and values, before cached_attention existed.
+        // Array encoding is independent of CacheGeometry's derived serializer.
+        let legacy_json = format!(concat!(
+            "{{\"model_identity\":{},\"model_root\":{},\"config_identity\":{},",
+            "\"rank\":0,\"world\":2,\"hidden\":128,\"kernel\":4,\"sliding_window\":4,\"vocab\":32,",
+            "\"context_budget\":1024,\"extend_batch\":16,\"prefill_budget\":16,\"forbidden\":[0,1],",
+            "\"router\":\"bf16\",\"shared_halved\":true,\"kv_prealloc\":null,\"kv_epoch\":512,",
+            "\"fp4\":true,\"attn_bf16\":true,\"act_bf16\":true,\"resid_bf16\":true,",
+            "\"flash\":true,\"flash_fp4\":true,\"head_rms_native\":false,",
+            "\"sink_down_fused\":false,\"dense_fake_quant\":false,",
+            "\"layers\":[{{\"layer\":0,\"kv_width\":64,\"window\":null}},",
+            "{{\"layer\":1,\"kv_width\":64,\"window\":4}}]}}"
+        ), serde_json::to_string(&[1u8; 32]).unwrap(),
+            serde_json::to_string(&[2u8; 16]).unwrap(),
+            serde_json::to_string(&[3u8; 32]).unwrap());
+        assert_eq!(serde_json::to_string(&geometry).unwrap(), legacy_json);
+        assert_eq!(geometry.identity().unwrap(),
+            *blake3::hash(format!("[1,{legacy_json}]").as_bytes()).as_bytes());
+        let restored: CacheGeometry = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(restored.cached_attention, CachedAttentionPolicy::Legacy);
+        assert_eq!(restored, geometry);
+    }
+
+    #[test]
+    fn cached_attention_candidate_is_versioned_and_cannot_restore_as_legacy() {
+        let state = fixture();
+        let mut candidate = state.geometry.clone();
+        candidate.cached_attention = CachedAttentionPolicy::PackedBatchedV1;
+        let json = serde_json::to_string(&candidate).unwrap();
+        assert!(json.contains("\"cached_attention\":\"packed-batched-v1\""));
+        let restored: CacheGeometry = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, candidate);
+        assert_ne!(candidate.identity().unwrap(), state.identity);
+        assert!(state.validate(&candidate).is_err());
+        let mut candidate_state = state.clone();
+        candidate_state.geometry = candidate;
+        candidate_state.identity = candidate_state.geometry.identity().unwrap();
+        candidate_state.validate(&candidate_state.geometry).unwrap();
+        assert!(candidate_state.validate(&state.geometry).is_err());
+        assert!(serde_json::from_str::<CacheGeometry>(
+            &json.replace("packed-batched-v1", "packed-batched-v2")).is_err());
+    }
+
+    #[test]
     fn portable_cache_identity_names_version_model_rank_numerics_and_prefix_chunking() {
         let state = fixture();
         let identity = state.geometry.identity().unwrap();
         assert_ne!(identity, *blake3::hash(&serde_json::to_vec(&state.geometry).unwrap()).as_bytes());
-        let changes: [fn(&mut CacheGeometry); 8] = [
+        let changes: [fn(&mut CacheGeometry); 9] = [
             |g| g.model_identity[0] ^= 1,
             |g| g.config_identity[0] ^= 1,
             |g| g.rank = 1,
@@ -565,6 +617,7 @@ mod tests {
             |g| g.extend_batch /= 2,
             |g| g.kv_epoch /= 2,
             |g| g.flash_fp4 = !g.flash_fp4,
+            |g| g.cached_attention = CachedAttentionPolicy::PackedBatchedV1,
             |g| g.router = "pre".to_owned(),
         ];
         for change in changes {

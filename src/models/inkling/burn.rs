@@ -779,6 +779,8 @@ pub struct AttnCache<B: Backend> {
     k_pre: Tensor<B, 2>,
     v_pre: Tensor<B, 2>,
     base: usize,
+    /// Selected by the owning Session, preserved by clone/rewind/reservation.
+    cached_attention: super::flash::CachedAttentionPolicy,
     /// Set by [`attention_steps`] and cleared by [`AttnCache::commit`]: the
     /// rows a SPECULATIVE batch appended, which may turn out not to have
     /// happened.
@@ -1130,6 +1132,7 @@ impl AttnCache<Bk> {
         state: &super::cache_state::AttnCacheState,
         client: &cubecl::prelude::ComputeClient<cubecl::cuda::CudaRuntime>,
         dev: &burn::backend::cuda::CudaDevice,
+        cached_attention: super::flash::CachedAttentionPolicy,
         source: &mut super::cache_state::BlobSource<'_>,
     ) -> anyhow::Result<Self> {
         use super::cache_state;
@@ -1138,7 +1141,8 @@ impl AttnCache<Bk> {
             v: super::kvpages::KvStore::restore_cache(&state.v, client, dev, source)?,
             k_pre: cache_state::restore_float(&state.k_pre, client, dev, source)?,
             v_pre: cache_state::restore_float(&state.v_pre, client, dev, source)?,
-            base: state.base, pending: None, evicted: state.evicted.clone(), gap_dev: None,
+            base: state.base, cached_attention,
+            pending: None, evicted: state.evicted.clone(), gap_dev: None,
         };
         cache.upload_gaps(dev);
         Ok(cache)
@@ -1169,6 +1173,16 @@ impl AttnCache<Bk> {
 }
 
 impl<B: Backend> AttnCache<B> {
+    /// Attach the immutable Session policy to a freshly created cache.
+    pub(crate) fn with_cached_attention(mut self, policy: super::flash::CachedAttentionPolicy) -> Self {
+        self.cached_attention = policy;
+        self
+    }
+
+    pub(crate) fn cached_attention(&self) -> super::flash::CachedAttentionPolicy {
+        self.cached_attention
+    }
+
     /// Keys retained — *not* the sequence length, because a windowed layer
     /// forgets.
     pub fn len(&self) -> usize {
@@ -2115,6 +2129,7 @@ fn attention_prefill_lane(
         k_pre: conv_history(k_pre, d.kernel),
         v_pre: conv_history(v_pre, d.kernel),
         base: 0,
+        cached_attention: super::flash::CachedAttentionPolicy::Legacy,
         pending: None,
         evicted: Vec::new(),
         gap_dev: None,
@@ -2480,38 +2495,6 @@ pub fn flash_lane() -> bool {
     *ON.get_or_init(|| std::env::var("INK_FLASH").map(|v| v != "0").unwrap_or(true))
 }
 
-/// Whether the fused lane reads the NVFP4 KV cache **packed**, dequantising in
-/// registers instead of consuming pages someone else expanded.
-/// **`INK_FLASH_FP4=1`; default OFF.**
-///
-/// # What it removes
-///
-/// [`flash_cached`] materialises every K and V page before the kernel launches,
-/// so a whole layer's dequantised cache is live at once. Per 42-layer decode
-/// step at ctx 3732, from the config's shapes (NVFP4 stored, BF16 consumed,
-/// 7 global layers reading the whole context and 35 local ones reading a
-/// 512-token window, `kv_heads` 8 x `head_dim` 128 x 2 = 2048 values a token a
-/// layer): 48.4 MiB of packed codes read, ~172 MiB of BF16 written by the
-/// dequant, and ~172 MiB read straight back by flash. This arm reads the 48.4
-/// and moves neither 172.
-///
-/// # Why it is a switch and not a replacement
-///
-/// It is NOT bit-identical and cannot be. Dequantising to BF16 and then
-/// multiplying rounds every value to eight mantissa bits before the product;
-/// reading the codes directly multiplies the exact E2M1 magnitude by the exact
-/// E4M3 scale in f32. Both are honest readings of the same stored bytes and
-/// they differ in the last places, so the two arms are priced against each
-/// other rather than one being asserted to be the other.
-pub fn flash_fp4() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        std::env::var("INK_FLASH_FP4")
-            .map(|v| v != "0")
-            .unwrap_or(false)
-    })
-}
-
 pub fn act_bf16() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -2586,19 +2569,15 @@ pub fn from_act<const D: usize>(t: Tensor<Bk, D>) -> Tensor<Bk, D> {
 
 /// Whether a layer's cached lanes take [`super::flash`].
 ///
-/// One predicate rather than three copies of the same three arguments, because
-/// the three cached entry points ([`attention_step`], [`attention_steps`] and
-/// the prefill's own arm) must not be able to disagree about it: a batch of one
-/// that took a different lane from a step of one would show up as drift in
-/// [`drift_table_at_real_width`] and be blamed on the cache.
-fn flash_cached_applies(d: &crate::models::inkling::attn::AttnDims) -> bool {
-    flash_lane()
-        && crate::models::inkling::flash::applies(
-            d.heads,
-            d.kv_heads,
-            d.head_dim,
-            crate::models::inkling::flash::decode_rows(d.groups()),
-        )
+/// One policy decision for both eligibility and launch geometry. A batch of
+/// one uses the same tile as a single step; wider cached batches may choose
+/// the candidate's prefill tile without changing initial uncached prefill.
+fn flash_cached_applies(
+    d: &crate::models::inkling::attn::AttnDims,
+    nq: usize,
+    policy: super::flash::CachedAttentionPolicy,
+) -> bool {
+    flash_lane() && policy.tile_rows(d.heads, d.kv_heads, d.head_dim, nq).is_some()
 }
 
 /// `nq` query rows at absolute positions `q0 ..` against the cache's PAGES.
@@ -2621,10 +2600,12 @@ fn flash_cached(
     eff: usize,
     window: Option<usize>,
 ) -> Tensor<Bk, 2> {
-    use crate::models::inkling::flash::{self, KeyRun, KvElem, flash_attention_launch};
+    use crate::models::inkling::flash::{KeyRun, KvElem, flash_attention_launch};
     use crate::models::inkling::seam::{client_of, handle_of, handle_of_any, tensor_of};
 
     let (heads, kv_heads, head_dim) = (d.heads, d.kv_heads, d.head_dim);
+    let rows = cache.cached_attention.tile_rows(heads, kv_heads, head_dim, nq)
+        .expect("cached flash dispatch checked tile eligibility");
     let (len, base) = (cache.len(), cache.base);
     let head = cache.k.head();
     let client = client_of(&q);
@@ -2644,9 +2625,12 @@ fn flash_cached(
     // scales and nothing is expanded at all; dense asks each store for pages,
     // which on the NVFP4 arm is one page-sized dequant launch each. Both cut
     // the key axis at the same page boundaries, so everything below is the
-    // same arithmetic on either arm. See [`flash_fp4`].
+    // same arithmetic for a fixed tile on either arm. The candidate's wider
+    // tile can change reduction grouping independently of this reader choice.
     let mut held: Vec<Held>;
-    let kv_elem = if flash_fp4() && cache.k.is_fp4() && cache.v.is_fp4() {
+    let kv_elem = if cache.cached_attention.packed_reader(head_dim)
+        && cache.k.is_fp4() && cache.v.is_fp4()
+    {
         let kruns = cache.k.packed_parts().expect("an NVFP4 store packs");
         let vruns = cache.v.packed_parts().expect("an NVFP4 store packs");
         debug_assert_eq!(kruns.len(), vruns.len(), "the two stores drifted apart");
@@ -2729,7 +2713,7 @@ fn flash_cached(
         eff,
         window,
         d.scaling(),
-        flash::decode_rows(d.groups()),
+        rows,
         gaps,
     );
     tensor_of(client, dev.clone(), out, nq, heads * head_dim)
@@ -2828,7 +2812,7 @@ pub fn attention_step(
     // at the release's global shape, one layer, one step, NVFP4 KV: 2.5 ms
     // against 4.2 at 16k of context, 7.8 against 33.2 at 64k, and 28.5 against
     // 143.8 at 256k.
-    if flash_cached_applies(d) {
+    if flash_cached_applies(d, 1, cache.cached_attention) {
         let tau = match (d.kind, log_scaling) {
             (AttnKind::Global, Some(ls)) => ls.tau(pos),
             _ => 1.0,
@@ -3121,7 +3105,7 @@ pub fn attention_steps_tree(
     // dense lane and [`attention_step`] was fused, they were not, and
     // [`drift_table_at_real_width`]'s batch=1 column — which had been exactly
     // zero — moved to 4e-3.
-    if tree.is_none() && flash_cached_applies(d) {
+    if tree.is_none() && flash_cached_applies(d, rows, cache.cached_attention) {
         let eff = d
             .rel_extent
             .min(pos0 + rows - base)
@@ -4232,6 +4216,7 @@ mod tests {
                 k_pre: Tensor::zeros([d.kernel - 1, kv_w], &dev),
                 v_pre: Tensor::zeros([d.kernel - 1, kv_w], &dev),
                 base: 0,
+                cached_attention: crate::models::inkling::flash::CachedAttentionPolicy::Legacy,
                 pending: None,
                 evicted: Vec::new(),
                 gap_dev: None,

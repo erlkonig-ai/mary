@@ -4,8 +4,8 @@
 //! [`super::tp`] is arithmetic: which rows of which tensor a rank owns. It can
 //! be reasoned about, tested and got wrong entirely on the host. This module is
 //! the other half — the part that has to touch the network — and it exists
-//! separately for exactly that reason: `tp`'s twelve tests run anywhere, and
-//! nothing here runs without two GPUs and a wire between them.
+//! separately for exactly that reason: the collective needs GPUs, while host
+//! framing and startup-policy agreement can be tested on CPU loopback sockets.
 //!
 //! # The property the whole design rests on, which is not the latency
 //!
@@ -267,6 +267,14 @@ impl Group {
 
     pub fn tp(&self) -> Tp {
         self.tp
+    }
+
+    /// Agree on the cached-attention policy before collective warmup or model
+    /// loading. Sequence digests cannot detect a hybrid policy: all-reduced
+    /// logits can agree even when the ranks computed different attention arms.
+    /// This uses only the existing host link and leaves pass framing untouched.
+    pub fn agree_cached_attention(&mut self, policy: super::flash::CachedAttentionPolicy) -> Result<()> {
+        agree_cached_attention_on_link(self.tp, &mut self.socks, policy)
     }
 
     /// The exact client the communicator was installed on.
@@ -738,6 +746,85 @@ impl Group {
             }
         }
         true
+    }
+}
+
+/// Socket-only startup check, separated from Group so its gate needs no CUDA.
+/// Followers send one digest; rank 0 returns its digest plus a whole-group
+/// verdict. A matching subset cannot proceed when another peer mismatches.
+fn agree_cached_attention_on_link(
+    tp: Tp,
+    peers: &mut [TcpStream],
+    policy: super::flash::CachedAttentionPolicy,
+) -> Result<()> {
+    let expected = if tp.rank() == 0 { tp.world() - 1 } else { 1 };
+    anyhow::ensure!(tp.is_split() && peers.len() == expected,
+        "cached-attention policy agreement has {} links for rank {} of {}",
+        peers.len(), tp.rank(), tp.world());
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"inkling cached-attention startup policy\0");
+    hasher.update(policy.as_str().as_bytes());
+    let digest = *hasher.finalize().as_bytes();
+    let timeouts = peers.iter().map(|peer| {
+        Ok((peer.read_timeout()?, peer.write_timeout()?))
+    }).collect::<std::io::Result<Vec<_>>>()
+        .context("read cached-attention policy link timeouts")?;
+
+    // All ranks have formed their sockets but have not entered NCCL. Bound an
+    // absent/older peer's handshake without changing later long-running waits.
+    let result = (|| -> Result<()> {
+        for peer in peers.iter() {
+            peer.set_read_timeout(Some(Duration::from_secs(30)))?;
+            peer.set_write_timeout(Some(Duration::from_secs(30)))?;
+        }
+        if tp.rank() == 0 {
+            let mut first_mismatch = None;
+            for (index, peer) in peers.iter_mut().enumerate() {
+                let mut theirs = [0u8; 32];
+                peer.read_exact(&mut theirs)
+                    .context("receive startup cached-attention policy digest")?;
+                if theirs != digest && first_mismatch.is_none() {
+                    first_mismatch = Some((index, theirs));
+                }
+            }
+            let mut reply = [0u8; 33];
+            reply[0] = u8::from(first_mismatch.is_none());
+            reply[1..].copy_from_slice(&digest);
+            for peer in peers.iter_mut() {
+                peer.write_all(&reply).context("send cached-attention whole-group verdict")?;
+            }
+            if let Some((index, theirs)) = first_mismatch {
+                anyhow::bail!(
+                    "cached-attention policy disagreement before loading weights: rank 0 chose {} \
+                     ({}), peer link {index} sent {}. The whole group must use the same policy",
+                    policy.as_str(), hex32(&digest), hex32(&theirs));
+            }
+        } else {
+            let peer = &mut peers[0];
+            peer.write_all(&digest).context("send startup cached-attention policy digest")?;
+            let mut reply = [0u8; 33];
+            peer.read_exact(&mut reply).context("receive cached-attention whole-group verdict")?;
+            anyhow::ensure!(reply[0] <= 1, "invalid cached-attention policy verdict {}", reply[0]);
+            let theirs: [u8; 32] = reply[1..].try_into().expect("fixed-size policy digest");
+            anyhow::ensure!(reply[0] == 1 && theirs == digest,
+                "cached-attention policy disagreement before loading weights: group rejected \
+                 rank {} policy {} ({}); rank 0 digest {}. The whole group must use the same policy",
+                tp.rank(), policy.as_str(), hex32(&digest), hex32(&theirs));
+        }
+        Ok(())
+    })();
+
+    // Restore every socket even when agreement or another restoration failed.
+    let mut restore_error = None;
+    for (peer, (read, write)) in peers.iter().zip(timeouts) {
+        for restored in [peer.set_read_timeout(read), peer.set_write_timeout(write)] {
+            if let Err(error) = restored { restore_error.get_or_insert(error); }
+        }
+    }
+    result?;
+    match restore_error {
+        Some(error) => Err(error).context("restore cached-attention policy link timeouts"),
+        None => Ok(()),
     }
 }
 
@@ -1265,6 +1352,82 @@ pub fn reduce_activation(
 #[cfg(test)]
 mod tests {
     use super::Pass;
+
+    /// The production socket-only helper, never a Group or CUDA client.
+    fn policy_loopback(policies: &[super::super::flash::CachedAttentionPolicy]) -> Vec<anyhow::Result<()>> {
+        use std::net::{TcpListener, TcpStream};
+        use std::time::Duration;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let mut leader = Vec::new();
+        let mut followers = Vec::new();
+        for _ in 1..policies.len() {
+            followers.push(TcpStream::connect(address).unwrap());
+            leader.push(listener.accept().unwrap().0);
+        }
+        let world = policies.len();
+        let run = |rank, mut peers: Vec<TcpStream>, policy| -> anyhow::Result<()> {
+            // Deliberately mixed pre-existing timeouts: restoring only to None
+            // would silently change later host-link semantics and fail here.
+            let read = (rank == 0).then_some(Duration::from_secs(7));
+            let write = (rank != 0).then_some(Duration::from_secs(9));
+            for peer in &peers {
+                peer.set_read_timeout(read).unwrap();
+                peer.set_write_timeout(write).unwrap();
+            }
+            let tp = super::Tp::new(rank, world).unwrap();
+            // A second matching exchange also proves no framing bytes remain.
+            for _ in 0..2 {
+                let result = super::agree_cached_attention_on_link(tp, &mut peers, policy);
+                for peer in &peers {
+                    assert_eq!(peer.read_timeout().unwrap(), read);
+                    assert_eq!(peer.write_timeout().unwrap(), write);
+                }
+                result?;
+            }
+            Ok(())
+        };
+        std::thread::scope(|scope| {
+            let threads: Vec<_> = followers.into_iter().enumerate().map(|(index, peer)| {
+                let policy = policies[index + 1];
+                let run = &run;
+                scope.spawn(move || run(index + 1, vec![peer], policy))
+            }).collect();
+            let mut results = vec![run(0, leader, policies[0])];
+            for thread in threads { results.push(thread.join().expect("loopback peer panicked")); }
+            results
+        })
+    }
+
+    #[test]
+    fn cached_attention_policy_agreement_accepts_both_matching_policies() {
+        use super::super::flash::CachedAttentionPolicy::{Legacy, PackedBatchedV1};
+        for policy in [Legacy, PackedBatchedV1] {
+            for result in policy_loopback(&[policy, policy]) { result.unwrap(); }
+        }
+    }
+
+    #[test]
+    fn cached_attention_policy_agreement_rejects_both_mismatch_directions() {
+        use super::super::flash::CachedAttentionPolicy::{Legacy, PackedBatchedV1};
+        for policies in [[Legacy, PackedBatchedV1], [PackedBatchedV1, Legacy]] {
+            for result in policy_loopback(&policies) {
+                let error = result.expect_err("hybrid policies must not reach collective warmup");
+                assert!(error.to_string().contains("cached-attention policy disagreement"), "{error:#}");
+            }
+        }
+    }
+
+    #[test]
+    fn cached_attention_policy_agreement_rejects_matching_subset_and_restores_timeouts() {
+        use super::super::flash::CachedAttentionPolicy::{Legacy, PackedBatchedV1};
+        let results = policy_loopback(&[Legacy, Legacy, PackedBatchedV1]);
+        assert_eq!(results.len(), 3);
+        for result in results {
+            let error = result.expect_err("every rank must receive the same rejecting verdict");
+            assert!(error.to_string().contains("cached-attention policy disagreement"), "{error:#}");
+        }
+    }
 
     #[test]
     fn distillation_work_round_trips_without_becoming_foreground_tokens() {

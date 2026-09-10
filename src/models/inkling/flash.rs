@@ -244,9 +244,15 @@
 //! (`groups` heads by `rows / groups` queries), and it is the tidier
 //! formulation of the two.
 //!
-//! # Reading NVFP4 in registers, and why it is OFF
+//! # Historical packed-reader measurements
 //!
-//! `INK_FLASH_FP4=1` swaps the fetch for the packed one: the kernel reads the
+//! The historical `INK_FLASH_FP4=1` experiment swapped the fetch for the packed
+//! one; that environment switch is no longer read. Sessions now select
+//! [`CachedAttentionPolicy`] explicitly, with [`CachedAttentionPolicy::Legacy`]
+//! preserving the dense reader and decode-sized tile by default. The following
+//! measurements describe the earlier reader experiments, not the batched policy.
+//!
+//! With the packed reader, the kernel reads the
 //! stored E2M1 codes and E4M3 block scales and decodes in registers, and no
 //! dequantised page is built at all. It is one comptime branch at two fetch
 //! sites; everything below them is the same code. The old note here said this
@@ -364,7 +370,7 @@
 //! sample is `mean(tile, tileB) / mean(dense, denseB) - 1` within one ABBA
 //! block; the interval is Student-t over seven samples. Both lengths use
 //! `INK_LAYERS=0:8`, `INK_GEN=40`, one GB10, and differ only in the input
-//! context and `INK_FLASH_FP4`:
+//! context and the historical `INK_FLASH_FP4` switch:
 //!
 //! | input context | paired step-time delta | 95% CI | favorable blocks |
 //! | ---: | ---: | ---: | ---: |
@@ -377,10 +383,10 @@
 //! Raw logs and TSVs are preserved as Files import
 //! `d6431dfa4c1e699b767e424a2785c1a4`.
 //!
-//! It is DECODE-only in effect: the prefill global arm reads freshly projected
-//! K and V rather than the cache, so it never reaches this flag — which is just
-//! as well, since a packed reader would turn prefill's one dequant an element
-//! into one per query tile.
+//! Those timings were decode-only. The initial uncached prefill still reads
+//! freshly projected K and V, not packed cache pages. Cached multi-query
+//! extensions also use this kernel now; their reader and query tile are selected
+//! together by the Session's explicit policy and need separate measurements.
 //!
 //! ## What it costs in registers, and what it does not spill
 //!
@@ -393,8 +399,9 @@
 //!
 //! ## What it removes regardless of the clock
 //!
-//! 84 dequant launches and 84 per-step allocations a step at 21 layers (168 at
-//! 42), sized by [`super::kvpages::Pages::read_rows`] and therefore re-sized
+//! In that historical growing-page layout, 84 dequant launches and 84 per-step
+//! allocations a step at 21 layers (168 at 42), sized by
+//! [`super::kvpages::Pages::read_rows`] and therefore re-sized
 //! whenever the read window grows. The flash partials `po` and `pml` remain and
 //! are still sized from the span, so this does not by itself make the decode
 //! path allocation-free — but it removes the buffer the KV-preallocation work
@@ -440,6 +447,60 @@ pub const ROWS_PREFILL: u32 = 32;
 /// registers a lane and the highest occupancy this kernel has, which is what a
 /// bandwidth-bound pass wants.
 pub const ROWS_DECODE: u32 = 4;
+
+/// Immutable cached-attention execution policy, selected when a Session loads.
+///
+/// Initial uncached prefill is unchanged. The candidate reads eligible NVFP4
+/// cache pages directly and uses a wider query tile only when there are enough
+/// queries to fill it. Changing the tile also changes split/reduction grouping,
+/// so this policy is part of persistent cache compatibility, not a live toggle.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CachedAttentionPolicy {
+    #[default]
+    #[serde(rename = "legacy")]
+    Legacy,
+    #[serde(rename = "packed-batched-v1")]
+    PackedBatchedV1,
+}
+
+impl CachedAttentionPolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::PackedBatchedV1 => "packed-batched-v1",
+        }
+    }
+
+    /// The default is omitted from serialized cache geometry to preserve the
+    /// already-written legacy identity byte for byte.
+    pub const fn is_legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+
+    /// Whether this shape may use packed KV. Dense stores and head widths that
+    /// end inside an NVFP4 block retain the dense reader under either policy.
+    pub fn packed_reader(self, head_dim: usize) -> bool {
+        !self.is_legacy() && head_dim != 0 && packed_head_dim_applies(head_dim)
+    }
+
+    /// Eligible tile for a cached query batch, or the existing unfused fallback.
+    /// A batch of one always has the same tile as single-token decode. If the
+    /// wider tile exceeds the shared-memory limit, keep the decode tile.
+    pub fn tile_rows(self, heads: usize, kv_heads: usize, head_dim: usize, nq: usize) -> Option<usize> {
+        if heads == 0 || kv_heads == 0 || heads % kv_heads != 0 || nq == 0 {
+            return None;
+        }
+        let groups = heads / kv_heads;
+        if !self.is_legacy() {
+            let rows = prefill_rows(groups);
+            if nq >= rows / groups && applies(heads, kv_heads, head_dim, rows) {
+                return Some(rows);
+            }
+        }
+        let rows = decode_rows(groups);
+        applies(heads, kv_heads, head_dim, rows).then_some(rows)
+    }
+}
 
 /// Negative infinity as the softmax's identity, spelled the way the rest of
 /// this module tree spells it: a large FINITE constant, so every guard against
@@ -973,8 +1034,9 @@ pub struct Gaps<'a> {
 ///
 /// A decode step's natural grid is `1 x kv_heads x 1` — eight cubes — and a
 /// device with dozens of SMs will run that at a few percent of its bandwidth.
-/// Splitting to roughly this many is what fills it. Prefill reaches it on the
-/// query axis alone and never splits.
+/// Splitting to roughly this many is what fills it. Multi-query batches can
+/// supply that parallelism on the query axis alone; wider query tiles may
+/// reduce their grid enough to require key splits again.
 const TARGET_CUBES: usize = 1024;
 
 /// The fewest keys worth giving a split.
@@ -994,7 +1056,7 @@ const MIN_KEYS_PER_SPLIT: usize = 128;
 /// are a `groups x (rows / groups)` rectangle spread over four planes; and the
 /// shared tile must fit the 48 KiB a static `__shared__` gets.
 pub fn applies(heads: usize, kv_heads: usize, head_dim: usize, rows: usize) -> bool {
-    if kv_heads == 0 || heads % kv_heads != 0 || head_dim == 0 || rows == 0 {
+    if heads == 0 || kv_heads == 0 || heads % kv_heads != 0 || head_dim == 0 || rows == 0 {
         return false;
     }
     let groups = heads / kv_heads;
@@ -1269,6 +1331,51 @@ pub fn flash_attention_launch<R: Runtime>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cached_attention_defaults_to_the_legacy_reader_and_tile() {
+        let policy = CachedAttentionPolicy::default();
+        assert_eq!(policy, CachedAttentionPolicy::Legacy);
+        assert_eq!(policy.as_str(), "legacy");
+        assert!(!policy.packed_reader(128));
+        for nq in [1, 2, 8, 90, 512] {
+            assert_eq!(policy.tile_rows(16, 4, 128, nq), Some(4));
+        }
+    }
+
+    #[test]
+    fn packed_batched_policy_waits_for_a_full_query_tile() {
+        let policy = CachedAttentionPolicy::PackedBatchedV1;
+        assert_eq!(policy.as_str(), "packed-batched-v1");
+        assert!(policy.packed_reader(128));
+        for nq in [1, 2, 7] {
+            assert_eq!(policy.tile_rows(16, 4, 128, nq), Some(4));
+        }
+        for nq in [8, 90, 512] {
+            assert_eq!(policy.tile_rows(16, 4, 128, nq), Some(32));
+        }
+        // Non-Inkling GQA also uses queries-per-tile, not a hard-coded eight.
+        assert_eq!(policy.tile_rows(24, 4, 128, 5), Some(12));
+        assert_eq!(policy.tile_rows(24, 4, 128, 6), Some(36));
+    }
+
+    #[test]
+    fn cached_policy_preserves_shape_and_packed_reader_fallbacks() {
+        let policy = CachedAttentionPolicy::PackedBatchedV1;
+        assert_eq!(policy.tile_rows(16, 4, 256, 512), Some(4));
+        assert_eq!(policy.tile_rows(16, 4, 1024, 512), None);
+        assert_eq!(policy.tile_rows(16, 4, 8, 512), Some(32));
+        assert!(!policy.packed_reader(8));
+        assert!(!policy.packed_reader(0));
+        for policy in [CachedAttentionPolicy::Legacy, policy] {
+            for (heads, kv_heads, head_dim, nq) in [
+                (0, 4, 128, 1), (16, 0, 128, 1), (16, 3, 128, 1),
+                (16, 4, 0, 1), (16, 4, 128, 0),
+            ] {
+                assert_eq!(policy.tile_rows(heads, kv_heads, head_dim, nq), None);
+            }
+        }
+    }
 
     #[test]
     fn inklings_global_shape_is_fused() {
@@ -1567,7 +1674,22 @@ mod device_tests {
         (words, scales)
     }
 
-    /// The same shape and the same key-axis cuts, read BOTH ways.
+    fn packed_rows(sh: &Shape, seed: usize) -> (Vec<u32>, Vec<u8>) {
+        let kv_row = sh.kv_heads * sh.head_dim;
+        let mut codes = Vec::with_capacity(sh.keys * kv_row / 8);
+        let mut scales = Vec::with_capacity(sh.keys * kv_row / 16);
+        for row in 0..sh.keys {
+            for head in 0..sh.kv_heads {
+                // Distinguish rows and heads, not just feature nibbles.
+                let (c, s) = packed_pair(sh.head_dim, seed + row * 5 + head * 3);
+                codes.extend(c);
+                scales.extend(s);
+            }
+        }
+        (codes, scales)
+    }
+
+    /// The same shape, key-axis cuts, live range and tile, read BOTH ways.
     ///
     /// The dense arm is production's, exactly: each cut goes through
     /// [`super::super::fp4quant::dequantize_nvfp4_bf16`] into a BF16 page and
@@ -1575,6 +1697,7 @@ mod device_tests {
     /// codes and scales. Nothing is decoded on the host, so nothing here can
     /// be wrong about what a byte means without the device being wrong the
     /// same way.
+    #[allow(clippy::too_many_arguments)]
     fn run_both_readers(
         sh: &Shape,
         q: &[f32],
@@ -1582,17 +1705,27 @@ mod device_tests {
         v: &(Vec<u32>, Vec<u8>),
         rel: &[f32],
         cuts: &[usize],
+        live: std::ops::Range<usize>,
+        tile_rows: usize,
+        gaps: &[(u32, u32)],
     ) -> (Vec<f32>, Vec<f32>) {
+        assert!(live.start <= live.end && live.end <= sh.keys);
+        assert!(gaps.is_empty() || (live.start == 0 && sh.window.is_none()),
+            "only global caches with no dropped prefix carry gaps");
         let kv_row = sh.kv_heads * sh.head_dim;
-        let groups = sh.heads / sh.kv_heads;
-        let rows = if sh.nq == 1 {
-            decode_rows(groups)
-        } else {
-            prefill_rows(groups)
-        };
         let client = <CudaRuntime as Runtime>::client(&Default::default());
         let qh = client.create_from_slice(f32::as_bytes(q));
         let rh = client.create_from_slice(f32::as_bytes(rel));
+        let gap_handles = if gaps.is_empty() {
+            None
+        } else {
+            let rows: Vec<u32> = gaps.iter().map(|g| g.0).collect();
+            let cums: Vec<u32> = gaps.iter().map(|g| g.1).collect();
+            Some((
+                client.create_from_slice(u32::as_bytes(&rows)),
+                client.create_from_slice(u32::as_bytes(&cums)),
+            ))
+        };
         let mut bounds = vec![0usize];
         bounds.extend_from_slice(cuts);
         bounds.push(sh.keys);
@@ -1632,8 +1765,12 @@ mod device_tests {
                 sh.eff,
                 sh.window,
                 1.0 / sh.head_dim as f32,
-                rows,
-                None,
+                tile_rows,
+                gap_handles.as_ref().map(|(rows, cums)| Gaps {
+                    rows,
+                    cums,
+                    count: gaps.len(),
+                }),
             );
             f32::from_bytes(&client.read_one(oh).expect("read the fused output")).to_vec()
         };
@@ -1646,9 +1783,9 @@ mod device_tests {
                 v_scales: None,
                 rows: *rows,
                 base: *base,
-                lo: 0,
-                hi: *rows,
-                row0: 0,
+                lo: live.start.saturating_sub(*base).min(*rows),
+                hi: live.end.saturating_sub(*base).min(*rows),
+                row0: base.saturating_sub(live.start),
             })
             .collect();
         let packed: Vec<KeyRun<'_>> = held
@@ -1660,9 +1797,9 @@ mod device_tests {
                 v_scales: Some(vs),
                 rows: *rows,
                 base: *base,
-                lo: 0,
-                hi: *rows,
-                row0: 0,
+                lo: live.start.saturating_sub(*base).min(*rows),
+                hi: live.end.saturating_sub(*base).min(*rows),
+                row0: base.saturating_sub(live.start),
             })
             .collect();
         (launch(&dense, KvElem::Bf16), launch(&packed, KvElem::Nvfp4))
@@ -1707,8 +1844,15 @@ mod device_tests {
             let v = packed_pair(n, 2);
             let q = fill(sh.nq * sh.heads * sh.head_dim, 0.1);
             let rel = fill(sh.nq * sh.heads * sh.eff, 0.7);
+            let groups = sh.heads / sh.kv_heads;
+            let tile_rows = if nq == 1 {
+                decode_rows(groups)
+            } else {
+                prefill_rows(groups)
+            };
             for cuts in [vec![], vec![keys / 2], vec![7, keys / 3, keys - 5]] {
-                let (dense, packed) = run_both_readers(&sh, &q, &k, &v, &rel, &cuts);
+                let (dense, packed) =
+                    run_both_readers(&sh, &q, &k, &v, &rel, &cuts, 0..keys, tile_rows, &[]);
                 assert!(
                     dense.iter().any(|x| x.abs() > 1e-6),
                     "nq {nq}, {keys} keys: the dense arm computed nothing to compare against"
@@ -1719,6 +1863,234 @@ mod device_tests {
                     "nq {nq}, {keys} keys, cuts {cuts:?}: worst |delta| {}",
                     worst(&dense, &packed)
                 );
+            }
+        }
+    }
+
+    /// The cached production call uses four rows per tile even for 512 query
+    /// rows; also gate the larger candidate tiles. Compare the readers only
+    /// within the same tile, with identical partitions and live bounds;
+    /// excluded NVFP4 rows contain NaN scales so accidental contributions cannot
+    /// quietly pass as finite agreement.
+    /// This tests the reader seam, not quantization or whole-Session numerics.
+    #[test]
+    #[ignore = "requires an explicitly reserved CUDA device; bounded packed reserved-range diagnostic"]
+    fn packed_reserved_reads_match_bf16_at_production_tile() {
+        // (query rows, first query position, live start, live end, window).
+        // The prefix-only query at 1023 independently exercises both bounds:
+        // neither causality nor a local window can hide the poisoned rows.
+        for (nq, q0, lo, hi, window) in [
+            (512usize, 129usize, 0usize, 641usize, None),
+            (90, 641, 0, 731, None),
+            (1, 640, 0, 641, None),
+            (1, 1023, 129, 641, None),
+            (90, 641, 129, 731, Some(512usize)),
+        ] {
+            let sh = Shape {
+                nq,
+                q0,
+                keys: 1024,
+                heads: 16,
+                kv_heads: 4,
+                head_dim: 128,
+                eff: 17,
+                window,
+            };
+            let kv_row = sh.kv_heads * sh.head_dim;
+            assert_eq!(decode_rows(sh.heads / sh.kv_heads), 4);
+            assert!(hi < sh.keys && hi % PLANE as usize != 0);
+            let pack = |seed: usize| {
+                let (mut codes, mut scales) = packed_rows(&sh, seed);
+                for row in (0..lo).chain(hi..sh.keys) {
+                    codes[row * kv_row / 8..(row + 1) * kv_row / 8].fill(0x7777_7777);
+                    // E4M3 0x7f is NaN; the finite code 7 decodes to +6.
+                    scales[row * kv_row / 16..(row + 1) * kv_row / 16].fill(0x7f);
+                }
+                (codes, scales)
+            };
+            let k = pack(1);
+            let v = pack(2);
+            let q = fill(sh.nq * sh.heads * sh.head_dim, 0.1);
+            let rel = fill(sh.nq * sh.heads * sh.eff, 0.7);
+            // The cuts are not tile-aligned; 900..1024 is entirely dead,
+            // and with lo=129, 0..7 is dead and 7..133 has a partial head.
+            // Equality is only between readers with the SAME cuts: changing
+            // partitions changes floating-point reduction order.
+            for cuts in [vec![], vec![7, 133, 700, 900]] {
+                for tile_rows in [4usize, 8, 16, 32] {
+                    let (dense, packed) = run_both_readers(
+                        &sh, &q, &k, &v, &rel, &cuts, lo..hi, tile_rows, &[],
+                    );
+                    assert_eq!(dense.len(), nq * sh.heads * sh.head_dim);
+                    assert!(dense.iter().any(|x| x.abs() > 1e-6),
+                        "nq {nq}, q0 {q0}, live {lo}..{hi}: the reference computed nothing");
+                    assert_eq!(worst(&dense, &packed), 0.0,
+                        "tile {tile_rows}, nq {nq}, q0 {q0}, live {lo}..{hi}, \
+                         window {window:?}, cuts {cuts:?}");
+                }
+            }
+        }
+    }
+
+    /// Two-pass scalar softmax with explicit absolute key positions. This
+    /// shares neither the device's tiling/split reduction nor its mask bounds.
+    /// The f64 arithmetic checks the kernel algorithm on fixed f32 operands;
+    /// it is not a claim that a higher-precision model is ground truth.
+    fn cpu_attention(
+        sh: &Shape,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        rel: &[f32],
+        key_positions: &[usize],
+    ) -> Vec<f64> {
+        let q_row = sh.heads * sh.head_dim;
+        let kv_row = sh.kv_heads * sh.head_dim;
+        assert_eq!(q.len(), sh.nq * q_row);
+        assert_eq!(k.len(), sh.keys * kv_row);
+        assert_eq!(v.len(), k.len());
+        assert_eq!(rel.len(), sh.nq * sh.heads * sh.eff);
+        assert_eq!(key_positions.len(), sh.keys);
+        let mut out = vec![0.0; q.len()];
+        for qi in 0..sh.nq {
+            let q_abs = sh.q0 + qi;
+            for h in 0..sh.heads {
+                let qoff = qi * q_row + h * sh.head_dim;
+                let kvh = h / (sh.heads / sh.kv_heads);
+                let mut scores = Vec::new();
+                for (ki, &k_abs) in key_positions.iter().enumerate() {
+                    if k_abs > q_abs || sh.window.is_some_and(|w| q_abs - k_abs >= w) {
+                        continue;
+                    }
+                    let koff = ki * kv_row + kvh * sh.head_dim;
+                    let dot: f64 = (0..sh.head_dim)
+                        .map(|d| f64::from(q[qoff + d]) * f64::from(k[koff + d]))
+                        .sum();
+                    let dist = q_abs - k_abs;
+                    let bias = if dist < sh.eff {
+                        f64::from(rel[(qi * sh.heads + h) * sh.eff + dist])
+                    } else {
+                        0.0
+                    };
+                    scores.push((koff, dot / sh.head_dim as f64 + bias));
+                }
+                assert!(!scores.is_empty(), "fixture query has no visible key");
+                let max = scores.iter().map(|(_, s)| *s).fold(f64::NEG_INFINITY, f64::max);
+                let denom: f64 = scores.iter().map(|(_, s)| (s - max).exp()).sum();
+                for (koff, score) in scores {
+                    let p = (score - max).exp() / denom;
+                    for d in 0..sh.head_dim {
+                        out[qoff + d] += p * f64::from(v[koff + d]);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn cpu_attention_oracle_uses_absolute_positions_and_window_edges() {
+        // Zero logits make the answer the visible values' arithmetic mean.
+        // Positions, rather than stored row numbers, decide visibility.
+        for (window, expected) in [
+            (None, [5.5, 5.5, 37.0]),
+            (Some(3usize), [10.0, 10.0, 100.0]),
+        ] {
+            let sh = Shape {
+                nq: 3,
+                q0: 3,
+                keys: 4,
+                heads: 1,
+                kv_heads: 1,
+                head_dim: 1,
+                eff: 1,
+                window,
+            };
+            let actual = cpu_attention(
+                &sh, &[0.0; 3], &[0.0; 4], &[1.0, 10.0, 100.0, 1000.0],
+                &[0.0; 3], &[0, 2, 5, 9],
+            );
+            assert_eq!(actual.len(), expected.len());
+            for (got, want) in actual.into_iter().zip(expected) {
+                assert!((got - want).abs() < 1e-12, "{got} versus {want}, window {window:?}");
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an explicitly reserved CUDA device; bounded cross-tile CPU-oracle diagnostic"]
+    fn cached_tiles_match_cpu_with_ragged_queries_windows_and_gaps() {
+        // These are separate production cases: only global caches have gaps.
+        // nq=37 leaves a ragged last query tile for rows 8, 16 and 32 at GQA4.
+        // With one 897-key run, rows=4 picks six key splits and rows>=8
+        // picks eight, so the oracle also covers a changed reduction partition.
+        for (window, gaps) in [
+            (None, vec![]),
+            (Some(19usize), vec![]),
+            (None, vec![(17u32, 5u32), (853, 19)]),
+        ] {
+            let sh = Shape {
+                nq: 37,
+                q0: 847,
+                keys: 897,
+                heads: 16,
+                kv_heads: 4,
+                head_dim: 32,
+                eff: 13,
+                window,
+            };
+            let k = packed_rows(&sh, 1);
+            let v = packed_rows(&sh, 2);
+            // The host codec uses the explicit E2M1 value ladder and E4M3
+            // exponent/mantissa decode, not either GPU reader's arithmetic.
+            let decode = |packed: &(Vec<u32>, Vec<u8>)| {
+                let bytes: Vec<u8> = packed.0.iter().flat_map(|word| word.to_le_bytes()).collect();
+                let mut values = vec![0.0; packed.0.len() * 8];
+                let count = super::super::nvfp4::decode_row(&bytes, &packed.1, 1.0, &mut values);
+                assert_eq!(count, values.len());
+                assert!(values.iter().all(|x| x.is_finite() && x.abs() <= 20.0));
+                values
+            };
+            let kd = decode(&k);
+            let vd = decode(&v);
+            let q = fill(sh.nq * sh.heads * sh.head_dim, 0.1);
+            let rel = fill(sh.nq * sh.heads * sh.eff, 0.7);
+            let key_positions: Vec<usize> = (0..sh.keys)
+                .map(|row| row + gaps.iter().rev()
+                    .find(|(at, _)| *at as usize <= row)
+                    .map_or(0, |(_, skipped)| *skipped as usize))
+                .collect();
+            let expected = cpu_attention(&sh, &q, &kd, &vd, &rel, &key_positions);
+            assert!(expected.iter().any(|x| x.abs() > 1e-3));
+            for cuts in [vec![], vec![7, 519, 859]] {
+                for tile_rows in [4usize, 8, 16, 32] {
+                    let (dense, packed) = run_both_readers(
+                        &sh, &q, &k, &v, &rel, &cuts, 0..sh.keys, tile_rows, &gaps,
+                    );
+                    assert_eq!(worst(&dense, &packed), 0.0,
+                        "reader mismatch: tile {tile_rows}, window {window:?}, gaps {gaps:?}");
+                    assert_eq!(dense.len(), expected.len());
+                    let (mut max_abs, mut max_scaled) = (0.0f64, 0.0f64);
+                    for (&actual, &want) in dense.iter().zip(&expected) {
+                        assert!(actual.is_finite() && want.is_finite());
+                        let error = (f64::from(actual) - want).abs();
+                        max_abs = max_abs.max(error);
+                        max_scaled = max_scaled.max(error / want.abs().max(1.0));
+                    }
+                    eprintln!(
+                        "cached tile {tile_rows}, window {window:?}, gaps {gaps:?}, \
+                         cuts {cuts:?}: max_abs={max_abs:e} max_scaled={max_scaled:e}"
+                    );
+                    // Tile width changes query grouping, split counts and
+                    // f32 reduction order. Allow ordinary dot/exp/softmax
+                    // rounding, not quantization error: these exact decoded
+                    // operands have |K|, |V| <= 20 and only 897 keys. The
+                    // absolute cap also bounds error at large reference values;
+                    // scaled error uses a floor of 1 to handle zero crossings.
+                    assert!(max_abs <= 5e-5 && max_scaled <= 1e-5,
+                        "CPU mismatch: tile {tile_rows}, window {window:?}, gaps {gaps:?}, \
+                         cuts {cuts:?}: max_abs={max_abs:e} max_scaled={max_scaled:e}");
+                }
             }
         }
     }
