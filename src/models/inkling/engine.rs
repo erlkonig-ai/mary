@@ -98,6 +98,8 @@ pub struct EngineConfig {
     pub preallocate_kv: bool,
     /// Explicit arena backing; non-Host choices are inference and aliases only.
     pub weight_storage: super::pile::WeightStorage,
+    /// Explicit immutable policy, including under the sealed profile.
+    pub cached_attention: super::flash::CachedAttentionPolicy,
     /// Rank, world and rendezvous, once `tpcomm::elect_rank` has decided them.
     pub tensor_parallel: Option<TensorParallel>,
     /// Refuse execution-changing environment overrides and announce
@@ -235,6 +237,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     let mut session_config = SessionConfig::new(&config.pile);
     session_config.preallocate_kv = config.preallocate_kv;
     session_config.weight_storage = config.weight_storage;
+    session_config.cached_attention = config.cached_attention;
     session_config.distillation = config.distillation.clone();
     if let Some(layers) = config.layers.clone() {
         session_config = session_config.layers(layers);
@@ -258,6 +261,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     execution_manifest.field("preallocate_kv", &[u8::from(config.preallocate_kv)]);
     execution_manifest.field("weight_arena", b"explicit-storage-v1");
     execution_manifest.field("weight_storage", config.weight_storage.as_str().as_bytes());
+    execution_manifest.field("cached_attention", config.cached_attention.as_str().as_bytes());
     let prefill_budget = session_config.prefill_budget;
     let context_budget = session_config.context_budget;
     let extend_batch = session_config.extend_batch;
@@ -281,8 +285,10 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
                 tensor_parallel.tp.world(),
                 tensor_parallel.rendezvous,
             );
-            let group = Group::form_default(tensor_parallel.tp, &tensor_parallel.rendezvous)
+            let mut group = Group::form_default(tensor_parallel.tp, &tensor_parallel.rendezvous)
                 .context("form the tensor-parallel group")?;
+            group.agree_cached_attention(config.cached_attention)
+                .context("agree on cached-attention policy before collective warmup and weight loading")?;
             group
                 .warm()
                 .context("warm and verify the tensor-parallel group")?;
@@ -2212,6 +2218,7 @@ mod tests {
                 context_budget: None,
                 preallocate_kv: false,
                 weight_storage,
+                cached_attention: super::super::flash::CachedAttentionPolicy::Legacy,
                 tensor_parallel: None,
                 sealed: false,
                 signing_key: None,

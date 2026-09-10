@@ -152,6 +152,7 @@ fn main() -> Result<()> {
         context_budget: Some(16384),
         preallocate_kv: false,
         weight_storage: mary::models::inkling::pile::WeightStorage::Host,
+        cached_attention: mary::models::inkling::flash::CachedAttentionPolicy::Legacy,
         tensor_parallel,
         sealed: false,
         // The bench writes a version through its own --save flow, if at all.

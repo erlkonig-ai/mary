@@ -114,6 +114,7 @@ use super::assembly::{
 };
 use super::attn::{AttnDims, LogScaling};
 use super::config::{AttnKind, InklingConfig};
+use super::flash::CachedAttentionPolicy;
 use super::host_trace;
 use super::pile::{Elem, WeightStorage};
 use super::pool::{CleanupGate, CleanupPolicy};
@@ -274,6 +275,9 @@ pub struct SessionConfig {
     /// direct aliases, never a second full copied weight arena.
     pub weight_storage: WeightStorage,
 
+    /// Immutable reader/query-tile policy for cached attention.
+    pub cached_attention: CachedAttentionPolicy,
+
     /// Additional independent sequences, in creation order. Each entry reserves
     /// its own persistent KV and convolution histories before weights load.
     /// Empty by default: sharing weights does not make another cache free.
@@ -346,6 +350,7 @@ impl SessionConfig {
             context_budget: 4096,
             preallocate_kv: false,
             weight_storage: WeightStorage::Host,
+            cached_attention: CachedAttentionPolicy::Legacy,
             sequence_context_budgets: Vec::new(),
             extra_reserved_bytes: 0,
             distillation: None,
@@ -484,6 +489,8 @@ pub struct Session {
     caches: Vec<LayerCache>,
     /// Typed reservation, independent of the diagnostic environment lane.
     kv_plan: Option<super::kvpages::KvPlan>,
+    /// Retained across reset, capsule swaps and portable-cache restoration.
+    cached_attention: CachedAttentionPolicy,
     /// How many positions the caches hold — the next token's position.
     pos: usize,
     /// The token the last pass produced, which is what [`Session::step`] feeds.
@@ -1262,6 +1269,7 @@ impl Session {
             cleanup.name(),
             cleanup_gate.schedule()
         );
+        println!("    cached attention: {}", cfg.cached_attention.as_str());
 
         Ok(Self {
             cfg: conf,
@@ -1294,6 +1302,7 @@ impl Session {
             anchor: Vec::new(),
             caches: Vec::new(),
             kv_plan,
+            cached_attention: cfg.cached_attention,
             pos: 0,
             last: None,
             extend_batch: cfg.extend_batch,
@@ -1405,7 +1414,8 @@ impl Session {
             act_bf16: dev_lane::act_bf16(),
             resid_bf16: super::resid::resid_bf16(),
             flash: dev_lane::flash_lane(),
-            flash_fp4: dev_lane::flash_fp4(),
+            flash_fp4: !self.cached_attention.is_legacy(),
+            cached_attention: self.cached_attention,
             head_rms_native: super::headnorm::head_rms_native(),
             sink_down_fused: super::assembly::sink_down_fused(),
             dense_fake_quant: super::assembly::dense_fake_quant(),
@@ -1500,7 +1510,8 @@ impl Session {
         let mut caches = Vec::with_capacity(state.layers.len());
         for layer in &state.layers {
             caches.push(LayerCache {
-                attn: dev_lane::AttnCache::restore_cache(&layer.attn, &self.client, &self.dev, source)?,
+                attn: dev_lane::AttnCache::restore_cache(
+                    &layer.attn, &self.client, &self.dev, self.cached_attention, source)?,
                 attn_sconv: cache_state::restore_float(&layer.attn_sconv, &self.client, &self.dev, source)?,
                 mlp_sconv: Some(cache_state::restore_float(&layer.mlp_sconv, &self.client, &self.dev, source)?),
                 attn_sconv_pending: None,
@@ -1558,6 +1569,8 @@ impl Session {
         let mut local_layers = 0usize;
         for layer in self.lo..self.hi {
             let cache = &self.caches[layer - self.lo].attn;
+            anyhow::ensure!(cache.cached_attention() == self.cached_attention,
+                "layer {layer} cached-attention policy differs from its Session");
             let kind = t.attn_kind(layer);
             local_layers += usize::from(kind == AttnKind::Local);
             let (expected_base, mut expected_len) =
@@ -2559,8 +2572,9 @@ impl Session {
                     out
                 }
                 (false, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, _) => {
-                    let (y, mut attn) =
+                    let (y, attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
+                    let mut attn = attn.with_cached_attention(self.cached_attention);
                     if let Some(plan) = self.kv_plan {
                         let _trace_reserve = host_trace::span("kv_reservation");
                         attn.reserve_kv_with_plan(window, plan, dev)?;
@@ -3096,6 +3110,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cached_attention_configuration_defaults_to_legacy() {
+        let mut config = SessionConfig::new("not-opened.pile");
+        assert_eq!(config.cached_attention, CachedAttentionPolicy::Legacy);
+        config.cached_attention = CachedAttentionPolicy::PackedBatchedV1;
+        assert_eq!(config.clone().cached_attention, CachedAttentionPolicy::PackedBatchedV1);
+    }
+
+    #[test]
     fn inference_weight_storage_rejects_every_admitted_writer() {
         for storage in [WeightStorage::HostReadOnly, WeightStorage::CudaManaged] {
             assert!(validate_weight_writers(storage, false, false).is_ok());
@@ -3122,29 +3144,38 @@ mod tests {
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_session_roundtrip_after_local_window_rollover() -> Result<()> {
-        session_cache_roundtrip(false, WeightStorage::Host, 128, 17)
+        session_cache_roundtrip(false, WeightStorage::Host, CachedAttentionPolicy::Legacy, 128, 17)
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_preallocated_session_roundtrip_with_wide_append() -> Result<()> {
-        session_cache_roundtrip(true, WeightStorage::Host, 1024, 777)
+        session_cache_roundtrip(true, WeightStorage::Host, CachedAttentionPolicy::Legacy, 1024, 777)
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_read_only_weights_session_roundtrip() -> Result<()> {
-        session_cache_roundtrip(true, WeightStorage::HostReadOnly, 1024, 777)
+        session_cache_roundtrip(true, WeightStorage::HostReadOnly, CachedAttentionPolicy::Legacy, 1024, 777)
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_cuda_managed_weights_session_roundtrip() -> Result<()> {
-        session_cache_roundtrip(true, WeightStorage::CudaManaged, 1024, 777)
+        session_cache_roundtrip(true, WeightStorage::CudaManaged, CachedAttentionPolicy::Legacy, 1024, 777)
+    }
+
+    /// Two local diagnostic layers test policy plumbing, not full-model quality
+    /// or global-attention correctness. Inputs are explicit synthetic IDs only.
+    #[test]
+    #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
+    fn portable_cache_packed_batched_policy_survives_lifecycle() -> Result<()> {
+        session_cache_roundtrip(true, WeightStorage::Host,
+            CachedAttentionPolicy::PackedBatchedV1, 512, 90)
     }
 
     fn session_cache_roundtrip(preallocate_kv: bool, weight_storage: WeightStorage,
-        prefill: usize, tail_rows: usize) -> Result<()>
+        cached_attention: CachedAttentionPolicy, prefill: usize, tail_rows: usize) -> Result<()>
     {
         use super::super::cache_state::{MAX_CHUNK_BYTES, SessionCacheState};
         const CONTEXT: usize = 2048;
@@ -3172,6 +3203,7 @@ mod tests {
         config.context_budget = CONTEXT;
         config.preallocate_kv = preallocate_kv;
         config.weight_storage = weight_storage;
+        config.cached_attention = cached_attention;
         config.prefill_budget = prefill;
         config.extend_batch = prefill;
         config.target_budget = 0;
@@ -3211,8 +3243,11 @@ mod tests {
         session.prefill(&prefix)?;
         assert_eq!(session.position(), prefix_rows);
         assert_eq!(session.validate_cache_completeness()?, 2);
+        assert!(session.caches.iter().all(|cache|
+            cache.attn.clone().cached_attention() == cached_attention));
         let checkpoint = save(&session, &mut blobs, &mut held)?;
         assert_eq!(checkpoint.identity, identity);
+        assert_eq!(checkpoint.geometry.cached_attention, cached_attention);
         assert_eq!(checkpoint.geometry.kv_local_rows.is_some(), preallocate_kv);
         for layer in &checkpoint.layers {
             assert_eq!(layer.attn.base, prefix_rows - window);
@@ -3224,6 +3259,15 @@ mod tests {
                 assert_eq!(Some(layer.attn.v.reserved), checkpoint.geometry.kv_local_rows);
             }
         }
+        if !cached_attention.is_legacy() {
+            // Exercise the narrow decode tile with an explicit input token,
+            // then rewind the same policy-bearing caches before the wide tail.
+            let rewind = session.checkpoint()?;
+            session.extend(&[synthetic(prefix_rows)])?;
+            session.rewind(&rewind)?;
+            assert_eq!(session.validate_cache_completeness()?, 2);
+            assert_eq!(save(&session, &mut blobs, &mut held)?, checkpoint);
+        }
         let expected_prediction = session.extend(&tail)?;
         let expected = save(&session, &mut blobs, &mut held)?;
         assert_eq!(expected.position, prefix_rows + tail_rows);
@@ -3231,6 +3275,21 @@ mod tests {
         // A failed restore may allocate temporary pages, but cannot install any
         // of them or leave a fresh-looking usable Session behind.
         session.reset();
+        assert_eq!(session.cached_attention, cached_attention);
+        assert_eq!(session.cache_identity()?, identity);
+        let mut incompatible = checkpoint.clone();
+        incompatible.geometry.cached_attention = match cached_attention {
+            CachedAttentionPolicy::Legacy => CachedAttentionPolicy::PackedBatchedV1,
+            CachedAttentionPolicy::PackedBatchedV1 => CachedAttentionPolicy::Legacy,
+        };
+        incompatible.geometry.flash_fp4 = !incompatible.geometry.cached_attention.is_legacy();
+        incompatible.identity = incompatible.geometry.identity()?;
+        let mut source_called = false;
+        assert!(session.restore_cache(&incompatible, &mut |_, _| {
+            source_called = true;
+            anyhow::bail!("incompatible policy must be refused before requesting payload")
+        }).is_err());
+        assert!(!source_called && !session.torn && session.caches.is_empty());
         session.validate_cache(&checkpoint)?;
         let first = checkpoint.chunks().next().context("nonempty cache has no payload")?.handle;
         let error = session.restore_cache(&checkpoint, &mut |hash, bytes| {
@@ -3262,7 +3321,15 @@ mod tests {
         let actual = save(&session, &mut blobs, &mut held)?;
         assert_eq!(actual, expected,
             "identical explicit tail changed complete KV/history state after restore");
-        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} weight_storage={} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}", weight_storage.as_str());
+        if !cached_attention.is_legacy() {
+            session.reset();
+            assert_eq!(session.cache_identity()?, identity);
+            session.prefill(&prefix)?;
+            assert_eq!(session.validate_cache_completeness()?, 2);
+            assert_eq!(save(&session, &mut blobs, &mut held)?, checkpoint,
+                "reset did not recreate the same policy-bearing prefix caches");
+        }
+        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} weight_storage={} cached_attention={} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}", weight_storage.as_str(), cached_attention.as_str());
         Ok(())
     }
 

@@ -1180,3 +1180,8 @@ required-features = ["inkling-cuda", "tokenizer"]
 [[bin]]
 name = "inkling_train_online"
 required-features = ["inkling-cuda", "tokenizer"]
+
+# Synthetic cached-attention reader/tile comparison; no model or pile access.
+[[bin]]
+name = "inkling_cached_attention_bench"
+required-features = ["inkling-cuda"]
