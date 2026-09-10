@@ -213,6 +213,11 @@ pub struct CacheGeometry {
     pub router: String,
     pub shared_halved: bool,
     pub kv_prealloc: Option<usize>,
+    /// Explicit Session reservation, including an entire pending prefill chunk.
+    /// Omitted on the existing environment/growing lanes so their serialized
+    /// compatibility identity is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kv_local_rows: Option<usize>,
     pub kv_epoch: usize,
     pub fp4: bool,
     pub attn_bf16: bool,
@@ -227,6 +232,21 @@ pub struct CacheGeometry {
 }
 
 impl CacheGeometry {
+    fn reservation_rows(&self, context: usize, window: Option<usize>) -> Result<usize> {
+        match (window, self.kv_local_rows) {
+            (Some(window), Some(rows)) => {
+                let needed = window.checked_add(self.prefill_budget.max(self.kv_epoch))
+                    .context("local KV append capacity overflow")?;
+                let needed = needed.checked_next_multiple_of(self.kv_epoch)
+                    .context("local KV reservation overflow")?;
+                ensure!(self.kv_prealloc.is_some() && rows == needed,
+                    "explicit local KV reservation does not match admitted append width");
+                Ok(rows)
+            }
+            _ => reservation_rows(context, window, self.kv_epoch),
+        }
+    }
+
     pub fn identity(&self) -> Result<[u8; 32]> {
         Ok(*blake3::hash(&serde_json::to_vec(&(CACHE_FORMAT_VERSION, self))?).as_bytes())
     }
@@ -285,7 +305,7 @@ impl SessionCacheState {
             ensure!(attn.k.pages.iter().map(|p| p.values.shape[0]).eq(
                 attn.v.pages.iter().map(|p| p.values.shape[0])), "K and V page boundaries disagree");
             let live_limit = geometry.window.unwrap_or(expected.context_budget);
-            let capacity = reservation_rows(expected.context_budget, geometry.window, expected.kv_epoch)?;
+            let capacity = expected.reservation_rows(expected.context_budget, geometry.window)?;
             let max_capacity = capacity.checked_add(super::kvpages::PAGE)
                 .context("cache capacity limit overflow")?;
             for store in [&attn.k, &attn.v] {
@@ -293,9 +313,11 @@ impl SessionCacheState {
                 ensure!(store.fp4 == (expected.fp4 && geometry.kv_width % super::kvpages::FP4_ROW_ALIGN == 0)
                     && store.dtype == if expected.attn_bf16 { CacheDType::Bf16 } else { CacheDType::F32 },
                     "cache KV encoding does not match the execution lane");
+                ensure!(expected.kv_local_rows.is_none() || store.reserved > 0,
+                    "explicitly preallocated runtime cannot restore a growing KV store");
                 if store.reserved > 0 {
                     let context = expected.kv_prealloc.context("cache is reserved but runtime preallocation is off")?;
-                    ensure!(store.reserved == reservation_rows(context, geometry.window, expected.kv_epoch)?
+                    ensure!(store.reserved == expected.reservation_rows(context, geometry.window)?
                         && store.epoch == expected.kv_epoch, "cache reservation does not match runtime");
                 }
             }
@@ -494,7 +516,7 @@ mod tests {
             model_identity: [1; 32], model_root: Some([2; 16]), config_identity: [3; 32],
             rank: 0, world: 2, hidden: 128, kernel: 4, sliding_window: 4, vocab: 32,
             context_budget: 1024, extend_batch: 16, prefill_budget: 16, forbidden: vec![0, 1],
-            router: "bf16".to_owned(), shared_halved: true, kv_prealloc: None, kv_epoch: 512,
+            router: "bf16".to_owned(), shared_halved: true, kv_prealloc: None, kv_local_rows: None, kv_epoch: 512,
             fp4: true, attn_bf16: true, act_bf16: true, resid_bf16: true, flash: true,
             flash_fp4: true, head_rms_native: false, sink_down_fused: false, dense_fake_quant: false,
             layers: vec![
@@ -628,5 +650,34 @@ mod tests {
         assert!(state.validate().is_err());
         let empty_history = tensor([0, 64], CacheDType::F32, 0, 0);
         empty_history.validate().unwrap();
+    }
+
+    #[test]
+    fn portable_cache_explicit_reservation_pins_wide_local_capacity() {
+        let mut state = fixture();
+        let legacy_json = serde_json::to_string(&state.geometry).unwrap();
+        assert!(!legacy_json.contains("kv_local_rows"));
+        let legacy: CacheGeometry = serde_json::from_str(&legacy_json).unwrap();
+        assert_eq!(legacy.identity().unwrap(), state.geometry.identity().unwrap());
+        state.geometry.prefill_budget = 1024;
+        state.geometry.kv_prealloc = Some(1024);
+        state.geometry.kv_local_rows = Some(1536);
+        state.identity = state.geometry.identity().unwrap();
+        assert!(state.validate(&state.geometry).is_err(), "advertised reservation must exist");
+        for (layer, geometry) in state.layers.iter_mut().zip(&state.geometry.layers) {
+            let rows = if geometry.window.is_some() { 1536 } else { 1024 };
+            for store in [&mut layer.attn.k, &mut layer.attn.v] {
+                store.reserved = rows;
+                store.epoch = 512;
+                store.read = 512;
+                store.pages[0].values.shape[0] = rows;
+                store.pages[0].scales.as_mut().unwrap().shape[0] = rows;
+            }
+        }
+        state.validate(&state.geometry).unwrap();
+        let mut wrong = state.geometry.clone();
+        wrong.kv_local_rows = Some(1024);
+        assert_ne!(wrong.identity().unwrap(), state.identity);
+        assert!(state.validate(&wrong).is_err());
     }
 }

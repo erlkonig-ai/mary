@@ -77,7 +77,7 @@
 
 use crate::models::inkling::config::{AttnKind, InklingTextConfig};
 use crate::models::inkling::pool::AllocatorConfig;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use cubecl::prelude::{ComputeClient, Runtime};
 
 /// The row alignment Burn's f32 matmul pads its output to.
@@ -782,6 +782,90 @@ pub fn chunked_prefill_activation_bytes(
     one_pass - chunk_kv + context_kv
 }
 
+/// The chunked live-set charge with an optional explicit KV reservation.
+///
+/// Reservation REPLACES the retained-context KV term; it is not a second
+/// cache beside that term. All transient activation charges remain unchanged.
+pub fn chunked_prefill_activation_bytes_with_kv_plan(
+    t: &InklingTextConfig,
+    layers: core::ops::Range<usize>,
+    chunk_tokens: usize,
+    context_tokens: usize,
+    policy: AdmissionPolicy,
+    plan: Option<super::kvpages::KvPlan>,
+) -> Result<u64> {
+    anyhow::ensure!(chunk_tokens > 0 && chunk_tokens <= context_tokens,
+        "a KV-admitted chunk must fit a nonempty context");
+    anyhow::ensure!(policy.tp_world > 0 && layers.start <= layers.end
+        && layers.end <= t.num_hidden_layers, "invalid KV admission placement");
+    let Some(plan) = plan else {
+        return Ok(chunked_prefill_activation_bytes(t, layers, chunk_tokens, context_tokens, policy));
+    };
+    anyhow::ensure!(plan.context == context_tokens,
+        "KV reservation context {} differs from admitted context {context_tokens}", plan.context);
+    if layers.clone().any(|layer| t.attn_kind(layer) == AttnKind::Local) {
+        let local_min = t.sliding_window_size.checked_add(chunk_tokens)
+            .context("local KV continuation capacity overflow")?;
+        anyhow::ensure!(plan.local_rows >= local_min,
+            "local KV reservation cannot hold the window plus a {chunk_tokens}-row append");
+    }
+    let reserved = reserved_kv_bytes(t, layers.clone(), plan, policy)?;
+    let one_pass = prefill_activation_bytes(t, layers.clone(), chunk_tokens, policy);
+    let chunk_kv = kv_cache_bytes(t, layers, chunk_tokens, policy);
+    one_pass.checked_sub(chunk_kv).and_then(|transient| transient.checked_add(reserved))
+        .context("reserved chunked-prefill admission overflow")
+}
+
+/// Exact packed KV reservation bytes on ONE tensor-parallel rank.
+///
+/// Local and global layers may have different KV head counts or head widths.
+/// Validate each actual stored width, rather than dividing one global-width
+/// estimate or silently pricing a non-FP4 fallback. Allocation-cap checks are
+/// separate: this is the sum of both planes of both K and V, not a max buffer.
+pub fn reserved_kv_bytes(
+    t: &InklingTextConfig,
+    layers: core::ops::Range<usize>,
+    plan: super::kvpages::KvPlan,
+    policy: AdmissionPolicy,
+) -> Result<u64> {
+    use super::kvpages::FP4_ROW_ALIGN;
+
+    anyhow::ensure!(policy.tp_world > 0 && layers.start <= layers.end
+        && layers.end <= t.num_hidden_layers, "invalid reserved KV placement");
+    anyhow::ensure!(plan.context > 0 && plan.epoch > 0
+        && plan.global_rows >= plan.context && plan.local_rows >= plan.epoch
+        && plan.global_rows <= u32::MAX as usize && plan.local_rows <= u32::MAX as usize
+        && plan.global_rows.is_multiple_of(plan.epoch) && plan.local_rows.is_multiple_of(plan.epoch),
+        "invalid KV reservation geometry");
+    let mut total = 0u128;
+    for layer in layers {
+        let kind = t.attn_kind(layer);
+        let (_, heads, head_dim) = t.heads(kind);
+        anyhow::ensure!(heads > 0 && heads.is_multiple_of(policy.tp_world),
+            "layer {layer} has {heads} KV heads, not divisible by TP world {}", policy.tp_world);
+        let width = (heads / policy.tp_world).checked_mul(head_dim)
+            .context("rank-local KV width overflow")?;
+        anyhow::ensure!(width > 0 && width.is_multiple_of(FP4_ROW_ALIGN),
+            "layer {layer} rank-local KV width {width} is not a positive multiple of {FP4_ROW_ALIGN}");
+        let rows = match kind {
+            AttnKind::Global => plan.global_rows,
+            AttnKind::Local => {
+                let minimum = t.sliding_window_size.checked_add(plan.epoch)
+                    .context("local KV reservation minimum overflow")?;
+                anyhow::ensure!(plan.local_rows >= minimum,
+                    "local KV reservation is smaller than its window plus an epoch");
+                plan.local_rows
+            }
+        };
+        // Code words plus packed scale words, each four bytes, for BOTH K/V.
+        let row_bytes = ((width / 8) as u128 + (width / 64) as u128) * 4;
+        let bytes = (rows as u128).checked_mul(row_bytes).and_then(|n| n.checked_mul(2))
+            .context("reserved KV layer byte count overflow")?;
+        total = total.checked_add(bytes).context("reserved KV byte count overflow")?;
+    }
+    u64::try_from(total).context("reserved KV byte count exceeds u64")
+}
+
 /// What the KV caches of this layer range hold at this length, GROWN ON
 /// DEMAND: keys and values, retained rows only.
 ///
@@ -1068,11 +1152,13 @@ pub fn kv_reserve_line(
 mod tests {
     use super::{
         AdmissionPolicy, QUERY_BLOCK_BYTES, RoutedLane, StorageDType, activation_bytes,
-        attention_activation_bytes, chunked_prefill_activation_bytes, kv_cache_bytes,
+        attention_activation_bytes, chunked_prefill_activation_bytes,
+        chunked_prefill_activation_bytes_with_kv_plan, kv_cache_bytes,
         largest_buffer, longest_sequence, mlp_activation_bytes, prefill_activation_bytes,
-        prefill_peak_bytes, query_block, score_block_bytes, score_matrix_bytes,
+        prefill_peak_bytes, query_block, reserved_kv_bytes, score_block_bytes, score_matrix_bytes,
     };
     use crate::models::inkling::config::{AttnKind, InklingTextConfig};
+    use crate::models::inkling::kvpages::KvPlan;
     use crate::models::inkling::pool::AllocatorConfig;
 
     fn wide() -> AdmissionPolicy {
@@ -1252,6 +1338,74 @@ mod tests {
             kv_cache_bytes(&t, 0..8, context, wide()) - kv_cache_bytes(&t, 0..8, chunk, wide());
         assert_eq!(actual, one_pass + extra_kv);
         assert!(actual > one_pass);
+    }
+
+    #[test]
+    fn explicit_kv_reservation_prices_one_tp_rank_and_each_layers_width() {
+        let mut t = small();
+        let plan = KvPlan::for_session(1 << 20, 512, 512).unwrap();
+        let whole = reserved_kv_bytes(&t, 0..42, plan, narrow()).unwrap();
+        let rank = reserved_kv_bytes(&t, 0..42, plan, narrow().with_tp_world(2)).unwrap();
+        assert_eq!(whole, 2 * rank);
+        assert_eq!(rank, 2 * (7 * plan.global_rows as u64 + 35 * 1_024) * 288);
+
+        // A coherent local head geometry different in BOTH axes from global.
+        t.swa_num_attention_heads = 16;
+        t.swa_num_key_value_heads = 16;
+        t.swa_head_dim = 256;
+        let rank = reserved_kv_bytes(&t, 0..42, plan, narrow().with_tp_world(2)).unwrap();
+        let want = 2 * (7 * plan.global_rows as u64 * KvPlan::row_bytes(512)
+            + 35 * plan.local_rows as u64 * KvPlan::row_bytes(2_048));
+        assert_eq!(rank, want, "do not price every layer at the global KV width");
+    }
+
+    #[test]
+    fn explicit_kv_reservation_replaces_the_growing_charge_exactly_once() {
+        let t = small();
+        let policy = narrow().with_tp_world(2);
+        let (chunk, context) = (4_096, 32_769);
+        let plan = KvPlan::for_session(context, t.sliding_window_size, chunk).unwrap();
+        let growing = chunked_prefill_activation_bytes(&t, 0..42, chunk, context, policy);
+        assert_eq!(chunked_prefill_activation_bytes_with_kv_plan(
+            &t, 0..42, chunk, context, policy, None).unwrap(), growing);
+        let reserved = reserved_kv_bytes(&t, 0..42, plan, policy).unwrap();
+        let fixed = chunked_prefill_activation_bytes_with_kv_plan(
+            &t, 0..42, chunk, context, policy, Some(plan)).unwrap();
+        let replaced = kv_cache_bytes(&t, 0..42, context, policy);
+        assert_eq!(fixed, growing - replaced + reserved);
+        assert!(fixed < growing + reserved, "a reservation is not a second cache");
+
+        let too_narrow = KvPlan::for_session(context, t.sliding_window_size, 1).unwrap();
+        assert!(chunked_prefill_activation_bytes_with_kv_plan(
+            &t, 0..42, chunk, context, policy, Some(too_narrow)).is_err());
+        assert!(chunked_prefill_activation_bytes_with_kv_plan(
+            &t, 0..42, chunk, context + 1, policy, Some(plan)).is_err());
+    }
+
+    #[test]
+    fn explicit_kv_reservation_refuses_invalid_tp_widths_and_geometry() {
+        let mut t = small();
+        let plan = KvPlan::for_session(4_096, 512, 512).unwrap();
+        for world in [0, 3] {
+            assert!(reserved_kv_bytes(&t, 0..42, plan, narrow().with_tp_world(world)).is_err());
+        }
+        assert!(reserved_kv_bytes(&t, 0..43, plan, narrow()).is_err());
+        assert!(reserved_kv_bytes(&t, 0..42, KvPlan { epoch: 0, ..plan }, narrow()).is_err());
+        assert!(reserved_kv_bytes(&t, 0..42, KvPlan { local_rows: 512, ..plan }, narrow()).is_err());
+        t.head_dim = 1;
+        assert!(reserved_kv_bytes(&t, 5..6, plan, narrow()).is_err(), "reject a non-FP4 width");
+        t.head_dim = usize::MAX;
+        assert!(reserved_kv_bytes(&t, 5..6, plan, narrow()).is_err(), "checked width multiply");
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn explicit_kv_reservation_refuses_byte_count_overflow() {
+        let mut t = small();
+        t.num_key_value_heads = 1;
+        t.head_dim = usize::MAX & !63;
+        let plan = KvPlan::for_session(1 << 20, 512, 512).unwrap();
+        assert!(reserved_kv_bytes(&t, 5..6, plan, narrow()).is_err());
     }
 
     /// The routed-expert lane is the peak, and by a wide margin.

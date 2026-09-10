@@ -93,6 +93,9 @@ pub struct EngineConfig {
     pub prefill_budget: Option<usize>,
     /// Maximum positions the session may retain across all turns.
     pub context_budget: Option<usize>,
+    /// Reserve packed KV for the admitted context instead of growing pages.
+    /// Explicit serving shape, including under the sealed execution profile.
+    pub preallocate_kv: bool,
     /// Rank, world and rendezvous, once `tpcomm::elect_rank` has decided them.
     pub tensor_parallel: Option<TensorParallel>,
     /// Refuse execution-changing environment overrides and announce
@@ -227,6 +230,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     }
 
     let mut session_config = SessionConfig::new(&config.pile);
+    session_config.preallocate_kv = config.preallocate_kv;
     session_config.distillation = config.distillation.clone();
     if let Some(layers) = config.layers.clone() {
         session_config = session_config.layers(layers);
@@ -247,6 +251,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // with 7 of 42 layers global, halved under tensor parallelism), which is
     // what the budget is FOR. A caller may still name a smaller one.
     session_config.context_budget = config.context_budget.unwrap_or(1 << 20);
+    execution_manifest.field("preallocate_kv", &[u8::from(config.preallocate_kv)]);
     let prefill_budget = session_config.prefill_budget;
     let context_budget = session_config.context_budget;
     let extend_batch = session_config.extend_batch;

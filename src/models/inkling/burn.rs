@@ -1008,11 +1008,28 @@ impl AttnCache<Bk> {
             // with the numbers.
             return;
         }
+        self.reserve_kv_with_plan(window, plan, dev)
+            .expect("validated diagnostic KV reservation");
+    }
+
+    /// Apply an explicitly admitted plan. Unlike the diagnostic environment
+    /// wrapper, a requested reservation must never silently remain growing.
+    pub(crate) fn reserve_kv_with_plan(
+        &mut self,
+        window: Option<usize>,
+        plan: super::kvpages::KvPlan,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> anyhow::Result<()> {
+        let rows = plan.rows_for(window);
+        anyhow::ensure!(self.kv_is_fp4(), "explicit KV reservation requires packed NVFP4 stores");
+        anyhow::ensure!(self.k.len() <= rows && self.v.len() <= rows,
+            "retained KV does not fit the admitted reservation");
         let placeholder = || super::kvpages::KvStore::wide(1);
         let k = std::mem::replace(&mut self.k, placeholder());
         self.k = k.into_reserved(rows, plan.epoch, dev);
         let v = std::mem::replace(&mut self.v, placeholder());
         self.v = v.into_reserved(rows, plan.epoch, dev);
+        Ok(())
     }
 
     /// Absolute positions this cache has evicted: sorted, merged, half-open.

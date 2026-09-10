@@ -150,6 +150,7 @@ fn main() -> Result<()> {
         // own footprint is in place -- it fits the machine by 5.15 GiB and
         // misses the moment by 4.45. The bench asks for what it uses.
         context_budget: Some(16384),
+        preallocate_kv: false,
         tensor_parallel,
         sealed: false,
         // The bench writes a version through its own --save flow, if at all.

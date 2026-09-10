@@ -266,6 +266,10 @@ pub struct SessionConfig {
     /// only one chunk long.
     pub context_budget: usize,
 
+    /// Explicit, single-sequence inference reservation for context_budget.
+    /// Local stores also reserve enough room for a full prefill-sized append.
+    pub preallocate_kv: bool,
+
     /// Additional independent sequences, in creation order. Each entry reserves
     /// its own persistent KV and convolution histories before weights load.
     /// Empty by default: sharing weights does not make another cache free.
@@ -336,6 +340,7 @@ impl SessionConfig {
             prefill_budget: 4096,
             target_budget: DEFAULT_TARGET_BUDGET,
             context_budget: 4096,
+            preallocate_kv: false,
             sequence_context_budgets: Vec::new(),
             extra_reserved_bytes: 0,
             distillation: None,
@@ -442,6 +447,8 @@ pub struct Session {
     /// short-convolution histories. Empty until the first prefill; alive from
     /// then until [`Session::reset`].
     caches: Vec<LayerCache>,
+    /// Typed reservation, independent of the diagnostic environment lane.
+    kv_plan: Option<super::kvpages::KvPlan>,
     /// How many positions the caches hold — the next token's position.
     pos: usize,
     /// The token the last pass produced, which is what [`Session::step`] feeds.
@@ -850,6 +857,15 @@ impl Session {
     fn load_inner(mut cfg: SessionConfig, group: Option<Group>) -> Result<Self> {
         super::fatal::arm();
 
+        if cfg.preallocate_kv {
+            anyhow::ensure!(cfg.distillation.is_none() && cfg.sequence_context_budgets.is_empty(),
+                "explicit KV preallocation currently supports one inference sequence, not SDFT or extra sequences");
+            for name in ["INK_KV_PREALLOC", "INK_KV_EPOCH", "INK_LEARN_LR"] {
+                anyhow::ensure!(std::env::var_os(name).is_none(),
+                    "explicit KV preallocation refuses ambient {name}; use the admitted serving shape");
+            }
+        }
+
         // Refuse an arbitrary raw client before opening or copying a byte of
         // the model. `form_default` records the Burn device from which the
         // Group's client came; using that exact witness is what makes the
@@ -890,6 +906,11 @@ impl Session {
         )?).as_bytes();
         let t = &conf.text_config;
         let tp = group.as_ref().map(Group::tp);
+        let kv_plan = cfg.preallocate_kv.then(|| {
+            super::kvpages::KvPlan::for_session(
+                cfg.context_budget, t.sliding_window_size, cfg.prefill_budget,
+            )
+        }).transpose()?;
 
         let (lo, hi) = (cfg.layers.start, cfg.layers.end);
         let partial = validate_layer_range(&cfg.layers, t.num_hidden_layers, tp)?;
@@ -1000,13 +1021,14 @@ impl Session {
         // Price the prefill's activations before anything is copied: the arena
         // has to leave room for them, and a copy that filled the box would fail
         // later, at a buffer, with nothing to say about why.
-        let attention_bytes = super::budget::chunked_prefill_activation_bytes(
+        let attention_bytes = super::budget::chunked_prefill_activation_bytes_with_kv_plan(
             t,
             lo..hi,
             cfg.prefill_budget,
             cfg.context_budget,
             admission,
-        )
+            kv_plan,
+        )?
         .checked_add(sequence::extra_sequence_bytes(
             t,
             lo..hi,
@@ -1018,6 +1040,11 @@ impl Session {
         let attention_bytes = attention_bytes
             .checked_add(cfg.extra_reserved_bytes)
             .context("extra resident admission overflow")?;
+        if let Some(plan) = kv_plan {
+            let bytes = super::budget::reserved_kv_bytes(t, lo..hi, plan, admission)?;
+            eprintln!("  KV plan            : explicit fixed capacity, {} bytes on this rank; context={}, global_rows={}, local_rows={}, epoch={}; allocated on first prefill, replaces growing KV charge",
+                bytes, plan.context, plan.global_rows, plan.local_rows, plan.epoch);
+        }
 
         // Move this rank's share into ONE anonymous allocation before any GPU
         // handle can alias it. The routed experts are cut here or nowhere: there
@@ -1221,6 +1248,7 @@ impl Session {
             #[cfg(feature = "inkling-cuda")]
             anchor: Vec::new(),
             caches: Vec::new(),
+            kv_plan,
             pos: 0,
             last: None,
             extend_batch: cfg.extend_batch,
@@ -1323,8 +1351,10 @@ impl Session {
                 RouterArm::Transpose => "transpose", RouterArm::Pre => "pre", RouterArm::Bf16 => "bf16",
             }.to_owned(),
             shared_halved: self.shared_halved,
-            kv_prealloc: super::kvpages::KvPlan::from_env(t.sliding_window_size).map(|p| p.context),
-            kv_epoch: super::kvpages::kv_epoch(),
+            kv_prealloc: self.kv_plan.or_else(|| super::kvpages::KvPlan::from_env(t.sliding_window_size))
+                .map(|p| p.context),
+            kv_local_rows: self.kv_plan.map(|p| p.local_rows),
+            kv_epoch: self.kv_plan.map_or_else(super::kvpages::kv_epoch, |p| p.epoch),
             fp4: super::kvpages::fp4_kv(),
             attn_bf16: dev_lane::attn_bf16(),
             act_bf16: dev_lane::act_bf16(),
@@ -1367,6 +1397,7 @@ impl Session {
         -> Result<super::cache_state::SessionCacheState>
     {
         use super::cache_state::{self, LayerCacheState, SessionCacheState};
+        self.trace_host_totals("before_cache_export");
         self.ensure_cache_inference_only()?;
         anyhow::ensure!(self.pos > 0 && self.caches.len() == self.hi - self.lo,
             "portable cache export requires a complete nonempty sequence");
@@ -1391,7 +1422,23 @@ impl Session {
             layers,
         };
         state.validate(&state.geometry)?;
+        self.trace_host_totals("after_cache_export");
         Ok(state)
+    }
+
+    /// Observations only: no CUDA synchronization or allocator cleanup.
+    fn trace_host_totals(&self, boundary: &str) {
+        use std::io::Write;
+        let Some(snapshot) = cubecl::cuda::host_operation_snapshot() else { return };
+        let rank = self.group.as_ref().map_or(0, |group| group.tp().rank());
+        let unix_ms = snapshot.unix_ms.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+        let mut stderr = std::io::stderr().lock();
+        for op in snapshot.operations {
+            let _ = writeln!(stderr,
+                "[inkling-host-totals] end_unix_ms={unix_ms} pid={} rank={rank} position={} boundary={boundary} op={} calls_total={} slow_calls_total={} host_micros_total={} requested_bytes_total={} snapshot=relaxed_completed_host_operations",
+                snapshot.pid, self.pos, op.operation, op.calls_total, op.slow_calls_total,
+                op.host_micros_total, op.requested_bytes_total);
+        }
     }
 
     /// Restore only into a fresh compatible inference Session. Metadata is
@@ -2467,8 +2514,12 @@ impl Session {
                     out
                 }
                 (false, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, _) => {
-                    let (y, attn) =
+                    let (y, mut attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
+                    if let Some(plan) = self.kv_plan {
+                        let _trace_reserve = host_trace::span("kv_reservation");
+                        attn.reserve_kv_with_plan(window, plan, dev)?;
+                    }
                     let y = tp_reduce(y, &mut tp_calls);
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
                     let out = dev_lane::short_conv(y, ld.attn_sconv.clone());
@@ -3005,10 +3056,18 @@ mod tests {
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_session_roundtrip_after_local_window_rollover() -> Result<()> {
+        session_cache_roundtrip(false, 128, 17)
+    }
+
+    #[test]
+    #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
+    fn portable_cache_preallocated_session_roundtrip_with_wide_append() -> Result<()> {
+        session_cache_roundtrip(true, 1024, 777)
+    }
+
+    fn session_cache_roundtrip(preallocate_kv: bool, prefill: usize, tail_rows: usize) -> Result<()> {
         use super::super::cache_state::{MAX_CHUNK_BYTES, SessionCacheState};
         const CONTEXT: usize = 2048;
-        const PREFILL: usize = 128;
-        const TAIL: usize = 17;
         const HOST_LIMIT: usize = 64 * 1024 * 1024;
 
         let path = std::env::var_os("INK_CACHE_TEST_MODEL")
@@ -3031,8 +3090,9 @@ mod tests {
         let mut config = SessionConfig::new(path).layers(0..2);
         config.config_override = None;
         config.context_budget = CONTEXT;
-        config.prefill_budget = PREFILL;
-        config.extend_batch = PREFILL;
+        config.preallocate_kv = preallocate_kv;
+        config.prefill_budget = prefill;
+        config.extend_batch = prefill;
         config.target_budget = 0;
         let mut session = Session::load(config)?;
         let identity = session.cache_identity()?; // also refuses any armed learner/teacher
@@ -3043,11 +3103,11 @@ mod tests {
             "the test needs nonempty local windows and at least 257 valid token IDs");
         let window = t.sliding_window_size;
         let prefix_rows = window.checked_add(129).context("test prefix overflow")?.max(641);
-        anyhow::ensure!(prefix_rows + TAIL <= CONTEXT,
+        anyhow::ensure!(prefix_rows + tail_rows <= CONTEXT,
             "the model's local window is too wide for this bounded diagnostic");
         let synthetic = |i: usize| 32 + (i * 37 % 191);
         let prefix: Vec<usize> = (0..prefix_rows).map(synthetic).collect();
-        let tail: Vec<usize> = (prefix_rows..prefix_rows + TAIL).map(synthetic).collect();
+        let tail: Vec<usize> = (prefix_rows..prefix_rows + tail_rows).map(synthetic).collect();
 
         fn save(session: &Session, blobs: &mut BTreeMap<[u8; 32], Vec<u8>>,
             held: &mut usize) -> Result<SessionCacheState>
@@ -3072,15 +3132,20 @@ mod tests {
         assert_eq!(session.validate_cache_completeness()?, 2);
         let checkpoint = save(&session, &mut blobs, &mut held)?;
         assert_eq!(checkpoint.identity, identity);
+        assert_eq!(checkpoint.geometry.kv_local_rows.is_some(), preallocate_kv);
         for layer in &checkpoint.layers {
             assert_eq!(layer.attn.base, prefix_rows - window);
             assert_eq!(layer.attn.k.len, window);
             assert_eq!(layer.attn.v.len, window);
             assert!(layer.attn.k.fp4 && layer.attn.v.fp4);
+            if preallocate_kv {
+                assert_eq!(Some(layer.attn.k.reserved), checkpoint.geometry.kv_local_rows);
+                assert_eq!(Some(layer.attn.v.reserved), checkpoint.geometry.kv_local_rows);
+            }
         }
         let expected_prediction = session.extend(&tail)?;
         let expected = save(&session, &mut blobs, &mut held)?;
-        assert_eq!(expected.position, prefix_rows + TAIL);
+        assert_eq!(expected.position, prefix_rows + tail_rows);
 
         // A failed restore may allocate temporary pages, but cannot install any
         // of them or leave a fresh-looking usable Session behind.
@@ -3116,7 +3181,7 @@ mod tests {
         let actual = save(&session, &mut blobs, &mut held)?;
         assert_eq!(actual, expected,
             "identical explicit tail changed complete KV/history state after restore");
-        eprintln!("portable Session cache: layers=0..2 prefix_rows={prefix_rows} local_window={window} tail_rows={TAIL} prediction={actual_prediction} distinct_payload_bytes={held}");
+        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}");
         Ok(())
     }
 
