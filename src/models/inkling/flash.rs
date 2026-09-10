@@ -1437,10 +1437,112 @@ mod device_tests {
     }
 
     fn worst(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len(), "comparison lengths differ");
         a.iter()
             .zip(b)
-            .map(|(x, y)| (x - y).abs())
+            .enumerate()
+            .map(|(i, (x, y))| {
+                assert!(x.is_finite() && y.is_finite(),
+                    "non-finite comparison at {i}: {x} versus {y}");
+                (x - y).abs()
+            })
             .fold(0f32, f32::max)
+    }
+
+    #[test]
+    #[should_panic(expected = "comparison lengths differ")]
+    fn worst_rejects_length_mismatch() {
+        worst(&[0.0], &[0.0, 1.0]);
+    }
+
+    #[test]
+    fn worst_rejects_non_finite_values_on_either_side() {
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert!(std::panic::catch_unwind(|| worst(&[0.0, bad], &[0.0, 1.0])).is_err());
+            assert!(std::panic::catch_unwind(|| worst(&[0.0, 1.0], &[0.0, bad])).is_err());
+        }
+    }
+
+    /// A reserved read may include dead rows up to the next 512-row epoch.
+    /// Compare the production BF16 reader with a tightly sized live buffer,
+    /// keeping the key partition identical so exact equality is meaningful.
+    /// This isolates masking, not whole-model fixed-versus-growing numerics.
+    #[test]
+    #[ignore = "requires an explicitly reserved CUDA device; bounded BF16 reserved-tail diagnostic"]
+    fn bf16_reserved_tail_is_excluded_at_live_hi() {
+        use half::bf16;
+
+        let client = <CudaRuntime as Runtime>::client(&Default::default());
+        // (query rows, live keys, first query position). The first two are
+        // normal cached batches: a full 512 rows and a short final 90 rows.
+        // The last queries a prefix without appending the query itself: the
+        // poisoned rows precede it, so causality cannot hide a broken `hi`.
+        for (nq, keys, q0) in [(512usize, 641usize, 129usize), (90, 731, 641), (1, 641, 1023)] {
+            let sh = Shape {
+                nq,
+                q0,
+                keys,
+                heads: 16,
+                kv_heads: 4,
+                head_dim: 128,
+                eff: 17,
+                window: None,
+            };
+            let capacity = keys.next_multiple_of(512);
+            assert!(keys < capacity && keys % PLANE as usize != 0);
+            let kv_row = sh.kv_heads * sh.head_dim;
+            let (q, k, v, rel) = inputs(&sh);
+            let qh = client.create_from_slice(f32::as_bytes(&q));
+            let rh = client.create_from_slice(f32::as_bytes(&rel));
+            let mut k: Vec<bf16> = k.into_iter().map(bf16::from_f32).collect();
+            let mut v: Vec<bf16> = v.into_iter().map(bf16::from_f32).collect();
+            let live_k = client.create_from_slice(bf16::as_bytes(&k));
+            let live_v = client.create_from_slice(bf16::as_bytes(&v));
+            // NaNs, rather than zeros: even a masked 0 * V load from the tail
+            // must be visible to the finite-output check below.
+            k.resize(capacity * kv_row, bf16::from_f32(f32::NAN));
+            v.resize(capacity * kv_row, bf16::from_f32(f32::NAN));
+            let padded_k = client.create_from_slice(bf16::as_bytes(&k));
+            let padded_v = client.create_from_slice(bf16::as_bytes(&v));
+            let launch = |kh: &Handle, vh: &Handle, physical_rows: usize| {
+                let run = KeyRun {
+                    k: kh,
+                    v: vh,
+                    k_scales: None,
+                    v_scales: None,
+                    rows: physical_rows,
+                    base: 0,
+                    lo: 0,
+                    hi: keys,
+                    row0: 0,
+                };
+                let out = flash_attention_launch(
+                    &client,
+                    &qh,
+                    &[run],
+                    &rh,
+                    KvElem::Bf16,
+                    sh.nq,
+                    sh.q0,
+                    sh.heads,
+                    sh.kv_heads,
+                    sh.head_dim,
+                    sh.eff,
+                    None,
+                    1.0 / sh.head_dim as f32,
+                    // flash_cached uses the decode tile even for nq > 1.
+                    decode_rows(sh.heads / sh.kv_heads),
+                    None,
+                );
+                f32::from_bytes(&client.read_one(out).expect("read reserved-tail output")).to_vec()
+            };
+            let expected = launch(&live_k, &live_v, keys);
+            let actual = launch(&padded_k, &padded_v, capacity);
+            assert_eq!(expected.len(), nq * sh.heads * sh.head_dim);
+            assert!(expected.iter().any(|x| x.abs() > 1e-6), "the reference computed nothing");
+            assert_eq!(worst(&actual, &expected), 0.0,
+                "{nq} queries at {q0}, {keys} live keys in {capacity} physical rows");
+        }
     }
 
     /// NVFP4 code words and E4M3 block-scale bytes for `n` elements, in the
