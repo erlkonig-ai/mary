@@ -270,6 +270,10 @@ pub struct SessionConfig {
     /// Local stores also reserve enough room for a full prefill-sized append.
     pub preallocate_kv: bool,
 
+    /// Seal the dedicated host weight arena read-only after startup swizzling.
+    /// Inference only; requires direct host aliases, never a full copied arena.
+    pub read_only_weights: bool,
+
     /// Additional independent sequences, in creation order. Each entry reserves
     /// its own persistent KV and convolution histories before weights load.
     /// Empty by default: sharing weights does not make another cache free.
@@ -341,6 +345,7 @@ impl SessionConfig {
             target_budget: DEFAULT_TARGET_BUDGET,
             context_budget: 4096,
             preallocate_kv: false,
+            read_only_weights: false,
             sequence_context_budgets: Vec::new(),
             extra_reserved_bytes: 0,
             distillation: None,
@@ -355,12 +360,40 @@ impl SessionConfig {
     }
 }
 
+fn validate_weight_writers(read_only: bool, distillation: bool, learner: bool) -> Result<()> {
+    anyhow::ensure!(
+        !read_only || (!distillation && !learner),
+        "read-only weights require inference only: disable SDFT and the active INK_LEARN_LR learner"
+    );
+    Ok(())
+}
+
+/// Refuse a writer before an engine opens its cache or a session loads weights.
+pub(super) fn validate_weight_protection(read_only: bool, distillation: bool) -> Result<()> {
+    #[cfg(feature = "inkling-cuda")]
+    let learner = super::learn::Learner::from_env().is_some();
+    #[cfg(not(feature = "inkling-cuda"))]
+    let learner = false;
+    validate_weight_writers(read_only, distillation, learner)
+}
+
+fn require_weight_aliases(
+    registered: Option<super::fp4gemm::Aliases>,
+    read_only: bool,
+) -> Result<super::fp4gemm::Aliases> {
+    if read_only {
+        anyhow::ensure!(registered.as_ref().is_some_and(|aliases| !aliases.is_empty()),
+            "read-only weights require zero-copy host registration; refusing a second copied weight arena");
+    }
+    Ok(registered.unwrap_or_else(super::fp4gemm::Aliases::disabled))
+}
+
 /// One live model: warm weights, a KV cache in flight, and a position.
 ///
-/// Held across calls and across turns. Dropping it releases the arena, which on
-/// this model is tens of gibibytes and takes the kernel a few tens of seconds to
-/// hand back — so a serving process holds ONE and calls [`Session::reset`]
-/// between conversations rather than dropping and reloading.
+/// Held across calls and across turns. External weight registrations may retain
+/// their arena in the compute client's memory manager beyond this value's drop.
+/// A serving process holds ONE and calls [`Session::reset`] between conversations;
+/// storage-layout experiments use fresh processes, not in-process reloads.
 pub struct Session {
     cfg: InklingConfig,
     /// Canonical source JSON, including any explicit single-rank override.
@@ -855,6 +888,15 @@ impl Session {
     }
 
     fn load_inner(mut cfg: SessionConfig, group: Option<Group>) -> Result<Self> {
+        validate_weight_protection(cfg.read_only_weights, cfg.distillation.is_some())?;
+        if cfg.read_only_weights {
+            // The capability helper caches failures; cuDeviceGet before cuInit
+            // would otherwise mark a supported fresh process as unsupported.
+            cudarc::driver::result::init()
+                .context("initialize CUDA for the read-only weight capability check")?;
+            anyhow::ensure!(cubecl::cuda::supports_zero_copy_host(0),
+                "read-only weights require pageable host access through host page tables; refusing a copied weight arena");
+        }
         super::fatal::arm();
 
         if cfg.preallocate_kv {
@@ -1056,7 +1098,7 @@ impl Session {
         // Always: a Session has to be able to answer, so it always binds the
         // unembedding.
         globals.push("model.llm.unembed.weight");
-        src.copy_share(lo..hi, &globals, attention_bytes, admission, tp)?;
+        src.copy_share(lo..hi, &globals, attention_bytes, admission, tp, cfg.read_only_weights)?;
 
         // The compute client taken FROM a Burn tensor rather than constructed
         // beside it: `seam::handle_of` hands a Burn allocation to a raw kernel on
@@ -1072,7 +1114,7 @@ impl Session {
         // than copies. A target that cannot register
         // host mappings falls back to a copying bind, which is slower but not
         // wrong -- `Aliases::disabled()` counts what it copied instead of
-        // aliasing it.
+        // aliasing it. Read-only weights explicitly forbid that fallback.
         // The CONTROL: while learning is armed, the learned layer's experts
         // are copied once more, out of the arena and before any step, into
         // their own mapping. Every scored pass then runs that layer twice
@@ -1092,10 +1134,10 @@ impl Session {
                 );
             }
         }
-        let aliases = Some(
-            super::fp4gemm::Aliases::register(&client, src.mappings()?)
-                .unwrap_or_else(super::fp4gemm::Aliases::disabled),
-        );
+        let aliases = Some(require_weight_aliases(
+            super::fp4gemm::Aliases::register(&client, src.mappings()?),
+            cfg.read_only_weights,
+        )?);
 
         anyhow::ensure!(
             owns_embed,
@@ -3050,22 +3092,47 @@ impl Session {
 mod tests {
     use super::*;
 
+    #[test]
+    fn read_only_weights_reject_every_admitted_writer() {
+        assert!(validate_weight_writers(true, false, false).is_ok());
+        for (distillation, learner) in [(true, false), (false, true), (true, true)] {
+            assert!(validate_weight_writers(true, distillation, learner).is_err());
+            assert!(validate_weight_writers(false, distillation, learner).is_ok());
+        }
+        assert!(!SessionConfig::new("not-opened.pile").read_only_weights);
+    }
+
+    #[test]
+    fn read_only_weights_never_select_the_copying_alias_fallback() {
+        assert!(require_weight_aliases(None, true).is_err());
+        assert!(require_weight_aliases(Some(super::super::fp4gemm::Aliases::disabled()), true).is_err());
+        assert!(require_weight_aliases(None, false).unwrap().is_empty());
+    }
+
     /// Explicit real weights, two diagnostic layers, synthetic input only.
     /// Run alone under a CUDA reservation with INK_CACHE_TEST_MODEL pointing
     /// at an existing model pile. This never feeds a prediction back as input.
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_session_roundtrip_after_local_window_rollover() -> Result<()> {
-        session_cache_roundtrip(false, 128, 17)
+        session_cache_roundtrip(false, false, 128, 17)
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_preallocated_session_roundtrip_with_wide_append() -> Result<()> {
-        session_cache_roundtrip(true, 1024, 777)
+        session_cache_roundtrip(true, false, 1024, 777)
     }
 
-    fn session_cache_roundtrip(preallocate_kv: bool, prefill: usize, tail_rows: usize) -> Result<()> {
+    #[test]
+    #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
+    fn portable_cache_read_only_weights_session_roundtrip() -> Result<()> {
+        session_cache_roundtrip(true, true, 1024, 777)
+    }
+
+    fn session_cache_roundtrip(preallocate_kv: bool, read_only_weights: bool,
+        prefill: usize, tail_rows: usize) -> Result<()>
+    {
         use super::super::cache_state::{MAX_CHUNK_BYTES, SessionCacheState};
         const CONTEXT: usize = 2048;
         const HOST_LIMIT: usize = 64 * 1024 * 1024;
@@ -3091,6 +3158,7 @@ mod tests {
         config.config_override = None;
         config.context_budget = CONTEXT;
         config.preallocate_kv = preallocate_kv;
+        config.read_only_weights = read_only_weights;
         config.prefill_budget = prefill;
         config.extend_batch = prefill;
         config.target_budget = 0;
@@ -3181,7 +3249,7 @@ mod tests {
         let actual = save(&session, &mut blobs, &mut held)?;
         assert_eq!(actual, expected,
             "identical explicit tail changed complete KV/history state after restore");
-        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}");
+        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} read_only_weights={read_only_weights} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}");
         Ok(())
     }
 

@@ -96,6 +96,8 @@ pub struct EngineConfig {
     /// Reserve packed KV for the admitted context instead of growing pages.
     /// Explicit serving shape, including under the sealed execution profile.
     pub preallocate_kv: bool,
+    /// Seal the mmap weight arena after startup; inference and host aliases only.
+    pub read_only_weights: bool,
     /// Rank, world and rendezvous, once `tpcomm::elect_rank` has decided them.
     pub tensor_parallel: Option<TensorParallel>,
     /// Refuse execution-changing environment overrides and announce
@@ -207,6 +209,7 @@ pub struct Follower {
 /// EVERY tensor rather than all of some layers. Getting it backwards is a
 /// refusal at load rather than a wrong answer, which is the good failure.
 pub fn load(config: EngineConfig) -> Result<Loaded> {
+    super::session::validate_weight_protection(config.read_only_weights, config.distillation.is_some())?;
     if let Some(cache) = &config.cache {
         anyhow::ensure!(config.distillation.is_none(),
             "durable inference caches do not snapshot an SDFT teacher, optimizer or sampler");
@@ -231,6 +234,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
 
     let mut session_config = SessionConfig::new(&config.pile);
     session_config.preallocate_kv = config.preallocate_kv;
+    session_config.read_only_weights = config.read_only_weights;
     session_config.distillation = config.distillation.clone();
     if let Some(layers) = config.layers.clone() {
         session_config = session_config.layers(layers);
@@ -252,6 +256,8 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // what the budget is FOR. A caller may still name a smaller one.
     session_config.context_budget = config.context_budget.unwrap_or(1 << 20);
     execution_manifest.field("preallocate_kv", &[u8::from(config.preallocate_kv)]);
+    execution_manifest.field("weight_arena", b"anonymous-mmap-v1");
+    execution_manifest.field("read_only_weights", &[u8::from(config.read_only_weights)]);
     let prefill_budget = session_config.prefill_budget;
     let context_budget = session_config.context_budget;
     let extend_batch = session_config.extend_batch;
@@ -2189,6 +2195,29 @@ mod tests {
     use super::{
         reject_sealed_environment, sealed_environment_rejections, validate_reinitialize_boundary,
     };
+
+    #[test]
+    fn read_only_weights_refuse_sdft_before_opening_cache_or_model() {
+        let config = super::EngineConfig {
+            cache: Some(super::CacheConfig {
+                pile: "/must-not-open/readonly-cache.pile".into(),
+                signing_key: "/must-not-open/cache.key".into(),
+                checkpoint_tokens: 32768,
+            }),
+            pile: "/must-not-open/model.pile".into(),
+            layers: None,
+            prefill_budget: None,
+            context_budget: None,
+            preallocate_kv: false,
+            read_only_weights: true,
+            tensor_parallel: None,
+            sealed: false,
+            signing_key: None,
+            distillation: Some(super::super::sdft::Config::default()),
+        };
+        let error = super::load(config).err().expect("read-only SDFT must be refused");
+        assert!(error.to_string().contains("read-only weights require inference only"));
+    }
 
     #[test]
     fn warmup_only_never_requests_ram_rewind_points() {

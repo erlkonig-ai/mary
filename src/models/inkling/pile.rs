@@ -42,6 +42,27 @@ use triblespace::prelude::Id;
 
 use super::load::PackedExpert;
 
+/// Finish a dedicated anonymous allocation before publishing any byte views
+/// or GPU aliases. Both arms have the same lazy mmap backing; only protection
+/// differs. The caller must have joined every startup copy/swizzle worker.
+fn finish_weight_arena(arena: memmap2::MmapMut, read_only: bool) -> Result<Bytes> {
+    if read_only {
+        Ok(Bytes::from_source(
+            arena.make_read_only().context("seal inference weight arena read-only")?,
+        ))
+    } else {
+        Ok(Bytes::from_source(arena))
+    }
+}
+
+/// Keep the existing byte owner alive without assuming its concrete allocator.
+/// Cloning Bytes retains its mapping; it does not duplicate the weight payload.
+fn weight_arena_mapping(
+    bytes: &Bytes,
+) -> (usize, usize, std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+    (bytes.as_ptr() as usize, bytes.len(), std::sync::Arc::new(bytes.clone()))
+}
+
 /// One line of the kernel's memory accounting, for a startup that competes with
 /// the GPU for ONE pool.
 ///
@@ -1612,21 +1633,8 @@ impl PileSource {
             // there is one: each is its own mapping, and an expert table is
             // built inside exactly one of them.
             let mut out = Vec::with_capacity(2);
-            for (bytes, what) in std::iter::once((bytes, "anonymous weight"))
-                .chain(self.frozen.iter().map(|b| (b, "frozen expert")))
-            {
-                let view: anybytes::View<[u8]> = bytes
-                    .clone()
-                    .view()
-                    .map_err(|e| anyhow::anyhow!("viewing the {what} allocation: {e}"))?;
-                let owner: std::sync::Arc<Vec<u8>> = view
-                    .downcast_to_owner()
-                    .map_err(|_| anyhow::anyhow!("{what} allocation lost its Vec owner"))?;
-                out.push((
-                    bytes.as_ptr() as usize,
-                    bytes.len(),
-                    owner as std::sync::Arc<dyn std::any::Any + Send + Sync>,
-                ));
+            for bytes in std::iter::once(bytes).chain(self.frozen.iter()) {
+                out.push(weight_arena_mapping(bytes));
             }
             return Ok(out);
         }
@@ -1693,9 +1701,13 @@ impl PileSource {
     }
 
     /// Copy exactly one node's share out of the file-backed pile mapping into
-    /// one anonymous allocation. The GPU may safely alias this allocation:
-    /// anonymous pages have no backing store the kernel can silently re-read
-    /// them from, so they cannot be reclaimed while this process owns them.
+    /// one dedicated anonymous mmap. Aliases retain its owner; unlike discarded
+    /// file-backed pages, these bytes cannot be reloaded from the source pile.
+    /// This is not physical pinning: anonymous pages may still swap or incur
+    /// GPU/host page-table fault servicing.
+    ///
+    /// `read_only_weights` seals this mapping after every copy/swizzle worker
+    /// joins and before publishing any view. Callers must exclude all learners.
     ///
     /// Dense leaves follow the layer range, except `model.mtp.*` leaves are
     /// omitted when `policy.drafts` is false. Every `global_dense` name is an
@@ -1767,6 +1779,7 @@ impl PileSource {
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
         shard: Option<super::tp::Tp>,
+        read_only_weights: bool,
     ) -> Result<(usize, usize, u64, u64)> {
         anyhow::ensure!(self.copied.is_none(), "the weight share was already copied");
 
@@ -2129,37 +2142,18 @@ impl PileSource {
             gib(available),
         );
 
-        // Zeroed by the KERNEL, not by us. `Vec::resize(total, 0)` wrote 80.72
-        // GiB of zeros that the copy immediately overwrote — 25 s of pure waste
-        // whose real cost was not the time but the residency: it faulted the
-        // whole arena in before a single weight had been copied, which is what
-        // forced the source page cache out to make room. `alloc_zeroed` is
-        // `calloc`, and for an allocation this size glibc hands back a fresh
-        // anonymous mapping whose pages are already zero and not yet resident,
-        // so each page arrives exactly once, when the copy writes it.
-        //
-        // `VIEW_ALIGN - 1` bytes longer than the layout, because the offsets
-        // are only 16-aligned RELATIVE to the base and every view's real
-        // address is base + offset. glibc mmaps an allocation this size and
-        // hands back a page-aligned pointer, so `skew` is measured to be zero
-        // -- but measured, not assumed, because the whole point of the
-        // alignment is that a weight at 4 mod 16 faults the CUDA context
-        // asynchronously and there is no failure to see at the bind.
+        // Dedicated, lazy anonymous pages: do not populate or zero the whole
+        // arena before copying. SourceRelease can shed source pages as each
+        // destination is written. No allocator metadata shares these pages,
+        // so the inference arm can safely seal this exact allocation later.
+        // Keep the same relative alignment/layout in the RW and RO arms.
         let (mut arena, skew) = {
-            let bytes = total + VIEW_ALIGN - 1;
-            let layout = std::alloc::Layout::from_size_align(bytes, 1)
-                .map_err(|e| anyhow::anyhow!("startup-copy layout for {bytes} bytes: {e}"))?;
-            // SAFETY: `bytes > 0` (the share always has leaves), the layout is
-            // the one `Vec<u8>` itself uses (align 1), and the pointer is
-            // handed to exactly one `Vec` which owns and frees it.
-            let p = unsafe { std::alloc::alloc_zeroed(layout) };
-            anyhow::ensure!(
-                !p.is_null(),
-                "cannot allocate {:.2} GiB for this node's startup weight copy",
-                bytes as f64 / (1u64 << 30) as f64,
-            );
-            let skew = (VIEW_ALIGN - (p as usize) % VIEW_ALIGN) % VIEW_ALIGN;
-            (unsafe { Vec::from_raw_parts(p, bytes, bytes) }, skew)
+            let bytes = total.checked_add(VIEW_ALIGN - 1)
+                .context("startup weight arena size overflow")?;
+            let arena = memmap2::MmapMut::map_anon(bytes)
+                .with_context(|| format!("map {bytes} bytes for the startup weight arena"))?;
+            let skew = arena.as_ptr().align_offset(VIEW_ALIGN);
+            (arena, skew)
         };
 
         // How many threads fetch, verify and copy. Unset means one per core.
@@ -2203,7 +2197,7 @@ impl PileSource {
         }
         bounds.push(jobs.len());
 
-        let mut rest: &mut [u8] = &mut arena.as_mut_slice()[skew..skew + total];
+        let mut rest: &mut [u8] = &mut arena[skew..skew + total];
         let mut shards: Vec<(&mut [u8], usize, &[(usize, usize, Job)])> = Vec::new();
         let mut base = 0usize;
         for w in bounds.windows(2) {
@@ -2419,10 +2413,17 @@ impl PileSource {
         );
         println!("{}", mem_line("after fetch+verify+copy"));
 
-        // `Bytes` owns the allocator's Vec; `View` proves and retains the new
-        // anonymous backing before subviews replace the selected mmap-backed
-        // payloads.
-        let bytes = anybytes::Bytes::from_source(arena);
+        // All workers have joined. Seal before any subview or GPU alias can
+        // escape, retaining the mmap owner through Bytes in either arm.
+        let arena_base = arena.as_ptr() as usize;
+        let arena_len = arena.len();
+        let seal_start = std::time::Instant::now();
+        let bytes = finish_weight_arena(arena, read_only_weights)?;
+        println!(
+            "    startup weight arena: base={arena_base:#x} bytes={arena_len} protection={} seal_seconds={:.6}",
+            if read_only_weights { "read-only" } else { "read-write" },
+            seal_start.elapsed().as_secs_f64(),
+        );
         let view: anybytes::View<[u8]> = bytes
             .clone()
             .view()
@@ -2507,6 +2508,54 @@ mod tests {
     use crate::models::inkling::budget::{AdmissionPolicy, StorageDType};
     use crate::models::inkling::pool::AllocatorConfig;
     use triblespace::core::blob::encodings::tensor::TensorView;
+
+    #[test]
+    fn mmap_weight_arena_reads_and_alias_keepalive_preserve_the_same_storage() -> Result<()> {
+        for read_only in [false, true] {
+            let mut arena = memmap2::MmapMut::map_anon(8192)?;
+            arena[32..40].copy_from_slice(b"weights!");
+            let base = arena.as_ptr() as usize;
+            let bytes = finish_weight_arena(arena, read_only)?;
+            let weak = bytes.downgrade();
+            let slice = bytes.slice(32..40);
+            let (mapped_base, len, keepalive) = weight_arena_mapping(&bytes);
+            assert_eq!((mapped_base, len), (base, 8192));
+            assert_eq!(slice.as_ref(), b"weights!");
+            drop(bytes);
+            drop(slice);
+            let retained = weak.upgrade().expect("the GPU keepalive retains the mmap");
+            assert_eq!(retained.as_ptr() as usize, base);
+            assert_eq!(&retained[32..40], b"weights!");
+            drop(retained);
+            drop(keepalive);
+            assert!(weak.upgrade().is_none(), "the final owner releases the mmap");
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mmap_weight_arena_protection_matches_the_selected_arm() -> Result<()> {
+        for read_only in [false, true] {
+            let mut arena = memmap2::MmapMut::map_anon(8192)?;
+            arena.fill(7);
+            let bytes = finish_weight_arena(arena, read_only)?;
+            let ptr = bytes.as_ptr() as usize;
+            let maps = std::fs::read_to_string("/proc/self/maps")?;
+            let permissions = maps.lines().find_map(|line| {
+                let mut fields = line.split_whitespace();
+                let (lo, hi) = fields.next()?.split_once('-')?;
+                let lo = usize::from_str_radix(lo, 16).ok()?;
+                let hi = usize::from_str_radix(hi, 16).ok()?;
+                let permissions = fields.next()?;
+                (lo <= ptr && ptr < hi).then_some(permissions)
+            }).expect("the dedicated arena is mapped");
+            assert!(permissions.starts_with('r'));
+            assert_eq!(permissions.as_bytes()[1] == b'w', !read_only);
+            assert!(bytes.iter().all(|byte| *byte == 7));
+        }
+        Ok(())
+    }
 
     #[test]
     fn startup_dense_selection_preserves_non_mtp_layer_and_global_rules() {
