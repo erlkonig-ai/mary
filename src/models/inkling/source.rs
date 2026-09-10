@@ -350,9 +350,10 @@ impl Weights {
         attention_bytes: u64,
         policy: super::budget::AdmissionPolicy,
         shard: Option<super::tp::Tp>,
+        read_only_weights: bool,
     ) -> Result<(usize, usize, u64, u64)> {
         self.src
-            .copy_share(layers, global_dense, attention_bytes, policy, shard)
+            .copy_share(layers, global_dense, attention_bytes, policy, shard, read_only_weights)
     }
 
     // ---- what the source SAYS about itself --------------------------------

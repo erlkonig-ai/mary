@@ -2453,6 +2453,7 @@ fn main() -> Result<()> {
             attention_bytes + slot_kv_bytes,
             admission,
             tp_shard,
+            false,
         )?;
         println!(
             "  startup weight copy: {experts} expert + {dense} dense views, {:.2} GiB anonymous in {:.1}s",
