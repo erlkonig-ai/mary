@@ -62,13 +62,55 @@ fn e4m3(v: f32) -> f32 {
 /// Returns the dequantized values and, per element, the lower and upper E2M1
 /// neighbours in the same block scaling (for the sixteen-lane code).
 fn nvfp4_quantize(x: &[f32]) -> (Vec<f32>, Vec<(f32, f32)>) {
+    nvfp4_quantize_with(x, false)
+}
+
+/// Candidate shrink factors for the per-block scale search: the block
+/// maximum maps to 6 at 1.0 and saturates below it, trading the largest
+/// element's error for a finer grid under everything else.
+const SCALE_SEARCH: [f32; 9] = [1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7, 0.65, 0.6];
+
+/// Squared error of one block quantized at `unit` per E2M1 step.
+fn block_error(block: &[f32], unit: f32) -> f32 {
+    block
+        .iter()
+        .map(|&v| {
+            let m = (v.abs() / unit).min(6.0);
+            let q = E2M1[e2m1_code(m)] * unit * v.signum();
+            (v - q) * (v - q)
+        })
+        .sum()
+}
+
+/// `search` picks each block's E4M3 scale by least squared error over the
+/// candidates in `SCALE_SEARCH` instead of always mapping the block maximum
+/// to the top code.
+fn nvfp4_quantize_with(x: &[f32], search: bool) -> (Vec<f32>, Vec<(f32, f32)>) {
     let absmax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
     let tensor_scale = if absmax > 0.0 { absmax / (6.0 * E4M3_MAX) } else { 1.0 };
     let mut out = Vec::with_capacity(x.len());
     let mut neighbours = Vec::with_capacity(x.len());
     for block in x.chunks(BLOCK) {
         let block_max = block.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let scale = e4m3(block_max / (6.0 * tensor_scale));
+        let nearest = e4m3(block_max / (6.0 * tensor_scale));
+        let scale = if search && nearest > 0.0 {
+            let mut best = nearest;
+            let mut best_err = block_error(block, nearest * tensor_scale);
+            for factor in SCALE_SEARCH.iter().skip(1) {
+                let candidate = e4m3(block_max * factor / (6.0 * tensor_scale));
+                if candidate <= 0.0 || candidate == best {
+                    continue;
+                }
+                let err = block_error(block, candidate * tensor_scale);
+                if err < best_err {
+                    best = candidate;
+                    best_err = err;
+                }
+            }
+            best
+        } else {
+            nearest
+        };
         let unit = scale * tensor_scale;
         for &v in block {
             if unit == 0.0 {
@@ -334,7 +376,7 @@ fn load_parts(model_pile: &Path) -> Result<(Keymap, tokenizers::Tokenizer)> {
 /// Fake-quantize every two-dimensional weight that is not an embedding table
 /// or a norm: rows are output features, blocks of sixteen run along the input
 /// features, one f32 scale per row. Returns how many tensors were touched.
-fn fake_nvfp4_weights(keymap: &mut Keymap, only: &[String]) -> (usize, usize) {
+fn fake_nvfp4_weights(keymap: &mut Keymap, only: &[String], scale_search: bool) -> (usize, usize) {
     let mut tensors = 0usize;
     let mut elements = 0usize;
     for (name, (data, shape)) in keymap.iter_mut() {
@@ -353,7 +395,7 @@ fn fake_nvfp4_weights(keymap: &mut Keymap, only: &[String]) -> (usize, usize) {
             continue;
         }
         for row in data.chunks_mut(cols) {
-            let (q, _) = nvfp4_quantize(row);
+            let (q, _) = nvfp4_quantize_with(row, scale_search);
             row.copy_from_slice(&q);
         }
         tensors += 1;
@@ -384,6 +426,8 @@ struct ProbeOptions {
     only: Vec<String>,
     list_tensors: bool,
     skip_output_variants: bool,
+    /// Per-block E4M3 scale by least squared error instead of block-max-to-6.
+    scale_search: bool,
 }
 
 /// f32 document and query vectors, saved after the first run so a sweep over
@@ -532,9 +576,10 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
 
     // The model itself with NVFP4 weights, all of them or the named group.
     let mut quantized = keymap;
-    let (tensors, elements) = fake_nvfp4_weights(&mut quantized, &options.only);
+    let (tensors, elements) = fake_nvfp4_weights(&mut quantized, &options.only, options.scale_search);
+    let rounding = if options.scale_search { "block scale search" } else { "round to nearest" };
     eprintln!(
-        "fake-quantized {tensors} weight tensors, {elements} elements, to NVFP4 (group: {})",
+        "fake-quantized {tensors} weight tensors, {elements} elements, to NVFP4 (group: {}; {rounding})",
         if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
     );
     let started = Instant::now();
@@ -555,7 +600,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
     let same_text_cos: f64 = docs.iter().zip(&qdocs).map(|(a, b)| dot(a, b) as f64).sum::<f64>() / docs.len() as f64;
     println!();
     println!(
-        "model with NVFP4 linear weights, group {} ({tensors} tensors, {elements} elements): mean cosine to the f32 model's vector of the same text {same_text_cos:.5}",
+        "model with NVFP4 linear weights, group {} ({tensors} tensors, {elements} elements, {rounding}): mean cosine to the f32 model's vector of the same text {same_text_cos:.5}",
         if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
     );
     report("NVFP4 weights, f32 vectors", 32.0, &qdocs, &qqueries);
@@ -603,9 +648,10 @@ fn main() -> Result<()> {
                     only,
                     list_tensors: args.iter().any(|a| a == "--list-tensors"),
                     skip_output_variants: args.iter().any(|a| a == "--weights-only"),
+                    scale_search: args.iter().any(|a| a == "--scale-search"),
                 },
             )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--list-tensors]")),
+        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--list-tensors]")),
     }
 }
