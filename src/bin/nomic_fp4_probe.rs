@@ -428,6 +428,9 @@ struct ProbeOptions {
     skip_output_variants: bool,
     /// Per-block E4M3 scale by least squared error instead of block-max-to-6.
     scale_search: bool,
+    /// Leave every weight in f32, so the run measures only what the model's
+    /// own activation quantisation (`NOMIC_ACT_QUANT`) costs.
+    keep_weights: bool,
 }
 
 /// f32 document and query vectors, saved after the first run so a sweep over
@@ -576,8 +579,18 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
 
     // The model itself with NVFP4 weights, all of them or the named group.
     let mut quantized = keymap;
-    let (tensors, elements) = fake_nvfp4_weights(&mut quantized, &options.only, options.scale_search);
-    let rounding = if options.scale_search { "block scale search" } else { "round to nearest" };
+    let (tensors, elements) = if options.keep_weights {
+        (0, 0)
+    } else {
+        fake_nvfp4_weights(&mut quantized, &options.only, options.scale_search)
+    };
+    let rounding = if options.keep_weights {
+        "weights left in f32"
+    } else if options.scale_search {
+        "block scale search"
+    } else {
+        "round to nearest"
+    };
     eprintln!(
         "fake-quantized {tensors} weight tensors, {elements} elements, to NVFP4 (group: {}; {rounding})",
         if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
@@ -649,9 +662,10 @@ fn main() -> Result<()> {
                     list_tensors: args.iter().any(|a| a == "--list-tensors"),
                     skip_output_variants: args.iter().any(|a| a == "--weights-only"),
                     scale_search: args.iter().any(|a| a == "--scale-search"),
+                    keep_weights: args.iter().any(|a| a == "--keep-weights"),
                 },
             )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--list-tensors]")),
+        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--list-tensors]")),
     }
 }

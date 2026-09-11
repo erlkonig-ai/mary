@@ -1807,6 +1807,77 @@ fn pil_resize(img: &image::RgbImage, dst_w: u32, dst_h: u32, filter: Filter) -> 
 /// nomic-embed-text-v1.5 embedding dimension (full Matryoshka width).
 pub const NOMIC_TEXT_DIM: usize = 768;
 
+/// How every linear's input is fake-quantised before its multiply, to measure
+/// what an fp4 activation path costs this model. Read once per model load from
+/// `NOMIC_ACT_QUANT`: unset or `f32` is the plain path; `nvfp4` is one E2M1
+/// lane under NVFP4 block scales; `lanes16` is the sixteen-lane fractional
+/// carrier from the Inkling pilot, sixteen fp4 lanes whose mean lands within a
+/// sixteenth of the E2M1 step. The residual stream stays f32 either way; only
+/// the operand handed to each matmul is rounded, which is what an fp4 kernel
+/// would see. All of it is tensor ops on the device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ActQuant {
+    None,
+    Nvfp4,
+    Lanes16,
+}
+
+impl ActQuant {
+    fn from_env() -> Self {
+        match std::env::var("NOMIC_ACT_QUANT").as_deref() {
+            Ok("nvfp4") => ActQuant::Nvfp4,
+            Ok("lanes16") => ActQuant::Lanes16,
+            _ => ActQuant::None,
+        }
+    }
+}
+
+/// NVFP4 fake quantisation of `[b, s, k]` activations: one f32 scale per
+/// token row (row max maps to 6 x 448), one E4M3 scale per block of sixteen
+/// along `k`, E2M1 codes {0, 0.5, 1, 1.5, 2, 3, 4, 6} by nearest on the
+/// non-uniform grid, and for `Lanes16` the lane mean `lo + (hi - lo) * k / 16`
+/// with `k = round(16 * frac)`.
+fn fake_quant_act<B: Backend>(x: Tensor<B, 3>, mode: ActQuant) -> Tensor<B, 3> {
+    if mode == ActQuant::None {
+        return x;
+    }
+    let [b, s, k] = x.dims();
+    assert!(k % 16 == 0, "activation width {k} is not a multiple of the NVFP4 block");
+    let blocks = k / 16;
+    let x4 = x.reshape([b, s, blocks, 16]);
+    let ax = x4.clone().abs();
+    let sign = x4.sign();
+    // Per-row scale; a zero row would divide by zero, and its values are all
+    // zero anyway, so give it any positive scale.
+    let row_max = ax.clone().max_dim(3).max_dim(2); // [b,s,1,1]
+    let ts = row_max.div_scalar(6.0 * 448.0);
+    let ts = ts.clone().mask_where(ts.clone().equal_elem(0.0), ts.ones_like());
+    // Block scale in E4M3: three mantissa bits, exponent floor at -6, cap 448.
+    let ln2 = std::f64::consts::LN_2;
+    let s_raw = ax.clone().max_dim(3).div(ts.clone()).div_scalar(6.0); // [b,s,blocks,1]
+    let e = s_raw.clone().clamp_min(1e-30).log().div_scalar(ln2).floor().clamp_min(-6.0);
+    let step = e.sub_scalar(3.0).mul_scalar(ln2).exp();
+    let scale = s_raw.div(step.clone()).round().mul(step).clamp_max(448.0);
+    let unit = scale.mul(ts); // [b,s,blocks,1]
+    let unit = unit.clone().mask_where(unit.clone().equal_elem(0.0), unit.ones_like());
+    let m = ax.div(unit.clone()).clamp(0.0, 6.0); // [b,s,blocks,16]
+    // E2M1 step: 0.5 below 2, 1 from 2 to 4, 2 from 4 to 6.
+    let st = m.zeros_like().add_scalar(0.5);
+    let st = st.mask_where(m.clone().greater_equal_elem(2.0), m.ones_like());
+    let st = st.mask_where(m.clone().greater_equal_elem(4.0), m.ones_like().mul_scalar(2.0));
+    let q = match mode {
+        ActQuant::Nvfp4 => m.div(st.clone()).round().mul(st),
+        ActQuant::Lanes16 => {
+            let lo = m.clone().div(st.clone()).floor().mul(st.clone());
+            let frac = m.sub(lo.clone()).div(st.clone());
+            let lanes = frac.mul_scalar(16.0).round().div_scalar(16.0);
+            lo.add(lanes.mul(st)).clamp_max(6.0)
+        }
+        ActQuant::None => unreachable!(),
+    };
+    q.mul(unit).mul(sign).reshape([b, s, k])
+}
+
 /// One POST-norm Nomic encoder layer: bidirectional MHA with RoPE on Q/K, then
 /// a SwiGLU MLP; the norm is applied AFTER the residual add (BERT post-norm).
 struct NomicLayer<B: Backend> {
@@ -1819,6 +1890,7 @@ struct NomicLayer<B: Backend> {
     norm2: LayerNorm<B>,
     n_heads: usize,
     head_dim: usize,
+    act: ActQuant,
 }
 
 impl<B: Backend> NomicLayer<B> {
@@ -1828,6 +1900,7 @@ impl<B: Backend> NomicLayer<B> {
         eps: f64,
         n_heads: usize,
         head_dim: usize,
+        act: ActQuant,
         device: &B::Device,
     ) -> Self {
         let lin = |n: &str| Linear::load(loader, &format!("{p}.{n}"), false, device);
@@ -1841,6 +1914,7 @@ impl<B: Backend> NomicLayer<B> {
             norm2: LayerNorm::load(loader, &format!("{p}.norm2"), eps, device),
             n_heads,
             head_dim,
+            act,
         }
     }
 
@@ -1856,7 +1930,7 @@ impl<B: Backend> NomicLayer<B> {
         let [b, s, d] = x.dims();
         let (h, hd) = (self.n_heads, self.head_dim);
         // packed qkv → [b,s,3d] then split into q,k,v each [b,s,d].
-        let qkv = self.wqkv.forward(x.clone());
+        let qkv = self.wqkv.forward(fake_quant_act(x.clone(), self.act));
         let q = qkv.clone().narrow(2, 0, d);
         let k = qkv.clone().narrow(2, d, d);
         let v = qkv.narrow(2, 2 * d, d);
@@ -1871,13 +1945,15 @@ impl<B: Backend> NomicLayer<B> {
         let probs = softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, s, d]);
         // POST-norm: norm AFTER the residual add.
+        let att = fake_quant_act(att, self.act);
         let h1 = self.norm1.forward(self.out_proj.forward(att).add(x));
         // SwiGLU: fc2(fc11(x) * silu(fc12(x))).
-        let mlp = self.fc2.forward(
-            self.fc11
-                .forward(h1.clone())
-                .mul(silu(self.fc12.forward(h1.clone()))),
-        );
+        let h1q = fake_quant_act(h1.clone(), self.act);
+        let gated = self
+            .fc11
+            .forward(h1q.clone())
+            .mul(silu(self.fc12.forward(h1q)));
+        let mlp = self.fc2.forward(fake_quant_act(gated, self.act));
         self.norm2.forward(mlp.add(h1))
     }
 }
@@ -1930,6 +2006,10 @@ impl<B: Backend> NomicTextModel<B> {
     fn load(loader: &WeightLoader, device: &B::Device) -> Self {
         let (n_layers, n_heads, head_dim, eps, theta) =
             (12usize, 12usize, 64usize, 1e-12, 1000.0f64);
+        let act = ActQuant::from_env();
+        if act != ActQuant::None {
+            eprintln!("nomic text: activations fake-quantised at every linear input: {act:?}");
+        }
         let layers = (0..n_layers)
             .map(|i| {
                 NomicLayer::load(
@@ -1938,6 +2018,7 @@ impl<B: Backend> NomicTextModel<B> {
                     eps,
                     n_heads,
                     head_dim,
+                    act,
                     device,
                 )
             })
