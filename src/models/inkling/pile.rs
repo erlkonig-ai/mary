@@ -71,7 +71,45 @@ fn validate_managed_concurrent_access(concurrent: i32) -> Result<()> {
     Ok(())
 }
 
-/// CPU-readable CUDA managed storage, fully initialized before any slice exists.
+const MIN_ZERO_BYTES_PER_WORKER: usize = 1 << 20;
+const MAX_ZERO_WORKERS: usize = 64;
+
+fn weight_zero_workers(len: usize, requested: usize) -> usize {
+    if len == 0 { return 0; }
+    requested.max(1).min(MAX_ZERO_WORKERS)
+        .min((len / MIN_ZERO_BYTES_PER_WORKER).max(1))
+}
+
+/// Initialize the whole allocation without ever treating its previous contents
+/// as initialized bytes. Disjoint coarse ranges bound thread overhead; scoped
+/// threads all join before return, including unwinding after a spawn/worker
+/// panic. The allocation owner therefore remains alive for every worker.
+///
+/// This changes scheduling only: it still writes every byte before the copy
+/// workers overwrite payloads, and does not change eager first-touch residency.
+fn initialize_weight_bytes(bytes: &mut [std::mem::MaybeUninit<u8>], requested: usize) -> usize {
+    fn zero(bytes: &mut [std::mem::MaybeUninit<u8>]) {
+        // SAFETY: this uniquely borrowed range is valid for bytes.len() one-byte
+        // elements; no previous value is read. A zero bit pattern initializes
+        // each u8, including every allocation padding/tail byte.
+        unsafe { std::ptr::write_bytes(bytes.as_mut_ptr(), 0, bytes.len()) };
+    }
+
+    let workers = weight_zero_workers(bytes.len(), requested);
+    if workers <= 1 {
+        zero(bytes);
+    } else {
+        let chunk = bytes.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for range in bytes.chunks_mut(chunk) {
+                scope.spawn(move || zero(range));
+            }
+        });
+    }
+    workers
+}
+
+/// CPU-readable CUDA managed storage, initialized before any u8 slice exists.
 /// Its primary context is the same device-0 primary retained by CubeCL.
 struct ManagedWeightArena {
     ptr: std::ptr::NonNull<u8>,
@@ -86,7 +124,7 @@ unsafe impl Send for ManagedWeightArena {}
 unsafe impl Sync for ManagedWeightArena {}
 
 impl ManagedWeightArena {
-    fn new(len: usize) -> Result<Self> {
+    fn new(len: usize, copy_threads: usize) -> Result<Self> {
         anyhow::ensure!(len > 0 && len <= isize::MAX as usize,
             "managed weight arena length must be in 1..=isize::MAX");
         let context = cudarc::driver::CudaContext::new(0)
@@ -108,13 +146,16 @@ impl ManagedWeightArena {
         eprintln!("    managed weight allocation: bytes={len} alloc_seconds={:.6}",
             allocated_at.elapsed().as_secs_f64());
         let started = std::time::Instant::now();
-        // SAFETY: the allocation is uniquely owned, len bytes long, and has
-        // no GPU alias yet. Initialize ALL bytes, including alignment padding,
-        // before ever forming &[u8] or &mut [u8]. This eager sweep is deliberate:
-        // unlike mmap it touches the whole allocation before the copy workers.
-        unsafe { std::ptr::write_bytes(arena.ptr.as_ptr(), 0, len) };
+        // SAFETY: the allocation is uniquely owned, len bytes long, and has no
+        // GPU alias yet. MaybeUninit permits the allocation's initial contents;
+        // no u8 slice or ByteSource is published before every worker joins.
+        let uninitialized = unsafe {
+            std::slice::from_raw_parts_mut(arena.ptr.as_ptr().cast::<std::mem::MaybeUninit<u8>>(), len)
+        };
+        let workers = initialize_weight_bytes(uninitialized, copy_threads);
         eprintln!("    managed weight initialization: bytes={len} zero_seconds={:.6}",
             started.elapsed().as_secs_f64());
+        eprintln!("    managed weight initialization workers: requested={copy_threads} active={workers}");
         Ok(arena)
     }
 
@@ -186,13 +227,13 @@ enum WeightArena {
 }
 
 impl WeightArena {
-    fn new(len: usize, storage: WeightStorage) -> Result<Self> {
+    fn new(len: usize, storage: WeightStorage, copy_threads: usize) -> Result<Self> {
         match storage {
             WeightStorage::Host | WeightStorage::HostReadOnly => {
                 Ok(Self::Host(memmap2::MmapMut::map_anon(len)
                     .with_context(|| format!("map {len} bytes for the startup weight arena"))?))
             }
-            WeightStorage::CudaManaged => Ok(Self::Managed(ManagedWeightArena::new(len)?)),
+            WeightStorage::CudaManaged => Ok(Self::Managed(ManagedWeightArena::new(len, copy_threads)?)),
         }
     }
 
@@ -2322,20 +2363,9 @@ impl PileSource {
             gib(available),
         );
 
-        // Host arms retain the same lazy dedicated mmap. Managed storage is
-        // initialized eagerly before any slice exists; this extra first-touch
-        // sweep is separately timed. All arms have the same relative layout.
-        let (mut arena, skew) = {
-            let bytes = total.checked_add(VIEW_ALIGN - 1)
-                .context("startup weight arena size overflow")?;
-            let arena = WeightArena::new(bytes, weight_storage)?;
-            let skew = arena.as_ptr().align_offset(VIEW_ALIGN);
-            (arena, skew)
-        };
-
-        // How many threads fetch, verify and copy. Unset means one per core.
-        // `INK_COPY_THREADS=1` is the sequential lane this replaced, kept
-        // selectable so the two can be run back to back out of ONE binary.
+        // Resolve once, before allocation: the managed eager-zero sweep and
+        // existing fetch/verify/copy workers share this request. Unset means
+        // one per core; INK_COPY_THREADS=1 keeps both phases sequential.
         let threads: usize = std::env::var("INK_COPY_THREADS")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -2345,6 +2375,18 @@ impl PileSource {
                     .map(|n| n.get())
                     .unwrap_or(1)
             });
+
+        // Host arms retain the same lazy dedicated mmap. Managed storage is
+        // still fully initialized before any u8 slice exists; only the eager
+        // sweep's scheduling changed. Speed is an experiment, not a guarantee.
+        // The payload layout and later copy/swizzle work are unchanged.
+        let (mut arena, skew) = {
+            let bytes = total.checked_add(VIEW_ALIGN - 1)
+                .context("startup weight arena size overflow")?;
+            let arena = WeightArena::new(bytes, weight_storage, threads)?;
+            let skew = arena.as_ptr().align_offset(VIEW_ALIGN);
+            (arena, skew)
+        };
 
         enum Job<'a> {
             Expert(&'a (String, i64), &'a Shape),
@@ -2688,6 +2730,50 @@ mod tests {
     use triblespace::core::blob::encodings::tensor::TensorView;
 
     #[test]
+    fn managed_weight_zero_worker_plan_is_bounded_for_empty_tiny_and_large_spans() {
+        assert_eq!(weight_zero_workers(0, 0), 0);
+        assert_eq!(weight_zero_workers(0, usize::MAX), 0);
+        assert_eq!(weight_zero_workers(1, 0), 1);
+        assert_eq!(weight_zero_workers(3, usize::MAX), 1);
+        assert_eq!(weight_zero_workers(MIN_ZERO_BYTES_PER_WORKER - 1, 8), 1);
+        assert_eq!(weight_zero_workers(2 * MIN_ZERO_BYTES_PER_WORKER + 3, 8), 2);
+        assert_eq!(weight_zero_workers(8 * MIN_ZERO_BYTES_PER_WORKER, 3), 3);
+        assert_eq!(weight_zero_workers(usize::MAX, usize::MAX), MAX_ZERO_WORKERS);
+    }
+
+    #[test]
+    fn managed_weight_zero_initialization_clears_poisoned_spans_without_touching_guards() {
+        use std::mem::MaybeUninit;
+        for len in [0, 1, 15, 16, 17, 8193, 3 * MIN_ZERO_BYTES_PER_WORKER + 17] {
+            for requested in [0, 1, 2, 3, usize::MAX] {
+                // An odd leading offset and tail exercise exact byte coverage,
+                // not just the aligned pages a large allocation usually has.
+                let mut bytes = vec![MaybeUninit::new(0xa5u8); len + 19];
+                let workers = initialize_weight_bytes(&mut bytes[7..7 + len], requested);
+                assert_eq!(workers, weight_zero_workers(len, requested));
+                for (index, byte) in bytes.iter().enumerate() {
+                    // SAFETY: guards were initialized above; the entire target
+                    // range was initialized before its scoped workers returned.
+                    let actual = unsafe { byte.assume_init() };
+                    let expected = if (7..7 + len).contains(&index) { 0 } else { 0xa5 };
+                    assert_eq!(actual, expected, "len={len} requested={requested} index={index}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn managed_weight_zero_initialization_accepts_truly_uninitialized_storage() {
+        use std::mem::MaybeUninit;
+        let mut bytes = vec![MaybeUninit::<u8>::uninit(); 2 * MIN_ZERO_BYTES_PER_WORKER + 1];
+        assert_eq!(initialize_weight_bytes(&mut bytes, 2), 2);
+        for byte in bytes {
+            // SAFETY: initialization joined both workers before returning.
+            assert_eq!(unsafe { byte.assume_init() }, 0);
+        }
+    }
+
+    #[test]
     fn weight_storage_names_and_default_are_explicit() {
         assert_eq!(WeightStorage::default(), WeightStorage::Host);
         assert_eq!(WeightStorage::Host.as_str(), "host");
@@ -2700,8 +2786,8 @@ mod tests {
 
     #[test]
     fn managed_weight_lengths_are_rejected_before_cuda_initialization() {
-        assert!(ManagedWeightArena::new(0).is_err());
-        assert!(ManagedWeightArena::new(usize::MAX).is_err());
+        assert!(ManagedWeightArena::new(0, 2).is_err());
+        assert!(ManagedWeightArena::new(usize::MAX, 2).is_err());
     }
 
     #[test]
@@ -2717,7 +2803,9 @@ mod tests {
     fn managed_weight_arena_owner_drops_on_foreign_thread() -> Result<()> {
         // Keep the primary alive independently of the allocation under test.
         let _primary = cudarc::driver::CudaContext::new(0)?;
-        let mut arena = ManagedWeightArena::new(8192)?;
+        let arena_len = 2 * MIN_ZERO_BYTES_PER_WORKER + 17;
+        assert_eq!(weight_zero_workers(arena_len, 2), 2);
+        let mut arena = ManagedWeightArena::new(arena_len, 2)?;
         assert!(arena.as_slice().iter().all(|byte| *byte == 0));
         arena.as_mut_slice()[32..40].copy_from_slice(b"weights!");
         let base = arena.ptr.as_ptr() as usize;
@@ -2725,7 +2813,7 @@ mod tests {
         let weak = bytes.downgrade();
         let slice = bytes.slice(32..40);
         let (mapped_base, len, keepalive) = weight_arena_mapping(&bytes);
-        assert_eq!((mapped_base, len), (base, 8192));
+        assert_eq!((mapped_base, len), (base, arena_len));
         assert_eq!(slice.as_ref(), b"weights!");
         drop(slice);
         drop(bytes);
@@ -2743,10 +2831,68 @@ mod tests {
         Ok(())
     }
 
+    /// A constructor-only ABBA screen, not a model-readiness benchmark. The
+    /// invoking harness must hold the exclusive GB10 lease; memory admission
+    /// is an additional guard, not a substitute for that reservation. This
+    /// test-only byte count is never read by the production startup path.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires an exclusive GB10 lease and INK_MANAGED_INIT_SCREEN_BYTES"]
+    fn managed_weight_initialization_timing_screen() -> Result<()> {
+        const MIN_BYTES: u64 = 1 << 20;
+        const MAX_BYTES: u64 = 89_022_731_951;
+        const MIN_AVAILABLE_BYTES: u64 = 115_000_000 * 1024;
+        const SAMPLE_BYTES: usize = 64;
+        let bytes = std::env::var("INK_MANAGED_INIT_SCREEN_BYTES")
+            .context("explicit test-only INK_MANAGED_INIT_SCREEN_BYTES is required")?
+            .parse::<u64>().context("INK_MANAGED_INIT_SCREEN_BYTES must be a byte count")?;
+        anyhow::ensure!((MIN_BYTES..=MAX_BYTES).contains(&bytes),
+            "INK_MANAGED_INIT_SCREEN_BYTES must be in {MIN_BYTES}..={MAX_BYTES}");
+        let len = usize::try_from(bytes).context("screen allocation does not fit usize")?;
+        let parallel = std::thread::available_parallelism()
+            .map(|n| n.get()).unwrap_or(1).min(MAX_ZERO_WORKERS);
+        // Keep primary-context startup outside each measured fresh allocation,
+        // and retain it across every arena's synchronous destruction.
+        let _primary = cudarc::driver::CudaContext::new(0)?;
+        for (arm, workers) in [1, parallel, parallel, 1].into_iter().enumerate() {
+            let available = mem_available_bytes()?;
+            anyhow::ensure!(available >= MIN_AVAILABLE_BYTES,
+                "managed initialization screen arm {} requires at least 115000000 KiB available; found {} KiB",
+                arm + 1, available / 1024);
+            let started = std::time::Instant::now();
+            let arena = ManagedWeightArena::new(len, workers)?;
+            let new_seconds = started.elapsed().as_secs_f64();
+            // The CPU tests check exhaustive coverage. Keep this timing screen
+            // bounded to three small samples without another full read pass.
+            for offset in [0, len / 2, len - SAMPLE_BYTES] {
+                assert!(arena.as_slice()[offset..offset + SAMPLE_BYTES]
+                    .iter().all(|byte| *byte == 0), "nonzero bytes at offset {offset}");
+            }
+            let dropping = std::time::Instant::now();
+            drop(arena);
+            let drop_seconds = dropping.elapsed().as_secs_f64();
+            println!("{}", serde_json::json!({
+                "event": "managed_weight_initialization_screen",
+                "arm": arm + 1,
+                "bytes": bytes,
+                "workers": workers,
+                "active_workers": weight_zero_workers(len, workers),
+                "new_seconds": new_seconds,
+                "drop_seconds": drop_seconds,
+                // Excludes zero sampling and admission/accounting reads.
+                "total_seconds": new_seconds + drop_seconds,
+                "mem_available_before_bytes": available,
+                "mem_available_before_kib": available / 1024,
+            }));
+        }
+        Ok(())
+    }
+
     #[test]
     fn mmap_weight_arena_reads_and_alias_keepalive_preserve_the_same_storage() -> Result<()> {
         for storage in [WeightStorage::Host, WeightStorage::HostReadOnly] {
-            let mut arena = WeightArena::new(8192, storage)?;
+            let mut arena = WeightArena::new(8192, storage, 2)?;
+            assert!(arena.iter().all(|byte| *byte == 0));
             arena[32..40].copy_from_slice(b"weights!");
             let base = arena.as_ptr() as usize;
             let bytes = arena.finish(storage)?;
@@ -2771,7 +2917,7 @@ mod tests {
     #[test]
     fn mmap_weight_arena_protection_matches_the_selected_arm() -> Result<()> {
         for storage in [WeightStorage::Host, WeightStorage::HostReadOnly] {
-            let mut arena = WeightArena::new(8192, storage)?;
+            let mut arena = WeightArena::new(8192, storage, 2)?;
             arena.fill(7);
             let bytes = arena.finish(storage)?;
             let ptr = bytes.as_ptr() as usize;
