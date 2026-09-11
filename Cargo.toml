@@ -878,6 +878,10 @@ required-features = ["embed", "import"]
 name = "nomic_semantic_probe"
 required-features = ["embed", "import"]
 
+[[bin]]
+name = "nomic_fp4_probe"
+required-features = ["embed"]
+
 [dev-dependencies]
 ciborium = "0.2"
 burn-ndarray = "0.21.0"
