@@ -334,12 +334,15 @@ fn load_parts(model_pile: &Path) -> Result<(Keymap, tokenizers::Tokenizer)> {
 /// Fake-quantize every two-dimensional weight that is not an embedding table
 /// or a norm: rows are output features, blocks of sixteen run along the input
 /// features, one f32 scale per row. Returns how many tensors were touched.
-fn fake_nvfp4_weights(keymap: &mut Keymap) -> (usize, usize) {
+fn fake_nvfp4_weights(keymap: &mut Keymap, only: &[String]) -> (usize, usize) {
     let mut tensors = 0usize;
     let mut elements = 0usize;
     for (name, (data, shape)) in keymap.iter_mut() {
         let lower = name.to_ascii_lowercase();
         if shape.len() != 2 || !lower.contains("weight") {
+            continue;
+        }
+        if !only.is_empty() && !only.iter().any(|pattern| lower.contains(&pattern.to_ascii_lowercase())) {
             continue;
         }
         if lower.contains("embed") || lower.contains("norm") || lower.contains("ln") {
@@ -375,7 +378,55 @@ fn top_k(query: &[f32], docs: &[Vec<f32>], exclude: Option<usize>, k: usize) -> 
     scored.into_iter().take(k).map(|(i, _)| i).collect()
 }
 
-fn probe(model_pile: &Path, corpus: &Path, queries: usize) -> Result<()> {
+struct ProbeOptions {
+    queries: usize,
+    cache: Option<PathBuf>,
+    only: Vec<String>,
+    list_tensors: bool,
+    skip_output_variants: bool,
+}
+
+/// f32 document and query vectors, saved after the first run so a sweep over
+/// weight groups does not re-embed the corpus with the unquantized model.
+fn save_vectors(path: &Path, docs: &[Vec<f32>], queries: &[Vec<f32>]) -> Result<()> {
+    let mut bytes = Vec::new();
+    for group in [docs, queries] {
+        bytes.extend_from_slice(&(group.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(&(group.first().map_or(0, Vec::len) as u64).to_le_bytes());
+        for v in group {
+            for x in v {
+                bytes.extend_from_slice(&x.to_le_bytes());
+            }
+        }
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
+fn load_vectors(path: &Path) -> Result<(Vec<Vec<f32>>, Vec<Vec<f32>>)> {
+    let bytes = fs::read(path)?;
+    let mut at = 0usize;
+    let mut read_group = |at: &mut usize| -> Result<Vec<Vec<f32>>> {
+        let n = u64::from_le_bytes(bytes[*at..*at + 8].try_into()?) as usize;
+        let d = u64::from_le_bytes(bytes[*at + 8..*at + 16].try_into()?) as usize;
+        *at += 16;
+        let mut out = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut v = Vec::with_capacity(d);
+            for _ in 0..d {
+                v.push(f32::from_le_bytes(bytes[*at..*at + 4].try_into()?));
+                *at += 4;
+            }
+            out.push(v);
+        }
+        Ok(out)
+    };
+    let docs = read_group(&mut at)?;
+    let queries = read_group(&mut at)?;
+    Ok((docs, queries))
+}
+
+fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> {
     let rows = read_corpus(corpus)?;
     if rows.len() < 20 {
         return Err(anyhow!("corpus has only {} texts", rows.len()));
@@ -383,30 +434,51 @@ fn probe(model_pile: &Path, corpus: &Path, queries: usize) -> Result<()> {
     eprintln!("corpus: {} texts", rows.len());
 
     let (keymap, tokenizer) = load_parts(model_pile)?;
-    let device = mary::embed::default_device();
-    let started = Instant::now();
-    let f32_model = mary::embed::nomic_text_from_parts(keymap.clone(), tokenizer.clone(), device.clone())?;
-    eprintln!("f32 model built in {:.1} s", started.elapsed().as_secs_f64());
-
-    let started = Instant::now();
-    let mut docs: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
-    for (_, _, text) in &rows {
-        let mut v = f32_model.embed_document(text)?;
-        l2_normalize(&mut v);
-        docs.push(v);
+    if options.list_tensors {
+        let mut names: Vec<_> = keymap.iter().map(|(n, (_, s))| (n.clone(), s.clone())).collect();
+        names.sort();
+        for (name, shape) in names {
+            println!("{name} {shape:?}");
+        }
+        return Ok(());
     }
-    let dim = docs[0].len();
-    eprintln!("embedded {} documents ({dim}-d) in {:.1} s", docs.len(), started.elapsed().as_secs_f64());
-
-    let queries = queries.min(rows.len());
+    let device = mary::embed::default_device();
+    let queries = options.queries.min(rows.len());
     let step = rows.len() / queries;
     let query_ids: Vec<usize> = (0..queries).map(|i| i * step).collect();
-    let mut qvecs: Vec<Vec<f32>> = Vec::with_capacity(queries);
-    for &i in &query_ids {
-        let mut v = f32_model.embed_query(&rows[i].2)?;
-        l2_normalize(&mut v);
-        qvecs.push(v);
-    }
+
+    let cached = options.cache.as_ref().filter(|p| p.exists()).map(|p| load_vectors(p)).transpose()?;
+    let (docs, qvecs): (Vec<Vec<f32>>, Vec<Vec<f32>>) = if let Some((docs, qvecs)) = cached {
+        if docs.len() != rows.len() || qvecs.len() != queries {
+            return Err(anyhow!("cached vectors do not match the corpus and query count"));
+        }
+        eprintln!("f32 vectors loaded from cache");
+        (docs, qvecs)
+    } else {
+        let started = Instant::now();
+        let f32_model = mary::embed::nomic_text_from_parts(keymap.clone(), tokenizer.clone(), device.clone())?;
+        eprintln!("f32 model built in {:.1} s", started.elapsed().as_secs_f64());
+        let started = Instant::now();
+        let mut docs: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
+        for (_, _, text) in &rows {
+            let mut v = f32_model.embed_document(text)?;
+            l2_normalize(&mut v);
+            docs.push(v);
+        }
+        eprintln!("embedded {} documents in {:.1} s", docs.len(), started.elapsed().as_secs_f64());
+        let mut qvecs: Vec<Vec<f32>> = Vec::with_capacity(queries);
+        for &i in &query_ids {
+            let mut v = f32_model.embed_query(&rows[i].2)?;
+            l2_normalize(&mut v);
+            qvecs.push(v);
+        }
+        if let Some(path) = &options.cache {
+            save_vectors(path, &docs, &qvecs)?;
+            eprintln!("f32 vectors cached at {}", path.display());
+        }
+        (docs, qvecs)
+    };
+    let dim = docs[0].len();
     let baseline: Vec<Vec<usize>> = query_ids
         .iter()
         .zip(&qvecs)
@@ -440,6 +512,7 @@ fn probe(model_pile: &Path, corpus: &Path, queries: usize) -> Result<()> {
     };
 
     report("f32 vectors", 32.0, &docs, &qvecs);
+    if !options.skip_output_variants {
     let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = nvfp4_quantize(d).0; l2_normalize(&mut q); q }).collect();
     report("NVFP4, one stage", 4.5, &v, &qvecs);
     let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = nvfp4_two_stage(d); l2_normalize(&mut q); q }).collect();
@@ -455,11 +528,15 @@ fn probe(model_pile: &Path, corpus: &Path, queries: usize) -> Result<()> {
     let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = nvfp4_two_stage(d); l2_normalize(&mut q); q }).collect();
     let q2: Vec<Vec<f32>> = qvecs.iter().map(|q| { let mut b = nvfp4_two_stage(q); l2_normalize(&mut b); b }).collect();
     report("NVFP4 two-stage, both sides", 9.0, &v, &q2);
+    }
 
-    // The model itself with NVFP4 weights.
+    // The model itself with NVFP4 weights, all of them or the named group.
     let mut quantized = keymap;
-    let (tensors, elements) = fake_nvfp4_weights(&mut quantized);
-    eprintln!("fake-quantized {tensors} weight tensors, {elements} elements, to NVFP4");
+    let (tensors, elements) = fake_nvfp4_weights(&mut quantized, &options.only);
+    eprintln!(
+        "fake-quantized {tensors} weight tensors, {elements} elements, to NVFP4 (group: {})",
+        if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
+    );
     let started = Instant::now();
     let q_model = mary::embed::nomic_text_from_parts(quantized, tokenizer, device)?;
     let mut qdocs: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
@@ -477,7 +554,10 @@ fn probe(model_pile: &Path, corpus: &Path, queries: usize) -> Result<()> {
     eprintln!("NVFP4-weight model embedded everything in {:.1} s", started.elapsed().as_secs_f64());
     let same_text_cos: f64 = docs.iter().zip(&qdocs).map(|(a, b)| dot(a, b) as f64).sum::<f64>() / docs.len() as f64;
     println!();
-    println!("model with NVFP4 linear weights ({tensors} tensors): mean cosine to the f32 model's vector of the same text {same_text_cos:.5}");
+    println!(
+        "model with NVFP4 linear weights, group {} ({tensors} tensors, {elements} elements): mean cosine to the f32 model's vector of the same text {same_text_cos:.5}",
+        if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
+    );
     report("NVFP4 weights, f32 vectors", 32.0, &qdocs, &qqueries);
     let v: Vec<Vec<f32>> = qdocs.iter().map(|d| { let mut q = nvfp4_two_stage(d); l2_normalize(&mut q); q }).collect();
     let q2: Vec<Vec<f32>> = qqueries.iter().map(|q| { let mut b = nvfp4_two_stage(q); l2_normalize(&mut b); b }).collect();
@@ -511,8 +591,21 @@ fn main() -> Result<()> {
             let model = PathBuf::from(flag("--model").ok_or_else(|| anyhow!("--model"))?);
             let corpus = PathBuf::from(flag("--corpus").unwrap_or_else(|| "corpus.jsonl".into()));
             let queries: usize = flag("--queries").map(|s| s.parse()).transpose()?.unwrap_or(200);
-            probe(&model, &corpus, queries)
+            let only: Vec<String> = flag("--only")
+                .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+                .unwrap_or_default();
+            probe(
+                &model,
+                &corpus,
+                ProbeOptions {
+                    queries,
+                    cache: flag("--cache").map(PathBuf::from),
+                    only,
+                    list_tensors: args.iter().any(|a| a == "--list-tensors"),
+                    skip_output_variants: args.iter().any(|a| a == "--weights-only"),
+                },
+            )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N]")),
+        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--list-tensors]")),
     }
 }
