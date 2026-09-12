@@ -472,3 +472,206 @@ mod tests {
         }
     }
 }
+
+// ── a whole keymap, and a pile to keep it in ─────────────────────────────
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use ed25519_dalek::SigningKey;
+use triblespace::macros::entity;
+use triblespace::prelude::*;
+
+/// A model as the f32 loaders speak it: name to (flat data, shape).
+pub type Keymap = HashMap<String, (Vec<f32>, Vec<usize>)>;
+
+/// Captured inputs of one linear: the rows and the per-channel mean `|x|`.
+#[derive(Clone, Debug, Default)]
+pub struct InputStats {
+    pub rows: Vec<Vec<f32>>,
+    pub mean_abs: Vec<f32>,
+}
+
+/// What [`pack_keymap`] did.
+#[derive(Debug, Default)]
+pub struct PackReport {
+    /// The packed form of every tensor that was packed.
+    pub packed: HashMap<String, Calibrated>,
+    pub tensors: usize,
+    pub elements: usize,
+    /// Packed payload bytes, the pile's size for those tensors.
+    pub packed_bytes: usize,
+}
+
+/// The nomic models' capture key for a weight name: the module prefix, with
+/// the gated MLP's two input projections sharing their input under `.mlp.fc1`
+/// (`encoder.layers.3.mlp.fc12.weight` captures as `encoder.layers.3.mlp.fc1`).
+pub fn nomic_capture_key(tensor_name: &str) -> String {
+    tensor_name
+        .trim_end_matches(".weight")
+        .replace(".mlp.fc11", ".mlp.fc1")
+        .replace(".mlp.fc12", ".mlp.fc1")
+}
+
+/// Whether a keymap tensor is a linear weight this packer takes: rank two,
+/// named a weight, not an embedding table or a norm, input width a multiple
+/// of the block, and named by `only` when `only` is not empty.
+pub fn packs(name: &str, shape: &[usize], only: &[String]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    shape.len() == 2
+        && lower.contains("weight")
+        && !(lower.contains("embed") || lower.contains("norm") || lower.contains("ln"))
+        && shape[1] % BLOCK == 0
+        && (only.is_empty() || only.iter().any(|p| lower.contains(&p.to_ascii_lowercase())))
+}
+
+/// Pack every eligible linear of a keymap in place. `stats_for(name)` gives a
+/// tensor's captured inputs (none: plain nearest rounding). The keymap keeps
+/// the DECODED packed values afterwards, so whatever a caller runs or scores
+/// next is exactly what a pile written from the report would hold. `log` is
+/// told one line per tensor as it lands.
+pub fn pack_keymap<'s>(
+    keymap: &mut Keymap,
+    only: &[String],
+    stats_for: &dyn Fn(&str) -> Option<&'s InputStats>,
+    opts: &Options<'_>,
+    log: &mut dyn FnMut(&str),
+) -> Result<PackReport> {
+    let mut report = PackReport::default();
+    let mut names: Vec<String> = keymap.keys().cloned().collect();
+    names.sort();
+    for name in names {
+        let (data, shape) = keymap.get_mut(&name).expect("listed key");
+        if !packs(&name, shape, only) {
+            continue;
+        }
+        let cols = shape[1];
+        let cal = match stats_for(&name) {
+            Some(st) if st.rows.len() >= 16 && st.mean_abs.len() == cols => {
+                let cal = pack_linear(data, cols, &st.rows, &st.mean_abs, opts)?;
+                log(&format!(
+                    "{name}: alpha {:.1}, output error x{:.3} of plain ({} rows{})",
+                    cal.alpha,
+                    cal.error_ratio,
+                    st.rows.len(),
+                    if cal.feedback_used { ", feedback" } else { "" }
+                ));
+                cal
+            }
+            _ => {
+                log(&format!("{name}: no captured inputs, plain rounding"));
+                Calibrated::plain(pack_nearest(data, cols)?)
+            }
+        };
+        data.copy_from_slice(&cal.decode());
+        report.tensors += 1;
+        report.elements += data.len();
+        report.packed_bytes += cal.packed.payload().len() + cal.input_scale.len() * 4;
+        report.packed.insert(name, cal);
+    }
+    Ok(report)
+}
+
+/// Write a packed model as a NEW model pile: every packed linear as a
+/// `Tensor<NVFP4, 2>` leaf plus its `<name>.input_scale` F32 vector, every
+/// other tensor as an F32 leaf, under one root labelled `quantization` and
+/// named `source`, and, when given, the tokenizer JSON beside it so the pile
+/// loads on its own. Refuses an existing file: a pile is append-only and a
+/// second root in it would be a choice the caller should make by name.
+pub fn write_packed_pile(
+    out: &Path,
+    key: &SigningKey,
+    keymap: &Keymap,
+    packed: &HashMap<String, Calibrated>,
+    source: &str,
+    quantization: &str,
+    tokenizer_json: Option<&[u8]>,
+) -> Result<Id> {
+    use crate::format::attrs;
+    use crate::leaf::{Elem, put_leaf};
+
+    ensure!(
+        !out.exists(),
+        "refusing to write into an existing pile {}: name a new file",
+        out.display()
+    );
+    std::fs::File::create(out).map_err(|e| anyhow::anyhow!("create {}: {e}", out.display()))?;
+    let mut pile = Pile::open(out).map_err(|e| anyhow::anyhow!("open {}: {e:?}", out.display()))?;
+    pile.refresh()
+        .map_err(|e| anyhow::anyhow!("refresh {}: {e:?}", out.display()))?;
+    crate::model_collection::model_graph_collection_or_create(&mut pile, key)
+        .map_err(|e| anyhow::anyhow!("create the model collection: {e}"))?;
+
+    let mut graph = Fragment::empty();
+    let mut members: Vec<Id> = Vec::new();
+    let mut add_member = |pile: &mut Pile, graph: &mut Fragment, leaf: Fragment, name: &str, kind: &str| -> Result<()> {
+        let leaf_id = leaf.root().ok_or_else(|| anyhow::anyhow!("{name}: leaf has no root"))?;
+        *graph += leaf;
+        let name_h = pile
+            .put::<blobencodings::UTF8String, _>(name.to_string())
+            .map_err(|e| anyhow::anyhow!("{name}: store name: {e:?}"))?;
+        let member = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
+        members.push(member.root().ok_or_else(|| anyhow::anyhow!("{name}: member has no root"))?);
+        *graph += member;
+        Ok(())
+    };
+    let mut names: Vec<&String> = keymap.keys().collect();
+    names.sort();
+    for name in names {
+        let (values, shape) = &keymap[name];
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+        if let Some(cal) = packed.get(name) {
+            ensure!(
+                shape.len() == 2 && cal.packed.rows == shape[0] && cal.packed.cols == shape[1],
+                "{name}: packed {}x{} for shape {shape:?}",
+                cal.packed.rows,
+                cal.packed.cols
+            );
+            let leaf = put_leaf(&mut pile, Elem::Nvfp4, &dims, anybytes::Bytes::from_source(cal.packed.payload()), name)?;
+            add_member(&mut pile, &mut graph, leaf, name, "matrix")?;
+            let scale_name = format!("{name}.input_scale");
+            let leaf = put_leaf(
+                &mut pile,
+                Elem::F32,
+                &[cal.input_scale.len() as u64],
+                anybytes::Bytes::from_source(cal.input_scale.clone()),
+                &scale_name,
+            )?;
+            add_member(&mut pile, &mut graph, leaf, &scale_name, "vector")?;
+        } else {
+            let leaf = put_leaf(&mut pile, Elem::F32, &dims, anybytes::Bytes::from_source(values.clone()), name)?;
+            let kind = match shape.len() {
+                1 => "vector",
+                2 => "matrix",
+                _ => "tensor",
+            };
+            add_member(&mut pile, &mut graph, leaf, name, kind)?;
+        }
+    }
+    let name_h = pile
+        .put::<blobencodings::UTF8String, _>(format!("{source} ({quantization})"))
+        .map_err(|e| anyhow::anyhow!("store model name: {e:?}"))?;
+    let source_h = pile
+        .put::<blobencodings::UTF8String, _>(source.to_string())
+        .map_err(|e| anyhow::anyhow!("store source: {e:?}"))?;
+    let model = entity! { _ @
+        attrs::model_name: name_h,
+        attrs::source: source_h,
+        attrs::quantization: quantization,
+        attrs::member*: members.iter(),
+    };
+    let root = model.root().ok_or_else(|| anyhow::anyhow!("model has no root"))?;
+    graph += model;
+    crate::model_collection::publish_model_fragment(&mut pile, key, graph)
+        .map_err(|e| anyhow::anyhow!("publish the packed model: {e}"))?;
+
+    if let Some(json) = tokenizer_json {
+        let tok = crate::tokenizer::save_tokenizer_json(json, source, &mut pile)
+            .map_err(|e| anyhow::anyhow!("build tokenizer graph: {e}"))?;
+        crate::model_collection::publish_model_fragment(&mut pile, key, tok)
+            .map_err(|e| anyhow::anyhow!("publish the tokenizer: {e}"))?;
+    }
+    pile.close()
+        .map_err(|e| anyhow::anyhow!("close {}: {e:?}", out.display()))?;
+    Ok(root)
+}

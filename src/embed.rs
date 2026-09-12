@@ -2406,6 +2406,11 @@ struct NomicVisionLayer<B: Backend> {
     n_heads: usize,
     head_dim: usize,
     n_prefix: usize, // RoPE-excluded prefix tokens (CLS) = 1
+    /// Activation quantisation and input capture, as the text layer has them
+    /// (`NOMIC_ACT_QUANT`, `nomic_activation_capture_start`), so the same
+    /// calibration recipe packs the vision model.
+    act: ActQuant,
+    prefix: String,
 }
 
 impl<B: Backend> NomicVisionLayer<B> {
@@ -2431,6 +2436,8 @@ impl<B: Backend> NomicVisionLayer<B> {
             n_heads,
             head_dim,
             n_prefix: 1,
+            act: ActQuant::from_env(),
+            prefix: p.to_owned(),
         }
     }
 
@@ -2453,7 +2460,9 @@ impl<B: Backend> NomicVisionLayer<B> {
         };
         let hidden = self.norm1.forward(residual.clone());
         // packed qkv → q,k,v each [b,h,s,hd]
-        let qkv = self.wqkv.forward(hidden);
+        let qkv = self
+            .wqkv
+            .forward(linear_input(hidden, self.act, &format!("{}.attn.Wqkv", self.prefix)));
         let q = qkv.clone().narrow(2, 0, d);
         let k = qkv.clone().narrow(2, d, d);
         let v = qkv.narrow(2, 2 * d, d);
@@ -2466,16 +2475,20 @@ impl<B: Backend> NomicVisionLayer<B> {
             .mul_scalar((hd as f64).powf(-0.5)); // [b,h,s,s]
         let probs = softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, s, d]);
+        let att = linear_input(att, self.act, &format!("{}.attn.out_proj", self.prefix));
         let attn_out = self.out_proj.forward(att);
 
         let residual = attn_out.add(residual);
         let hidden = self.norm2.forward(residual.clone());
         // gated SwiGLU with an inner LayerNorm: fc2(norm(fc11(x)*silu(fc12(x)))).
+        // fc11 and fc12 read the same input, captured once under `.mlp.fc1`.
+        let hq = linear_input(hidden, self.act, &format!("{}.mlp.fc1", self.prefix));
         let gated = self
             .fc11
-            .forward(hidden.clone())
-            .mul(silu(self.fc12.forward(hidden)));
-        let mlp = self.fc2.forward(self.mlp_norm.forward(gated));
+            .forward(hq.clone())
+            .mul(silu(self.fc12.forward(hq)));
+        let inner = linear_input(self.mlp_norm.forward(gated), self.act, &format!("{}.mlp.fc2", self.prefix));
+        let mlp = self.fc2.forward(inner);
         (mlp, residual)
     }
 

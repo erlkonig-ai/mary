@@ -712,174 +712,14 @@ fn fake_nvfp4_weights_awq(
         eprintln!("  (block scale search is ignored under calibration: it lost to nearest rounding there)");
     }
     let opts = mary::calibrate::Options { alphas: &mary::calibrate::AWQ_ALPHAS, feedback: gptq };
-    let mut tensors = 0usize;
-    let mut elements = 0usize;
-    let mut packed = HashMap::new();
-    let mut names: Vec<String> = keymap.keys().cloned().collect();
-    names.sort();
-    for name in names {
-        let lower = name.to_ascii_lowercase();
-        let (data, shape) = keymap.get_mut(&name).expect("key exists");
-        if shape.len() != 2 || !lower.contains("weight") {
-            continue;
-        }
-        if !only.is_empty() && !only.iter().any(|pattern| lower.contains(&pattern.to_ascii_lowercase())) {
-            continue;
-        }
-        if lower.contains("embed") || lower.contains("norm") || lower.contains("ln") {
-            continue;
-        }
-        let cols = shape[1];
-        if cols % BLOCK != 0 {
-            continue;
-        }
-        let prefix = name.trim_end_matches(".weight");
-        let key = prefix.replace(".mlp.fc11", ".mlp.fc1").replace(".mlp.fc12", ".mlp.fc1");
-        // The packed form is the artifact; the keymap gets its decoded values,
-        // so what the probe scores is exactly what a pile would hold.
-        let cal = match stats.get(&key) {
-            Some(st) if st.rows.len() >= 16 && st.sum_abs.len() == cols => {
-                let cal = mary::calibrate::pack_linear(data, cols, &st.rows, &st.mean_abs(), &opts)
-                    .unwrap_or_else(|e| panic!("{name}: calibrate: {e}"));
-                eprintln!(
-                    "  {name}: alpha {:.1}, output error x{:.3} of plain ({} rows{})",
-                    cal.alpha,
-                    cal.error_ratio,
-                    st.rows.len(),
-                    if cal.feedback_used { ", feedback" } else { "" }
-                );
-                cal
-            }
-            _ => {
-                eprintln!("  {name}: no captured inputs, plain rounding");
-                mary::calibrate::Calibrated::plain(
-                    mary::nvfp4::pack_nearest(data, cols).unwrap_or_else(|e| panic!("{name}: pack: {e}")),
-                )
-            }
-        };
-        data.copy_from_slice(&cal.decode());
-        packed.insert(name.clone(), cal);
-        tensors += 1;
-        elements += data.len();
-    }
-    (tensors, elements, packed)
-}
-
-/// Write the calibrated model as a NEW model pile: every packed linear as a
-/// `Tensor<NVFP4, 2>` leaf plus its `.input_scale` F32 vector, everything
-/// else as F32 leaves, under one root labelled `quantization`, with the
-/// tokenizer beside it so the pile loads on its own.
-fn write_packed_pile(
-    out: &Path,
-    key_path: &Path,
-    keymap: &Keymap,
-    packed: &HashMap<String, mary::calibrate::Calibrated>,
-    tokenizer: &tokenizers::Tokenizer,
-    source: &str,
-    quantization: &str,
-) -> Result<Id> {
-    use mary::format::attrs;
-    use mary::leaf::{put_leaf, Elem};
-    use triblespace::core::signing_key_file;
-    use triblespace::macros::entity;
-
-    let key = signing_key_file::load_existing(key_path)
-        .with_context(|| format!("load signing key {}", key_path.display()))?;
-    anyhow::ensure!(
-        !out.exists(),
-        "refusing to write into an existing pile {}: a pile is append-only, name a new file",
-        out.display()
-    );
-    fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
-    let mut pile = Pile::open(out).map_err(|e| anyhow!("open {}: {e:?}", out.display()))?;
-    pile.refresh().map_err(|e| anyhow!("refresh {}: {e:?}", out.display()))?;
-    mary::model_collection::model_graph_collection_or_create(&mut pile, &key)
-        .context("create the model collection")?;
-
-    let mut graph = Fragment::empty();
-    let mut members: Vec<Id> = Vec::new();
-    let (mut packed_bytes, mut dense_bytes) = (0usize, 0usize);
-    let mut names: Vec<&String> = keymap.keys().collect();
-    names.sort();
-    let mut add_member = |pile: &mut Pile, graph: &mut Fragment, leaf: Fragment, name: &str, kind: &str| -> Result<()> {
-        let leaf_id = leaf.root().ok_or_else(|| anyhow!("{name}: leaf has no root"))?;
-        *graph += leaf;
-        let name_h = pile
-            .put::<blobencodings::UTF8String, _>(name.to_string())
-            .map_err(|e| anyhow!("{name}: store name: {e:?}"))?;
-        let member = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
-        members.push(member.root().ok_or_else(|| anyhow!("{name}: member has no root"))?);
-        *graph += member;
-        Ok(())
-    };
-    for name in names {
-        let (values, shape) = &keymap[name];
-        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
-        if let Some(cal) = packed.get(name) {
-            anyhow::ensure!(
-                shape.len() == 2 && cal.packed.rows == shape[0] && cal.packed.cols == shape[1],
-                "{name}: packed {}x{} for shape {shape:?}",
-                cal.packed.rows,
-                cal.packed.cols
-            );
-            let payload = cal.packed.payload();
-            packed_bytes += payload.len();
-            let leaf = put_leaf(&mut pile, Elem::Nvfp4, &dims, anybytes::Bytes::from_source(payload), name)?;
-            add_member(&mut pile, &mut graph, leaf, name, "matrix")?;
-            let scale_name = format!("{name}.input_scale");
-            let scale = cal.input_scale.clone();
-            dense_bytes += scale.len() * 4;
-            let leaf = put_leaf(
-                &mut pile,
-                Elem::F32,
-                &[scale.len() as u64],
-                anybytes::Bytes::from_source(scale),
-                &scale_name,
-            )?;
-            add_member(&mut pile, &mut graph, leaf, &scale_name, "vector")?;
-        } else {
-            dense_bytes += values.len() * 4;
-            let leaf = put_leaf(&mut pile, Elem::F32, &dims, anybytes::Bytes::from_source(values.clone()), name)?;
-            let kind = match shape.len() {
-                1 => "vector",
-                2 => "matrix",
-                _ => "tensor",
-            };
-            add_member(&mut pile, &mut graph, leaf, name, kind)?;
-        }
-    }
-    let name_h = pile
-        .put::<blobencodings::UTF8String, _>(format!("{source} ({quantization})"))
-        .map_err(|e| anyhow!("store model name: {e:?}"))?;
-    let source_h = pile
-        .put::<blobencodings::UTF8String, _>(source.to_string())
-        .map_err(|e| anyhow!("store source: {e:?}"))?;
-    let model = entity! { _ @
-        attrs::model_name: name_h,
-        attrs::source: source_h,
-        attrs::quantization: quantization,
-        attrs::member*: members.iter(),
-    };
-    let root = model.root().ok_or_else(|| anyhow!("model has no root"))?;
-    graph += model;
-    mary::model_collection::publish_model_fragment(&mut pile, &key, graph)
-        .map_err(|e| anyhow!("publish the packed model: {e}"))?;
-
-    let json = tokenizer
-        .to_string(false)
-        .map_err(|e| anyhow!("serialise tokenizer: {e}"))?;
-    let tok = mary::tokenizer::save_tokenizer_json(json.as_bytes(), source, &mut pile)
-        .map_err(|e| anyhow!("build tokenizer graph: {e}"))?;
-    mary::model_collection::publish_model_fragment(&mut pile, &key, tok)
-        .map_err(|e| anyhow!("publish the tokenizer: {e}"))?;
-    pile.close().map_err(|e| anyhow!("close {}: {e:?}", out.display()))?;
-    eprintln!(
-        "  packed leaves {:.1} MB, dense leaves {:.1} MB, {} members",
-        packed_bytes as f64 / 1e6,
-        dense_bytes as f64 / 1e6,
-        members.len()
-    );
-    Ok(root)
+    let inputs: HashMap<String, mary::calibrate::InputStats> = stats
+        .iter()
+        .map(|(k, s)| (k.clone(), mary::calibrate::InputStats { rows: s.rows.clone(), mean_abs: s.mean_abs() }))
+        .collect();
+    let stats_for = |name: &str| inputs.get(&mary::calibrate::nomic_capture_key(name));
+    let report = mary::calibrate::pack_keymap(keymap, only, &stats_for, &opts, &mut |line| eprintln!("  {line}"))
+        .unwrap_or_else(|e| panic!("pack: {e}"));
+    (report.tensors, report.elements, report.packed)
 }
 
 fn recall_at_k(baseline: &[usize], candidate: &[usize]) -> f32 {
@@ -1125,7 +965,18 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             "--pack writes the calibrated model; give --calibrate N"
         );
         let started = Instant::now();
-        let root = write_packed_pile(out, key, &quantized, &calibrated, &tokenizer, NOMIC_TEXT_MODEL, "nvfp4-calibrated")?;
+        let key = triblespace::core::signing_key_file::load_existing(key)
+            .with_context(|| format!("load signing key {}", key.display()))?;
+        let json = tokenizer.to_string(false).map_err(|e| anyhow!("serialise tokenizer: {e}"))?;
+        let root = mary::calibrate::write_packed_pile(
+            out,
+            &key,
+            &quantized,
+            &calibrated,
+            NOMIC_TEXT_MODEL,
+            "nvfp4-calibrated",
+            Some(json.as_bytes()),
+        )?;
         eprintln!(
             "packed model written to {} (root {root}, {} packed tensors) in {:.1} s",
             out.display(),
