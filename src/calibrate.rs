@@ -675,3 +675,100 @@ pub fn write_packed_pile(
         .map_err(|e| anyhow::anyhow!("close {}: {e:?}", out.display()))?;
     Ok(root)
 }
+
+#[cfg(test)]
+mod pile_tests {
+    use super::*;
+    use crate::selection::ModelSelector;
+
+    fn matrix(rows: usize, cols: usize) -> Vec<f32> {
+        (0..rows * cols)
+            .map(|i| ((i * 7919) % 1000) as f32 / 1000.0 - 0.5)
+            .collect()
+    }
+
+    fn inputs(n: usize, cols: usize) -> Vec<Vec<f32>> {
+        (0..n)
+            .map(|r| {
+                (0..cols)
+                    .map(|j| {
+                        let x = (((r * 131 + j * 17) % 997) as f32 / 997.0) - 0.5;
+                        if j >= 3 * cols / 4 { x * 8.0 } else { x }
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// The whole seam in one test: pack a tiny model, write it as a pile, read
+    /// it back through the ordinary keymap loader, and get the decoded packed
+    /// values with the input scale folded in and its vector gone.
+    #[test]
+    fn a_packed_pile_reads_back_through_the_keymap_loader() {
+        let dir = std::env::temp_dir().join(format!(
+            "mary-calibrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("packed.pile");
+        let key = SigningKey::from_bytes(&[0x4C; 32]);
+
+        let (rows, cols) = (8, 32);
+        let mut keymap: Keymap = HashMap::new();
+        keymap.insert("encoder.layers.0.mlp.fc2.weight".into(), (matrix(rows, cols), vec![rows, cols]));
+        keymap.insert("encoder.layers.0.norm1.weight".into(), (vec![1.0; cols], vec![cols]));
+        keymap.insert("embeddings.word_embeddings.weight".into(), (matrix(4, cols), vec![4, cols]));
+        let x = inputs(32, cols);
+        let mut mean_abs = vec![0f32; cols];
+        for r in &x {
+            for (m, v) in mean_abs.iter_mut().zip(r) {
+                *m += v.abs() / x.len() as f32;
+            }
+        }
+        let stats = HashMap::from([(
+            "encoder.layers.0.mlp.fc2".to_string(),
+            InputStats { rows: x, mean_abs },
+        )]);
+        let stats_for = |name: &str| stats.get(&nomic_capture_key(name));
+
+        let mut packed_keymap = keymap.clone();
+        let report =
+            pack_keymap(&mut packed_keymap, &[], &stats_for, &Options::default(), &mut |_| {}).unwrap();
+        assert_eq!(report.tensors, 1, "the linear packs; the norm and the embedding do not");
+        assert_ne!(packed_keymap["encoder.layers.0.mlp.fc2.weight"].0, keymap["encoder.layers.0.mlp.fc2.weight"].0);
+        assert_eq!(packed_keymap["encoder.layers.0.norm1.weight"], keymap["encoder.layers.0.norm1.weight"]);
+
+        let root = write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None)
+            .unwrap();
+        assert!(write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None).is_err(), "refuses an existing file");
+
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&out).unwrap();
+        let back = crate::selection::load_keymap_from_graph(
+            snapshot.facts(),
+            snapshot.store(),
+            ModelSelector::Source { source: "test/model", quantization: "nvfp4-calibrated" },
+        )
+        .unwrap();
+        assert_eq!(back.len(), 3, "input_scale folded away, keys {:?}", back.keys().collect::<Vec<_>>());
+        for (name, (values, shape)) in &packed_keymap {
+            let (b, s) = &back[name];
+            assert_eq!(s, shape, "{name}");
+            assert_eq!(b, values, "{name}: the loader decodes what the packer scored");
+        }
+        assert_eq!(
+            crate::selection::load_keymap_from_graph(
+                snapshot.facts(),
+                snapshot.store(),
+                ModelSelector::Root(root),
+            )
+            .unwrap()
+            .len(),
+            3
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
