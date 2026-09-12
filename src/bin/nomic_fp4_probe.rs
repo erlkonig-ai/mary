@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{anyhow, Context, Result};
+use triblespace::prelude::*;
 
 // ── NVFP4 reference arithmetic ───────────────────────────────────────────
 
@@ -351,7 +352,7 @@ const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 
 type Keymap = HashMap<String, (Vec<f32>, Vec<usize>)>;
 
-fn load_parts(model_pile: &Path) -> Result<(Keymap, tokenizers::Tokenizer)> {
+fn load_parts(model_pile: &Path, quantization: &str) -> Result<(Keymap, tokenizers::Tokenizer)> {
     use mary::selection::{ModelSelector, TokenizerSelector};
     let snapshot = mary::model_collection::load_model_collection_local_latest(model_pile)
         .with_context(|| format!("open model pile {}", model_pile.display()))?;
@@ -360,7 +361,7 @@ fn load_parts(model_pile: &Path) -> Result<(Keymap, tokenizers::Tokenizer)> {
         snapshot.store(),
         ModelSelector::Source {
             source: NOMIC_TEXT_MODEL,
-            quantization: mary::persist::QUANTIZATION_NATIVE,
+            quantization,
         },
     )
     .context("select native nomic text weights")?;
@@ -706,9 +707,14 @@ fn fake_nvfp4_weights_awq(
     scale_search: bool,
     gptq: bool,
     stats: &std::collections::HashMap<String, mary::embed::NomicActStats>,
-) -> (usize, usize) {
+) -> (usize, usize, HashMap<String, mary::calibrate::Calibrated>) {
+    if scale_search {
+        eprintln!("  (block scale search is ignored under calibration: it lost to nearest rounding there)");
+    }
+    let opts = mary::calibrate::Options { alphas: &mary::calibrate::AWQ_ALPHAS, feedback: gptq };
     let mut tensors = 0usize;
     let mut elements = 0usize;
+    let mut packed = HashMap::new();
     let mut names: Vec<String> = keymap.keys().cloned().collect();
     names.sort();
     for name in names {
@@ -729,23 +735,151 @@ fn fake_nvfp4_weights_awq(
         }
         let prefix = name.trim_end_matches(".weight");
         let key = prefix.replace(".mlp.fc11", ".mlp.fc1").replace(".mlp.fc12", ".mlp.fc1");
-        match stats.get(&key) {
+        // The packed form is the artifact; the keymap gets its decoded values,
+        // so what the probe scores is exactly what a pile would hold.
+        let cal = match stats.get(&key) {
             Some(st) if st.rows.len() >= 16 && st.sum_abs.len() == cols => {
-                let (alpha, ratio) = awq_quantize_tensor(data, cols, st, scale_search, gptq);
-                eprintln!("  {name}: alpha {alpha:.1}, output error x{ratio:.3} of plain ({} rows)", st.rows.len());
+                let cal = mary::calibrate::pack_linear(data, cols, &st.rows, &st.mean_abs(), &opts)
+                    .unwrap_or_else(|e| panic!("{name}: calibrate: {e}"));
+                eprintln!(
+                    "  {name}: alpha {:.1}, output error x{:.3} of plain ({} rows{})",
+                    cal.alpha,
+                    cal.error_ratio,
+                    st.rows.len(),
+                    if cal.feedback_used { ", feedback" } else { "" }
+                );
+                cal
             }
             _ => {
-                for row in data.chunks_mut(cols) {
-                    let (q, _) = nvfp4_quantize_with(row, scale_search);
-                    row.copy_from_slice(&q);
-                }
                 eprintln!("  {name}: no captured inputs, plain rounding");
+                mary::calibrate::Calibrated::plain(
+                    mary::nvfp4::pack_nearest(data, cols).unwrap_or_else(|e| panic!("{name}: pack: {e}")),
+                )
             }
-        }
+        };
+        data.copy_from_slice(&cal.decode());
+        packed.insert(name.clone(), cal);
         tensors += 1;
         elements += data.len();
     }
-    (tensors, elements)
+    (tensors, elements, packed)
+}
+
+/// Write the calibrated model as a NEW model pile: every packed linear as a
+/// `Tensor<NVFP4, 2>` leaf plus its `.input_scale` F32 vector, everything
+/// else as F32 leaves, under one root labelled `quantization`, with the
+/// tokenizer beside it so the pile loads on its own.
+fn write_packed_pile(
+    out: &Path,
+    key_path: &Path,
+    keymap: &Keymap,
+    packed: &HashMap<String, mary::calibrate::Calibrated>,
+    tokenizer: &tokenizers::Tokenizer,
+    source: &str,
+    quantization: &str,
+) -> Result<Id> {
+    use mary::format::attrs;
+    use mary::leaf::{put_leaf, Elem};
+    use triblespace::core::signing_key_file;
+    use triblespace::macros::entity;
+
+    let key = signing_key_file::load_existing(key_path)
+        .with_context(|| format!("load signing key {}", key_path.display()))?;
+    anyhow::ensure!(
+        !out.exists(),
+        "refusing to write into an existing pile {}: a pile is append-only, name a new file",
+        out.display()
+    );
+    fs::File::create(out).with_context(|| format!("create {}", out.display()))?;
+    let mut pile = Pile::open(out).map_err(|e| anyhow!("open {}: {e:?}", out.display()))?;
+    pile.refresh().map_err(|e| anyhow!("refresh {}: {e:?}", out.display()))?;
+    mary::model_collection::model_graph_collection_or_create(&mut pile, &key)
+        .context("create the model collection")?;
+
+    let mut graph = Fragment::empty();
+    let mut members: Vec<Id> = Vec::new();
+    let (mut packed_bytes, mut dense_bytes) = (0usize, 0usize);
+    let mut names: Vec<&String> = keymap.keys().collect();
+    names.sort();
+    let mut add_member = |pile: &mut Pile, graph: &mut Fragment, leaf: Fragment, name: &str, kind: &str| -> Result<()> {
+        let leaf_id = leaf.root().ok_or_else(|| anyhow!("{name}: leaf has no root"))?;
+        *graph += leaf;
+        let name_h = pile
+            .put::<blobencodings::UTF8String, _>(name.to_string())
+            .map_err(|e| anyhow!("{name}: store name: {e:?}"))?;
+        let member = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
+        members.push(member.root().ok_or_else(|| anyhow!("{name}: member has no root"))?);
+        *graph += member;
+        Ok(())
+    };
+    for name in names {
+        let (values, shape) = &keymap[name];
+        let dims: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
+        if let Some(cal) = packed.get(name) {
+            anyhow::ensure!(
+                shape.len() == 2 && cal.packed.rows == shape[0] && cal.packed.cols == shape[1],
+                "{name}: packed {}x{} for shape {shape:?}",
+                cal.packed.rows,
+                cal.packed.cols
+            );
+            let payload = cal.packed.payload();
+            packed_bytes += payload.len();
+            let leaf = put_leaf(&mut pile, Elem::Nvfp4, &dims, anybytes::Bytes::from_source(payload), name)?;
+            add_member(&mut pile, &mut graph, leaf, name, "matrix")?;
+            let scale_name = format!("{name}.input_scale");
+            let scale = cal.input_scale.clone();
+            dense_bytes += scale.len() * 4;
+            let leaf = put_leaf(
+                &mut pile,
+                Elem::F32,
+                &[scale.len() as u64],
+                anybytes::Bytes::from_source(scale),
+                &scale_name,
+            )?;
+            add_member(&mut pile, &mut graph, leaf, &scale_name, "vector")?;
+        } else {
+            dense_bytes += values.len() * 4;
+            let leaf = put_leaf(&mut pile, Elem::F32, &dims, anybytes::Bytes::from_source(values.clone()), name)?;
+            let kind = match shape.len() {
+                1 => "vector",
+                2 => "matrix",
+                _ => "tensor",
+            };
+            add_member(&mut pile, &mut graph, leaf, name, kind)?;
+        }
+    }
+    let name_h = pile
+        .put::<blobencodings::UTF8String, _>(format!("{source} ({quantization})"))
+        .map_err(|e| anyhow!("store model name: {e:?}"))?;
+    let source_h = pile
+        .put::<blobencodings::UTF8String, _>(source.to_string())
+        .map_err(|e| anyhow!("store source: {e:?}"))?;
+    let model = entity! { _ @
+        attrs::model_name: name_h,
+        attrs::source: source_h,
+        attrs::quantization: quantization,
+        attrs::member*: members.iter(),
+    };
+    let root = model.root().ok_or_else(|| anyhow!("model has no root"))?;
+    graph += model;
+    mary::model_collection::publish_model_fragment(&mut pile, &key, graph)
+        .map_err(|e| anyhow!("publish the packed model: {e}"))?;
+
+    let json = tokenizer
+        .to_string(false)
+        .map_err(|e| anyhow!("serialise tokenizer: {e}"))?;
+    let tok = mary::tokenizer::save_tokenizer_json(json.as_bytes(), source, &mut pile)
+        .map_err(|e| anyhow!("build tokenizer graph: {e}"))?;
+    mary::model_collection::publish_model_fragment(&mut pile, &key, tok)
+        .map_err(|e| anyhow!("publish the tokenizer: {e}"))?;
+    pile.close().map_err(|e| anyhow!("close {}: {e:?}", out.display()))?;
+    eprintln!(
+        "  packed leaves {:.1} MB, dense leaves {:.1} MB, {} members",
+        packed_bytes as f64 / 1e6,
+        dense_bytes as f64 / 1e6,
+        members.len()
+    );
+    Ok(root)
 }
 
 fn recall_at_k(baseline: &[usize], candidate: &[usize]) -> f32 {
@@ -782,6 +916,12 @@ struct ProbeOptions {
     /// With `calibrate`: error-feedback rounding against the captured rows
     /// after the scale search (GPTQ).
     gptq: bool,
+    /// Which model root to read: the `quantization` label on the root.
+    quantization: String,
+    /// With `calibrate`: write the calibrated model as packed NVFP4 leaves
+    /// into this NEW pile (`--key` signs it).
+    pack: Option<PathBuf>,
+    key: Option<PathBuf>,
 }
 
 /// f32 document and query vectors, saved after the first run so a sweep over
@@ -831,7 +971,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
     }
     eprintln!("corpus: {} texts", rows.len());
 
-    let (keymap, tokenizer) = load_parts(model_pile)?;
+    let (keymap, tokenizer) = load_parts(model_pile, &options.quantization)?;
     if options.list_tensors {
         let mut names: Vec<_> = keymap.iter().map(|(n, (_, s))| (n.clone(), s.clone())).collect();
         names.sort();
@@ -930,6 +1070,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
 
     // The model itself with NVFP4 weights, all of them or the named group.
     let mut quantized = keymap;
+    let mut calibrated: HashMap<String, mary::calibrate::Calibrated> = HashMap::new();
     let (tensors, elements) = if options.keep_weights {
         (0, 0)
     } else if options.calibrate > 0 {
@@ -954,9 +1095,11 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             started.elapsed().as_secs_f64()
         );
         let started = Instant::now();
-        let out = fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, options.gptq, &stats);
+        let (t, e, packed) =
+            fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, options.gptq, &stats);
         eprintln!("activation-aware scale search took {:.1} s", started.elapsed().as_secs_f64());
-        out
+        calibrated = packed;
+        (t, e)
     } else {
         fake_nvfp4_weights(&mut quantized, &options.only, options.scale_search)
     };
@@ -975,6 +1118,21 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
         "fake-quantized {tensors} weight tensors, {elements} elements, to NVFP4 (group: {}; {rounding})",
         if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
     );
+    if let Some(out) = &options.pack {
+        let key = options.key.as_ref().ok_or_else(|| anyhow!("--pack needs --key <signing key>"))?;
+        anyhow::ensure!(
+            options.calibrate > 0 && !options.keep_weights,
+            "--pack writes the calibrated model; give --calibrate N"
+        );
+        let started = Instant::now();
+        let root = write_packed_pile(out, key, &quantized, &calibrated, &tokenizer, NOMIC_TEXT_MODEL, "nvfp4-calibrated")?;
+        eprintln!(
+            "packed model written to {} (root {root}, {} packed tensors) in {:.1} s",
+            out.display(),
+            calibrated.len(),
+            started.elapsed().as_secs_f64()
+        );
+    }
     let started = Instant::now();
     let q_model = mary::embed::nomic_text_from_parts(quantized, tokenizer, device)?;
     let mut qdocs: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
@@ -1045,9 +1203,13 @@ fn main() -> Result<()> {
                     keep_weights: args.iter().any(|a| a == "--keep-weights"),
                     calibrate: flag("--calibrate").map(|s| s.parse()).transpose()?.unwrap_or(0),
                     gptq: args.iter().any(|a| a == "--gptq"),
+                    quantization: flag("--quantization")
+                        .unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string()),
+                    pack: flag("--pack").map(PathBuf::from),
+                    key: flag("--key").map(PathBuf::from),
                 },
             )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--gptq] [--list-tensors]")),
+        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--gptq] [--list-tensors] [--quantization TAG] [--pack OUT.pile --key KEY]")),
     }
 }
