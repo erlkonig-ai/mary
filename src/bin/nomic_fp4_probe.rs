@@ -1111,6 +1111,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             NOMIC_TEXT_MODEL,
             "nvfp4-calibrated",
             Some(json.as_bytes()),
+            false,
         )?;
         eprintln!(
             "packed model written to {} (root {root}, {} packed tensors) in {:.1} s",

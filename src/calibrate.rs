@@ -583,8 +583,16 @@ pub fn pack_keymap<'s>(
 /// `Tensor<NVFP4, 2>` leaf plus its `<name>.input_scale` F32 vector, every
 /// other tensor as an F32 leaf, under one root labelled `quantization` and
 /// named `source`, and, when given, the tokenizer JSON beside it so the pile
-/// loads on its own. Refuses an existing file: a pile is append-only and a
-/// second root in it would be a choice the caller should make by name.
+/// loads on its own.
+///
+/// A new file unless `append`: a pile is append-only and a second root in it
+/// is a choice the caller makes by name. With `append`, the root joins an
+/// existing model pile's collection (which the key must be allowed to write),
+/// so one pile carries the native root and the packed one and every reader,
+/// old or new, finds the root it asks for; the tokenizer is left out when the
+/// pile already has one, and a root already labelled `quantization` for
+/// `source` refuses the write, because two of them would be selected together
+/// and their tensor names would collide.
 pub fn write_packed_pile(
     out: &Path,
     key: &SigningKey,
@@ -593,16 +601,37 @@ pub fn write_packed_pile(
     source: &str,
     quantization: &str,
     tokenizer_json: Option<&[u8]>,
+    append: bool,
 ) -> Result<Id> {
     use crate::format::attrs;
     use crate::leaf::{Elem, put_leaf};
 
-    ensure!(
-        !out.exists(),
-        "refusing to write into an existing pile {}: name a new file",
-        out.display()
-    );
-    std::fs::File::create(out).map_err(|e| anyhow::anyhow!("create {}: {e}", out.display()))?;
+    let mut tokenizer_json = tokenizer_json;
+    if append {
+        ensure!(out.exists(), "--append needs an existing pile, {} is not one", out.display());
+        let snapshot = crate::model_collection::load_model_collection_local_latest(out)
+            .map_err(|e| anyhow::anyhow!("open {} to append: {e}", out.display()))?;
+        ensure!(
+            crate::selection::select_model_roots(
+                snapshot.facts(),
+                snapshot.store(),
+                crate::selection::ModelSelector::Source { source, quantization },
+            )
+            .is_err(),
+            "{} already carries a {source} root labelled {quantization}",
+            out.display()
+        );
+        if crate::tokenizer::find_tokenizer(snapshot.facts()).is_some() {
+            tokenizer_json = None;
+        }
+    } else {
+        ensure!(
+            !out.exists(),
+            "refusing to write into an existing pile {}: name a new file, or --append",
+            out.display()
+        );
+        std::fs::File::create(out).map_err(|e| anyhow::anyhow!("create {}: {e}", out.display()))?;
+    }
     let mut pile = Pile::open(out).map_err(|e| anyhow::anyhow!("open {}: {e:?}", out.display()))?;
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("refresh {}: {e:?}", out.display()))?;
@@ -749,9 +778,9 @@ mod pile_tests {
         assert_ne!(packed_keymap["encoder.layers.0.mlp.fc2.weight"].0, keymap["encoder.layers.0.mlp.fc2.weight"].0);
         assert_eq!(packed_keymap["encoder.layers.0.norm1.weight"], keymap["encoder.layers.0.norm1.weight"]);
 
-        let root = write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None)
+        let root = write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None, false)
             .unwrap();
-        assert!(write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None).is_err(), "refuses an existing file");
+        assert!(write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None, false).is_err(), "refuses an existing file");
 
         let snapshot = crate::model_collection::load_model_collection_local_latest(&out).unwrap();
         let back = crate::selection::load_keymap_from_graph(
