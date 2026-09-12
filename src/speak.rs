@@ -210,6 +210,7 @@ impl Qwen3TtsWeights {
                         match leaf.elem() {
                             Elem::F32 => "f32",
                             Elem::F16 => "f16",
+                            Elem::Nvfp4 => "nvfp4",
                         },
                         if f16 { "f16" } else { "f32" }
                     );

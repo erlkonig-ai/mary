@@ -39,7 +39,7 @@
 
 use anyhow::{Context, Result};
 use triblespace::core::attribute::Attribute;
-use triblespace::core::blob::encodings::tensor::elements::{F16, F32};
+use triblespace::core::blob::encodings::tensor::elements::{F16, F32, NVFP4};
 use triblespace::core::blob::encodings::tensor::{Tensor, TensorElement, TensorView, tensor_blob};
 use triblespace::core::blob::{Blob, TryFromBlob};
 use triblespace::core::id_hex;
@@ -70,6 +70,9 @@ pub fn leaf<T: TensorElement, const RANK: usize>() -> Attribute<Handle<Tensor<T,
 pub enum Elem {
     F32,
     F16,
+    /// Packed NVFP4: E2M1 codes with E4M3 block scales and one global scale in
+    /// the payload (`crate::nvfp4`). Reading it as f32 decodes on the host.
+    Nvfp4,
 }
 
 impl Elem {
@@ -78,6 +81,7 @@ impl Elem {
         match self {
             Elem::F32 => <F32 as TensorElement>::payload_len(elems),
             Elem::F16 => <F16 as TensorElement>::payload_len(elems),
+            Elem::Nvfp4 => <NVFP4 as TensorElement>::payload_len(elems),
         }
     }
 }
@@ -126,7 +130,7 @@ impl Leaf {
     pub fn view_f32(&self) -> Option<anybytes::View<[f32]>> {
         match self.elem {
             Elem::F32 => self.payload.clone().view::<[f32]>().ok(),
-            Elem::F16 => None,
+            Elem::F16 | Elem::Nvfp4 => None,
         }
     }
 
@@ -135,7 +139,7 @@ impl Leaf {
     pub fn view_f16(&self) -> Option<anybytes::View<[half::f16]>> {
         match self.elem {
             Elem::F16 => self.payload.clone().view::<[half::f16]>().ok(),
-            Elem::F32 => None,
+            Elem::F32 | Elem::Nvfp4 => None,
         }
     }
 
@@ -157,6 +161,8 @@ impl Leaf {
                 .iter()
                 .map(|h| h.to_f32())
                 .collect(),
+            Elem::Nvfp4 => crate::nvfp4::decode_payload(&self.payload, self.elems())
+                .expect("an NVFP4 leaf payload is sized by its encoding"),
         }
     }
 
@@ -285,6 +291,9 @@ macro_rules! leaf_by_rank {
             (Elem::F16, 4) => leaf_entity!($blobs, $head, F16, 4, dims, $payload, $what),
             (Elem::F16, 5) => leaf_entity!($blobs, $head, F16, 5, dims, $payload, $what),
             (Elem::F16, 6) => leaf_entity!($blobs, $head, F16, 6, dims, $payload, $what),
+            (Elem::Nvfp4, 1) => leaf_entity!($blobs, $head, NVFP4, 1, dims, $payload, $what),
+            (Elem::Nvfp4, 2) => leaf_entity!($blobs, $head, NVFP4, 2, dims, $payload, $what),
+            (Elem::Nvfp4, 3) => leaf_entity!($blobs, $head, NVFP4, 3, dims, $payload, $what),
             (_, r) => anyhow::bail!(
                 "{}: rank {r} exceeds the ranks this format dispatches (0..=6); \
                  add an arm rather than flattening",
@@ -369,6 +378,9 @@ pub fn resolve(tribles: &TribleSet, blobs: &impl BlobStoreGet, weight: Id) -> Re
     typed!(F16, 4, Elem::F16);
     typed!(F16, 5, Elem::F16);
     typed!(F16, 6, Elem::F16);
+    typed!(NVFP4, 1, Elem::Nvfp4);
+    typed!(NVFP4, 2, Elem::Nvfp4);
+    typed!(NVFP4, 3, Elem::Nvfp4);
 
     if hits > 0 {
         anyhow::ensure!(
@@ -536,6 +548,9 @@ pub fn index_typed_all(
     sweep_all!(F16, 4, Elem::F16);
     sweep_all!(F16, 5, Elem::F16);
     sweep_all!(F16, 6, Elem::F16);
+    sweep_all!(NVFP4, 1, Elem::Nvfp4);
+    sweep_all!(NVFP4, 2, Elem::Nvfp4);
+    sweep_all!(NVFP4, 3, Elem::Nvfp4);
 
     map
 }
@@ -631,6 +646,7 @@ pub(crate) fn fixture_leaf(
                     .map(|&v| half::f16::from_f32(v))
                     .collect::<Vec<half::f16>>(),
             ),
+            Elem::Nvfp4 => panic!("fixture leaves are dense"),
         }
     };
 
@@ -675,6 +691,7 @@ pub(crate) fn fixture_leaf(
                     );
                     triblespace::macros::entity! { _ @ attrs::data_f16: data, attrs::shape: shape }
                 }
+                Elem::Nvfp4 => panic!("the two-blob form has no packed leaves"),
             }
         }
     };

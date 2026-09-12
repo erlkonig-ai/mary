@@ -34,6 +34,8 @@ pub mod ingest;
 /// minted attribute per config field.
 pub mod jsonfacts;
 pub mod leaf;
+pub mod calibrate;
+pub mod nvfp4;
 #[cfg(feature = "local-model")]
 pub mod local;
 /// Compatibility projection for model graphs written before TribleSpace's

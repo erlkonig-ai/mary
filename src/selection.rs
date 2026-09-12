@@ -520,10 +520,51 @@ pub fn load_keymap_from_graph(
     blobs: &impl BlobStoreGet,
     selector: ModelSelector<'_>,
 ) -> anyhow::Result<HashMap<String, (Vec<f32>, Vec<usize>)>> {
-    Ok(index_keymap_for_selector(tribles, blobs, selector)?
-        .into_iter()
-        .map(|(name, leaf)| (name, leaf.to_f32_shape()))
-        .collect())
+    let mut keymap: HashMap<String, (Vec<f32>, Vec<usize>)> =
+        index_keymap_for_selector(tribles, blobs, selector)?
+            .into_iter()
+            .map(|(name, leaf)| (name, leaf.to_f32_shape()))
+            .collect();
+    fold_input_scales(&mut keymap)?;
+    Ok(keymap)
+}
+
+/// Fold every `<weight>.input_scale` vector into its matrix and drop it.
+///
+/// A packed linear written by [`crate::calibrate`] carries its activation-aware
+/// channel scales as a sibling F32 vector rather than inside its codes. A
+/// consumer that reads f32 matrices wants the product: column `j` of the
+/// matrix times `input_scale[j]`, which is what applying the vector to the
+/// input would compute. Folded here, once, so no model loader has to know the
+/// convention; a kernel that reads the packed codes directly applies the vector
+/// to its input instead. Returns how many vectors were folded.
+pub fn fold_input_scales(
+    keymap: &mut HashMap<String, (Vec<f32>, Vec<usize>)>,
+) -> anyhow::Result<usize> {
+    const SUFFIX: &str = ".input_scale";
+    let names: Vec<String> = keymap
+        .keys()
+        .filter(|k| k.ends_with(SUFFIX))
+        .cloned()
+        .collect();
+    for name in &names {
+        let base = &name[..name.len() - SUFFIX.len()];
+        let (scale, scale_shape) = keymap.remove(name).expect("listed key");
+        let (values, shape) = keymap
+            .get_mut(base)
+            .ok_or_else(|| anyhow::anyhow!("{name} has no matrix {base:?} to fold into"))?;
+        anyhow::ensure!(
+            shape.len() == 2 && scale_shape.len() == 1 && scale.len() == shape[1],
+            "{name}: a vector of {} for a matrix {shape:?}",
+            scale.len()
+        );
+        for row in values.chunks_mut(shape[1]) {
+            for (v, s) in row.iter_mut().zip(&scale) {
+                *v *= s;
+            }
+        }
+    }
+    Ok(names.len())
 }
 
 fn tokenizer_roots(tribles: &TribleSet) -> BTreeSet<Id> {
