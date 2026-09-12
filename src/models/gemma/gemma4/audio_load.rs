@@ -19,9 +19,26 @@ use symphonia::core::probe::Hint;
 pub fn load_audio_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
     let file = std::fs::File::open(path).map_err(|e| format!("open: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
+    decode_audio_16k_mono(mss, path.extension().and_then(|s| s.to_str()))
+}
 
+/// Decode immutable resident audio with the same decoder/downmix/resampler as
+/// the file entrypoint. The optional extension is only a format hint: no path,
+/// device, network or temporary file is accessed by this function.
+pub fn load_audio_16k_mono_bytes(
+    bytes: Vec<u8>,
+    extension: Option<&str>,
+) -> Result<Vec<f32>, String> {
+    let mss = MediaSourceStream::new(Box::new(std::io::Cursor::new(bytes)), Default::default());
+    decode_audio_16k_mono(mss, extension)
+}
+
+fn decode_audio_16k_mono(
+    mss: MediaSourceStream,
+    extension: Option<&str>,
+) -> Result<Vec<f32>, String> {
     let mut hint = Hint::new();
-    if let Some(ext) = path.extension().and_then(|s| s.to_str()) {
+    if let Some(ext) = extension {
         hint.with_extension(ext);
     }
 
@@ -100,6 +117,11 @@ pub fn load_audio_16k_mono(path: &Path) -> Result<Vec<f32>, String> {
         }
     }
     let channels = channels.ok_or("no audio frames decoded")?;
+    // A valid container can declare channels yet contain no audio packets.
+    // Resident uploads must fail normally instead of indexing an empty vector.
+    if channels == 0 || per_ch.is_empty() {
+        return Err("no audio frames decoded".to_owned());
+    }
 
     // Downmix to mono by averaging.
     let n = per_ch[0].len();
@@ -170,4 +192,77 @@ pub fn resample_to_16k(mono: Vec<f32>, src_rate: usize) -> Result<Vec<f32>, Stri
     let expected = (mono.len() as f64 * ratio).round() as usize;
     let final_out: Vec<f32> = skipped.into_iter().take(expected).collect();
     Ok(final_out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write as _;
+
+    fn stereo_wav() -> Vec<u8> {
+        let samples = [0_i16, 0, 8192, 24576, -8192, -24576, 16384, -16384];
+        let data_bytes = (samples.len() * 2) as u32;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_bytes).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16_u32.to_le_bytes());
+        bytes.extend_from_slice(&1_u16.to_le_bytes());
+        bytes.extend_from_slice(&2_u16.to_le_bytes());
+        bytes.extend_from_slice(&16000_u32.to_le_bytes());
+        bytes.extend_from_slice(&64000_u32.to_le_bytes());
+        bytes.extend_from_slice(&4_u16.to_le_bytes());
+        bytes.extend_from_slice(&16_u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_bytes.to_le_bytes());
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn resident_and_file_audio_are_identical_after_downmix() {
+        let bytes = stereo_wav();
+        let resident = load_audio_16k_mono_bytes(bytes.clone(), Some("wav")).unwrap();
+        assert_eq!(resident, [0.0, 0.5, -0.5, 0.0]);
+        assert_eq!(
+            resident,
+            load_audio_16k_mono_bytes(bytes.clone(), None).unwrap()
+        );
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "mary-resident-audio-{}-{nonce}.wav",
+            std::process::id()
+        ));
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        drop(file);
+        let decoded = load_audio_16k_mono(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(decoded.unwrap(), resident);
+    }
+
+    #[test]
+    fn malformed_resident_audio_is_a_decode_error() {
+        assert!(
+            load_audio_16k_mono_bytes(b"not an audio container".to_vec(), Some("wav")).is_err()
+        );
+    }
+
+    #[test]
+    fn empty_wav_returns_an_error_instead_of_panicking() {
+        let mut bytes = stereo_wav();
+        bytes.truncate(44);
+        bytes[4..8].copy_from_slice(&36_u32.to_le_bytes());
+        bytes[40..44].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(load_audio_16k_mono_bytes(bytes, Some("wav")).is_err());
+    }
 }
