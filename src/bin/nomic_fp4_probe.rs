@@ -706,12 +706,13 @@ fn fake_nvfp4_weights_awq(
     only: &[String],
     scale_search: bool,
     gptq: bool,
+    embeddings: bool,
     stats: &std::collections::HashMap<String, mary::embed::NomicActStats>,
 ) -> (usize, usize, HashMap<String, mary::calibrate::Calibrated>) {
     if scale_search {
         eprintln!("  (block scale search is ignored under calibration: it lost to nearest rounding there)");
     }
-    let opts = mary::calibrate::Options { alphas: &mary::calibrate::AWQ_ALPHAS, feedback: gptq };
+    let opts = mary::calibrate::Options { alphas: &mary::calibrate::AWQ_ALPHAS, feedback: gptq, embeddings };
     let inputs: HashMap<String, mary::calibrate::InputStats> = stats
         .iter()
         .map(|(k, s)| (k.clone(), mary::calibrate::InputStats { rows: s.rows.clone(), mean_abs: s.mean_abs() }))
@@ -720,6 +721,106 @@ fn fake_nvfp4_weights_awq(
     let report = mary::calibrate::pack_keymap(keymap, only, &stats_for, &opts, &mut |line| eprintln!("  {line}"))
         .unwrap_or_else(|e| panic!("pack: {e}"));
     (report.tensors, report.elements, report.packed)
+}
+
+// ── vision: the packed vision model against the f32 one, image to image ────
+
+const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
+
+fn vision_keymap(pile: &Path, quantization: &str) -> Result<Keymap> {
+    let snapshot = mary::model_collection::load_model_collection_local_latest(pile)
+        .with_context(|| format!("open model pile {}", pile.display()))?;
+    mary::selection::load_keymap_from_graph(
+        snapshot.facts(),
+        snapshot.store(),
+        mary::selection::ModelSelector::Source { source: NOMIC_VISION_MODEL, quantization },
+    )
+    .with_context(|| format!("select {quantization} nomic vision weights from {}", pile.display()))
+}
+
+fn image_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .with_context(|| format!("read {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file())
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+/// Embed every image in `dir` with one vision model; unreadable images are
+/// skipped and named. Returns the vectors in `files` order with the index of
+/// each file that embedded.
+fn embed_images(
+    embedder: &mary::embed::NomicVisionEmbedder<mary::nn::backend::B>,
+    files: &[PathBuf],
+) -> Result<Vec<(usize, Vec<f32>)>> {
+    use mary::embed::LocalEmbedder;
+    let mut out = Vec::with_capacity(files.len());
+    for (i, f) in files.iter().enumerate() {
+        let bytes = fs::read(f).with_context(|| format!("read {}", f.display()))?;
+        match embedder.embed_image(&bytes) {
+            Ok(mut v) => {
+                l2_normalize(&mut v);
+                out.push((i, v));
+            }
+            Err(e) => eprintln!("  skip {}: {e}", f.display()),
+        }
+    }
+    Ok(out)
+}
+
+/// Score a packed vision pile against the f32 one over a directory of images:
+/// mean cosine between the two models' vectors of the same image, and
+/// image-to-image recall@k, each image a query against the rest, the f32
+/// model's top k as the baseline.
+fn vision(model: &Path, quantization: &str, packed: &Path, packed_quantization: &str, images: &Path) -> Result<()> {
+    let files = image_files(images)?;
+    anyhow::ensure!(!files.is_empty(), "no images under {}", images.display());
+    let device = mary::embed::default_device();
+    let started = Instant::now();
+    let base = {
+        let emb = mary::embed::load_nomic_vision_from_keymap(vision_keymap(model, quantization)?, device.clone())?;
+        embed_images(&emb, &files)?
+    };
+    eprintln!("f32 model embedded {} of {} images in {:.1} s", base.len(), files.len(), started.elapsed().as_secs_f64());
+    let started = Instant::now();
+    let cand = {
+        let emb = mary::embed::load_nomic_vision_from_keymap(vision_keymap(packed, packed_quantization)?, device)?;
+        embed_images(&emb, &files)?
+    };
+    eprintln!("packed model embedded {} of {} images in {:.1} s", cand.len(), files.len(), started.elapsed().as_secs_f64());
+    anyhow::ensure!(
+        base.iter().map(|(i, _)| *i).eq(cand.iter().map(|(i, _)| *i)),
+        "the two models did not embed the same images"
+    );
+    let a: Vec<Vec<f32>> = base.into_iter().map(|(_, v)| v).collect();
+    let b: Vec<Vec<f32>> = cand.into_iter().map(|(_, v)| v).collect();
+    let n = a.len();
+    let mean_cos: f64 = a.iter().zip(&b).map(|(x, y)| dot(x, y) as f64).sum::<f64>() / n as f64;
+    println!("nomic-embed-vision-v1.5 over {n} images: packed ({packed_quantization}) against f32 ({quantization})");
+    println!("mean cosine between the two models' vectors of the same image: {mean_cos:.5}");
+    for k in [1usize, 5, 10] {
+        if n <= k {
+            continue;
+        }
+        let mut recall = 0f64;
+        let mut top1_same = 0usize;
+        for i in 0..n {
+            let base_top = top_k(&a[i], &a, Some(i), k);
+            let cand_top = top_k(&b[i], &b, Some(i), k);
+            recall += recall_at_k(&base_top, &cand_top) as f64;
+            if base_top.first() == cand_top.first() {
+                top1_same += 1;
+            }
+        }
+        println!(
+            "image-to-image recall@{k}: {:.1}%   (same nearest image: {}/{n})",
+            100.0 * recall / n as f64,
+            top1_same
+        );
+    }
+    Ok(())
 }
 
 fn recall_at_k(baseline: &[usize], candidate: &[usize]) -> f32 {
@@ -762,6 +863,8 @@ struct ProbeOptions {
     /// into this NEW pile (`--key` signs it).
     pack: Option<PathBuf>,
     key: Option<PathBuf>,
+    /// With `calibrate`: pack the embedding tables as well (nearest rounding).
+    pack_embeddings: bool,
 }
 
 /// f32 document and query vectors, saved after the first run so a sweep over
@@ -936,7 +1039,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
         );
         let started = Instant::now();
         let (t, e, packed) =
-            fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, options.gptq, &stats);
+            fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, options.gptq, options.pack_embeddings, &stats);
         eprintln!("activation-aware scale search took {:.1} s", started.elapsed().as_secs_f64());
         calibrated = packed;
         (t, e)
@@ -1034,6 +1137,14 @@ fn main() -> Result<()> {
             }
             extract(&pile, &sources, &out, max_chars)
         }
+        Some("vision") => {
+            let model = PathBuf::from(flag("--model").ok_or_else(|| anyhow!("--model"))?);
+            let packed = PathBuf::from(flag("--packed").ok_or_else(|| anyhow!("--packed"))?);
+            let images = PathBuf::from(flag("--images").ok_or_else(|| anyhow!("--images"))?);
+            let quantization = flag("--quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
+            let packed_quantization = flag("--packed-quantization").unwrap_or_else(|| "nvfp4-calibrated".to_string());
+            vision(&model, &quantization, &packed, &packed_quantization, &images)
+        }
         Some("probe") => {
             let model = PathBuf::from(flag("--model").ok_or_else(|| anyhow!("--model"))?);
             let corpus = PathBuf::from(flag("--corpus").unwrap_or_else(|| "corpus.jsonl".into()));
@@ -1058,9 +1169,10 @@ fn main() -> Result<()> {
                         .unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string()),
                     pack: flag("--pack").map(PathBuf::from),
                     key: flag("--key").map(PathBuf::from),
+                    pack_embeddings: args.iter().any(|a| a == "--pack-embeddings"),
                 },
             )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--gptq] [--list-tensors] [--quantization TAG] [--pack OUT.pile --key KEY]")),
+        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--gptq] [--list-tensors] [--quantization TAG] [--pack OUT.pile --key KEY] [--pack-embeddings] | vision --model P --packed Q --images DIR [--quantization TAG] [--packed-quantization TAG]")),
     }
 }

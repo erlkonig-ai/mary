@@ -94,12 +94,14 @@ fn pack_and_write(
     source: &str,
     quantization: &str,
     tokenizer_json: Option<&[u8]>,
+    embeddings: bool,
 ) -> Result<()> {
     let key = triblespace::core::signing_key_file::load_existing(key)
         .with_context(|| format!("load signing key {}", key.display()))?;
     let stats_for = |name: &str| inputs.get(&calibrate::nomic_capture_key(name));
     let started = Instant::now();
-    let report = calibrate::pack_keymap(&mut keymap, &[], &stats_for, &Options::default(), &mut |line| {
+    let opts = Options { embeddings, ..Options::default() };
+    let report = calibrate::pack_keymap(&mut keymap, &[], &stats_for, &opts, &mut |line| {
         eprintln!("  {line}")
     })?;
     eprintln!(
@@ -115,7 +117,7 @@ fn pack_and_write(
     Ok(())
 }
 
-fn text(model: &Path, quantization: &str, corpus: &Path, calibrate: usize, out: &Path, key: &Path) -> Result<()> {
+fn text(model: &Path, quantization: &str, corpus: &Path, calibrate: usize, out: &Path, key: &Path, embeddings: bool) -> Result<()> {
     let snapshot = mary::model_collection::load_model_collection_local_latest(model)
         .with_context(|| format!("open model pile {}", model.display()))?;
     let keymap = mary::selection::load_keymap_from_graph(
@@ -150,10 +152,10 @@ fn text(model: &Path, quantization: &str, corpus: &Path, calibrate: usize, out: 
         started.elapsed().as_secs_f64()
     );
     let json = tokenizer.to_string(false).map_err(|e| anyhow!("serialise tokenizer: {e}"))?;
-    pack_and_write(keymap, stats_from_capture(stats), out, key, NOMIC_TEXT_MODEL, PACKED, Some(json.as_bytes()))
+    pack_and_write(keymap, stats_from_capture(stats), out, key, NOMIC_TEXT_MODEL, PACKED, Some(json.as_bytes()), embeddings)
 }
 
-fn vision(model: &Path, source: &str, quantization: &str, images: &Path, calibrate: usize, out: &Path, key: &Path) -> Result<()> {
+fn vision(model: &Path, source: &str, quantization: &str, images: &Path, calibrate: usize, out: &Path, key: &Path, embeddings: bool) -> Result<()> {
     let snapshot = mary::model_collection::load_model_collection_local_latest(model)
         .with_context(|| format!("open model pile {}", model.display()))?;
     let keymap = mary::selection::load_keymap_from_graph(
@@ -186,7 +188,7 @@ fn vision(model: &Path, source: &str, quantization: &str, images: &Path, calibra
         files.len(),
         started.elapsed().as_secs_f64()
     );
-    pack_and_write(keymap, stats_from_capture(stats), out, key, source, PACKED, None)
+    pack_and_write(keymap, stats_from_capture(stats), out, key, source, PACKED, None, embeddings)
 }
 
 fn main() -> Result<()> {
@@ -194,21 +196,22 @@ fn main() -> Result<()> {
     let flag = |name: &str| -> Option<String> {
         args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
     };
-    let usage = "usage: nomic_pack text --model P --corpus F --out O --key K [--calibrate N] [--quantization TAG]\n       nomic_pack vision --model P --images DIR --out O --key K [--calibrate N] [--quantization TAG] [--source ID]";
+    let usage = "usage: nomic_pack text --model P --corpus F --out O --key K [--calibrate N] [--quantization TAG] [--embeddings]\n       nomic_pack vision --model P --images DIR --out O --key K [--calibrate N] [--quantization TAG] [--source ID] [--embeddings]";
     let model = || flag("--model").map(PathBuf::from).ok_or_else(|| anyhow!("--model\n{usage}"));
     let out = || flag("--out").map(PathBuf::from).ok_or_else(|| anyhow!("--out\n{usage}"));
     let key = || flag("--key").map(PathBuf::from).ok_or_else(|| anyhow!("--key\n{usage}"));
     let calibrate: usize = flag("--calibrate").map(|s| s.parse()).transpose()?.unwrap_or(1024);
     let quantization = flag("--quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
+    let embeddings = args.iter().any(|a| a == "--embeddings");
     match args.first().map(String::as_str) {
         Some("text") => {
             let corpus = flag("--corpus").map(PathBuf::from).ok_or_else(|| anyhow!("--corpus\n{usage}"))?;
-            text(&model()?, &quantization, &corpus, calibrate, &out()?, &key()?)
+            text(&model()?, &quantization, &corpus, calibrate, &out()?, &key()?, embeddings)
         }
         Some("vision") => {
             let images = flag("--images").map(PathBuf::from).ok_or_else(|| anyhow!("--images\n{usage}"))?;
             let source = flag("--source").unwrap_or_else(|| NOMIC_VISION_MODEL.to_string());
-            vision(&model()?, &source, &quantization, &images, calibrate, &out()?, &key()?)
+            vision(&model()?, &source, &quantization, &images, calibrate, &out()?, &key()?, embeddings)
         }
         _ => Err(anyhow!("{usage}")),
     }

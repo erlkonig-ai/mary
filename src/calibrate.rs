@@ -43,6 +43,11 @@ pub struct Options<'a> {
     pub alphas: &'a [f32],
     /// Error-feedback rounding after the scale search.
     pub feedback: bool,
+    /// Pack embedding tables too. They have no captured inputs (a lookup
+    /// reads one row), so they get nearest rounding under the tensor scale;
+    /// nomic-text's word table is 94 MB of f32, most of what is left once
+    /// the linears are packed.
+    pub embeddings: bool,
 }
 
 impl Default for Options<'static> {
@@ -50,6 +55,7 @@ impl Default for Options<'static> {
         Self {
             alphas: &AWQ_ALPHAS,
             feedback: true,
+            embeddings: false,
         }
     }
 }
@@ -513,14 +519,15 @@ pub fn nomic_capture_key(tensor_name: &str) -> String {
         .replace(".mlp.fc12", ".mlp.fc1")
 }
 
-/// Whether a keymap tensor is a linear weight this packer takes: rank two,
-/// named a weight, not an embedding table or a norm, input width a multiple
-/// of the block, and named by `only` when `only` is not empty.
-pub fn packs(name: &str, shape: &[usize], only: &[String]) -> bool {
+/// Whether a keymap tensor is a weight this packer takes: rank two, named a
+/// weight, not a norm, an embedding table only when `embeddings`, input width
+/// a multiple of the block, and named by `only` when `only` is not empty.
+pub fn packs(name: &str, shape: &[usize], only: &[String], embeddings: bool) -> bool {
     let lower = name.to_ascii_lowercase();
     shape.len() == 2
         && lower.contains("weight")
-        && !(lower.contains("embed") || lower.contains("norm") || lower.contains("ln"))
+        && !(lower.contains("norm") || lower.contains("ln"))
+        && (embeddings || !lower.contains("embed"))
         && shape[1] % BLOCK == 0
         && (only.is_empty() || only.iter().any(|p| lower.contains(&p.to_ascii_lowercase())))
 }
@@ -542,7 +549,7 @@ pub fn pack_keymap<'s>(
     names.sort();
     for name in names {
         let (data, shape) = keymap.get_mut(&name).expect("listed key");
-        if !packs(&name, shape, only) {
+        if !packs(&name, shape, only, opts.embeddings) {
             continue;
         }
         let cols = shape[1];
