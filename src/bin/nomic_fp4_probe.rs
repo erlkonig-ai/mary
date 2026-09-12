@@ -405,7 +405,7 @@ fn fake_nvfp4_weights(keymap: &mut Keymap, only: &[String], scale_search: bool) 
 }
 
 /// Candidate exponents for the activation-aware scale `s = mean|x|^alpha`.
-const AWQ_ALPHAS: [f32; 6] = [0.0, 0.2, 0.4, 0.5, 0.6, 0.8];
+const AWQ_ALPHAS: [f32; 10] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9];
 
 /// Output error of a quantised weight on real inputs: sum over reservoir
 /// rows of |(W - Wq) x|^2, the quantity AWQ minimises.
