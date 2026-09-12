@@ -434,6 +434,185 @@ fn output_error(w: &[f32], wq: &[f32], cols: usize, rows: &[Vec<f32>]) -> f64 {
     })
 }
 
+/// Cholesky factor L (lower, row-major n x n) of a symmetric positive
+/// definite matrix; panics on a non-positive pivot, which the dampening
+/// below prevents.
+fn cholesky(a: &[f64], n: usize) -> Vec<f64> {
+    let mut l = vec![0f64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            let mut sum = a[i * n + j];
+            for k in 0..j {
+                sum -= l[i * n + k] * l[j * n + k];
+            }
+            if i == j {
+                assert!(sum > 0.0, "cholesky: non-positive pivot at {i}: {sum}");
+                l[i * n + i] = sum.sqrt();
+            } else {
+                l[i * n + j] = sum / l[j * n + j];
+            }
+        }
+    }
+    l
+}
+
+/// Inverse of a symmetric positive definite matrix from its Cholesky factor,
+/// one column of the identity per solve, columns spread over threads.
+fn spd_inverse(l: &[f64], n: usize) -> Vec<f64> {
+    let threads = std::thread::available_parallelism().map_or(8, |v| v.get()).min(32).max(1);
+    let chunk = n.div_ceil(threads).max(1);
+    let mut inv = vec![0f64; n * n];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..n)
+            .step_by(chunk)
+            .map(|start| {
+                let end = (start + chunk).min(n);
+                scope.spawn(move || {
+                    let mut cols = Vec::with_capacity((end - start) * n);
+                    let mut y = vec![0f64; n];
+                    for c in start..end {
+                        // L y = e_c
+                        for i in 0..n {
+                            let mut sum = if i == c { 1.0 } else { 0.0 };
+                            for k in 0..i {
+                                sum -= l[i * n + k] * y[k];
+                            }
+                            y[i] = sum / l[i * n + i];
+                        }
+                        // L^T x = y
+                        let mut x = vec![0f64; n];
+                        for i in (0..n).rev() {
+                            let mut sum = y[i];
+                            for k in i + 1..n {
+                                sum -= l[k * n + i] * x[k];
+                            }
+                            x[i] = sum / l[i * n + i];
+                        }
+                        cols.extend_from_slice(&x);
+                    }
+                    (start, cols)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (start, cols) = h.join().expect("inverse worker");
+            for (c, col) in cols.chunks(n).enumerate() {
+                for i in 0..n {
+                    inv[i * n + start + c] = col[i];
+                }
+            }
+        }
+    });
+    inv
+}
+
+/// Error-feedback rounding (GPTQ) of one weight `w` [rows x cols] to NVFP4,
+/// against input rows `x` [.. x cols]: columns are rounded left to right and
+/// each column's rounding error is pushed onto the columns still to come
+/// through the inverse Hessian of the inputs, so the layer's output error is
+/// what gets minimised rather than the weight error. Block scales are fixed
+/// per row when a block of sixteen columns is reached, from the values the
+/// feedback has left there; the per-row f32 scale comes from the row's
+/// original maximum. Returns the dequantised weight.
+fn gptq_quantize(w: &[f32], cols: usize, x: &[Vec<f32>]) -> Vec<f32> {
+    let rows = w.len() / cols;
+    let n = cols;
+    // H = X^T X / R, dampened by one percent of its mean diagonal.
+    let mut h = vec![0f64; n * n];
+    for r in x {
+        for i in 0..n {
+            let xi = r[i] as f64;
+            if xi == 0.0 {
+                continue;
+            }
+            let row = &mut h[i * n..(i + 1) * n];
+            for (hij, &xj) in row.iter_mut().zip(r.iter()) {
+                *hij += xi * xj as f64;
+            }
+        }
+    }
+    let scale = 1.0 / x.len().max(1) as f64;
+    for v in h.iter_mut() {
+        *v *= scale;
+    }
+    let mean_diag = (0..n).map(|i| h[i * n + i]).sum::<f64>() / n as f64;
+    let damp = 0.01 * mean_diag.max(1e-12);
+    for i in 0..n {
+        h[i * n + i] += damp;
+    }
+    let l = cholesky(&h, n);
+    let hinv = spd_inverse(&l, n);
+    // U = chol(Hinv)^T, upper; the feedback uses its rows.
+    let lu = cholesky(&hinv, n);
+    let mut u = vec![0f64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            u[j * n + i] = lu[i * n + j];
+        }
+    }
+    let ts: Vec<f32> = w
+        .chunks(cols)
+        .map(|row| {
+            let absmax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
+            if absmax > 0.0 { absmax / (6.0 * E4M3_MAX) } else { 1.0 }
+        })
+        .collect();
+    let threads = std::thread::available_parallelism().map_or(8, |v| v.get()).min(32).max(1);
+    let chunk = rows.div_ceil(threads).max(1);
+    let mut out = vec![0f32; w.len()];
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = w
+            .chunks(chunk * cols)
+            .enumerate()
+            .map(|(ci, part)| {
+                let u = &u;
+                let ts = &ts[ci * chunk..];
+                scope.spawn(move || {
+                    let mut work: Vec<f32> = part.to_vec();
+                    let mut q = vec![0f32; part.len()];
+                    let nrows = part.len() / cols;
+                    let mut units = vec![0f32; nrows];
+                    for j in 0..cols {
+                        if j % BLOCK == 0 {
+                            for r in 0..nrows {
+                                let block = &work[r * cols + j..r * cols + j + BLOCK];
+                                let bmax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                                units[r] = e4m3(bmax / (6.0 * ts[r])) * ts[r];
+                            }
+                        }
+                        let ujj = u[j * n + j];
+                        for r in 0..nrows {
+                            let v = work[r * cols + j];
+                            let unit = units[r];
+                            let qv = if unit == 0.0 {
+                                0.0
+                            } else {
+                                let m = (v.abs() / unit).min(6.0);
+                                E2M1[e2m1_code(m)] * unit * v.signum()
+                            };
+                            q[r * cols + j] = qv;
+                            let err = ((v - qv) as f64 / ujj) as f32;
+                            if err != 0.0 {
+                                let urow = &u[j * n + j + 1..(j + 1) * n];
+                                let wrow = &mut work[r * cols + j + 1..(r + 1) * cols];
+                                for (wk, &ujk) in wrow.iter_mut().zip(urow) {
+                                    *wk -= err * ujk as f32;
+                                }
+                            }
+                        }
+                    }
+                    (ci, q)
+                })
+            })
+            .collect();
+        for h in handles {
+            let (ci, q) = h.join().expect("gptq worker");
+            out[ci * chunk * cols..ci * chunk * cols + q.len()].copy_from_slice(&q);
+        }
+    });
+    out
+}
+
 /// One tensor's activation-aware NVFP4: scale each input channel by
 /// `mean|x|^alpha` (geometric mean one) before rounding and divide it back
 /// after, so the rounding grid follows the channels the inputs actually
@@ -444,6 +623,7 @@ fn awq_quantize_tensor(
     cols: usize,
     stats: &mary::embed::NomicActStats,
     scale_search: bool,
+    gptq: bool,
 ) -> (f32, f64) {
     let mean_abs = stats.mean_abs();
     let original = data.to_vec();
@@ -479,6 +659,40 @@ fn awq_quantize_tensor(
             best = (alpha, err, w);
         }
     }
+    if gptq {
+        // The chosen alpha's scales, then error-feedback rounding in the
+        // scaled space against the correspondingly scaled inputs.
+        let alpha = best.0;
+        let mut s: Vec<f32> = mean_abs.iter().map(|m| (m + 1e-8).powf(alpha)).collect();
+        let log_mean = s.iter().map(|v| v.ln() as f64).sum::<f64>() / s.len() as f64;
+        let norm = log_mean.exp() as f32;
+        for v in &mut s {
+            *v /= norm;
+        }
+        let mut scaled = original.clone();
+        for row in scaled.chunks_mut(cols) {
+            for (v, si) in row.iter_mut().zip(&s) {
+                *v *= si;
+            }
+        }
+        let xs: Vec<Vec<f32>> = stats
+            .rows
+            .iter()
+            .map(|r| r.iter().zip(&s).map(|(xi, si)| xi / si).collect())
+            .collect();
+        let mut q = gptq_quantize(&scaled, cols, &xs);
+        for row in q.chunks_mut(cols) {
+            for (v, si) in row.iter_mut().zip(&s) {
+                *v /= si;
+            }
+        }
+        let err = output_error(&original, &q, cols, &stats.rows);
+        if err < best.1 {
+            best = (alpha, err, q);
+        } else {
+            eprintln!("    (feedback rounding did not improve on nearest: x{:.3} vs x{:.3})", err / plain_err.max(1e-30), best.1 / plain_err.max(1e-30));
+        }
+    }
     data.copy_from_slice(&best.2);
     (best.0, if plain_err > 0.0 { best.1 / plain_err } else { 1.0 })
 }
@@ -490,6 +704,7 @@ fn fake_nvfp4_weights_awq(
     keymap: &mut Keymap,
     only: &[String],
     scale_search: bool,
+    gptq: bool,
     stats: &std::collections::HashMap<String, mary::embed::NomicActStats>,
 ) -> (usize, usize) {
     let mut tensors = 0usize;
@@ -516,7 +731,7 @@ fn fake_nvfp4_weights_awq(
         let key = prefix.replace(".mlp.fc11", ".mlp.fc1").replace(".mlp.fc12", ".mlp.fc1");
         match stats.get(&key) {
             Some(st) if st.rows.len() >= 16 && st.sum_abs.len() == cols => {
-                let (alpha, ratio) = awq_quantize_tensor(data, cols, st, scale_search);
+                let (alpha, ratio) = awq_quantize_tensor(data, cols, st, scale_search, gptq);
                 eprintln!("  {name}: alpha {alpha:.1}, output error x{ratio:.3} of plain ({} rows)", st.rows.len());
             }
             _ => {
@@ -564,6 +779,9 @@ struct ProbeOptions {
     /// calibration texts, then choose each tensor's channel scale exponent by
     /// least output error before rounding. Zero means plain rounding.
     calibrate: usize,
+    /// With `calibrate`: error-feedback rounding against the captured rows
+    /// after the scale search (GPTQ).
+    gptq: bool,
 }
 
 /// f32 document and query vectors, saved after the first run so a sweep over
@@ -736,7 +954,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             started.elapsed().as_secs_f64()
         );
         let started = Instant::now();
-        let out = fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, &stats);
+        let out = fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, options.gptq, &stats);
         eprintln!("activation-aware scale search took {:.1} s", started.elapsed().as_secs_f64());
         out
     } else {
@@ -744,6 +962,8 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
     };
     let rounding = if options.keep_weights {
         "weights left in f32"
+    } else if options.calibrate > 0 && options.gptq {
+        "activation-aware scales + error-feedback rounding"
     } else if options.calibrate > 0 {
         "activation-aware scales"
     } else if options.scale_search {
@@ -824,9 +1044,10 @@ fn main() -> Result<()> {
                     scale_search: args.iter().any(|a| a == "--scale-search"),
                     keep_weights: args.iter().any(|a| a == "--keep-weights"),
                     calibrate: flag("--calibrate").map(|s| s.parse()).transpose()?.unwrap_or(0),
+                    gptq: args.iter().any(|a| a == "--gptq"),
                 },
             )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--list-tensors]")),
+        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--gptq] [--list-tensors]")),
     }
 }
