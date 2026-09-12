@@ -1832,6 +1832,113 @@ impl ActQuant {
     }
 }
 
+/// Per-linear input statistics gathered while a model runs with capture on:
+/// the mean absolute value and mean square of every input channel over all
+/// rows seen, and a reservoir of whole rows for a calibration search that
+/// needs the real inputs (AWQ's scale search, GPTQ's Hessian).
+#[derive(Clone, Debug, Default)]
+pub struct NomicActStats {
+    pub rows_seen: usize,
+    pub sum_abs: Vec<f64>,
+    pub sum_sq: Vec<f64>,
+    pub rows: Vec<Vec<f32>>,
+}
+
+impl NomicActStats {
+    pub fn mean_abs(&self) -> Vec<f32> {
+        let n = self.rows_seen.max(1) as f64;
+        self.sum_abs.iter().map(|&v| (v / n) as f32).collect()
+    }
+    pub fn mean_sq(&self) -> Vec<f32> {
+        let n = self.rows_seen.max(1) as f64;
+        self.sum_sq.iter().map(|&v| (v / n) as f32).collect()
+    }
+}
+
+struct ActCapture {
+    rows_per_call: usize,
+    lcg: u64,
+    stats: HashMap<String, NomicActStats>,
+}
+
+static ACT_CAPTURE: std::sync::Mutex<Option<ActCapture>> = std::sync::Mutex::new(None);
+
+/// Start recording every nomic linear's input (see [`NomicActStats`]); each
+/// forward call contributes its channel sums and up to `rows_per_call`
+/// randomly chosen token rows to the reservoir.
+pub fn nomic_activation_capture_start(rows_per_call: usize) {
+    *ACT_CAPTURE.lock().expect("capture lock") = Some(ActCapture {
+        rows_per_call,
+        lcg: 0x9E37_79B9_7F4A_7C15,
+        stats: HashMap::new(),
+    });
+}
+
+/// Stop recording and hand back what was gathered, keyed by the linear's
+/// weight prefix (`encoder.layers.3.attn.Wqkv`; the MLP's two input linears
+/// share one entry under `mlp.fc1` because they read the same input).
+pub fn nomic_activation_capture_take() -> HashMap<String, NomicActStats> {
+    ACT_CAPTURE
+        .lock()
+        .expect("capture lock")
+        .take()
+        .map(|c| c.stats)
+        .unwrap_or_default()
+}
+
+fn capture_linear_input<B: Backend>(x: &Tensor<B, 3>, name: &str) {
+    let mut guard = ACT_CAPTURE.lock().expect("capture lock");
+    let Some(capture) = guard.as_mut() else {
+        return;
+    };
+    let [b, s, k] = x.dims();
+    let flat = x.clone().reshape([b * s, k]);
+    let sum_abs = flat.clone().abs().sum_dim(0).into_data().to_vec::<f32>().expect("sum_abs");
+    let sum_sq = flat
+        .clone()
+        .powf_scalar(2.0)
+        .sum_dim(0)
+        .into_data()
+        .to_vec::<f32>()
+        .expect("sum_sq");
+    let rows = b * s;
+    let take = capture.rows_per_call.min(rows);
+    let mut picks = Vec::with_capacity(take);
+    for _ in 0..take {
+        capture.lcg = capture.lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        picks.push(((capture.lcg >> 33) as usize % rows) as i64);
+    }
+    let picked = if take > 0 {
+        let idx = Tensor::<B, 1, Int>::from_data(TensorData::new(picks, [take]), &x.device());
+        flat.select(0, idx).into_data().to_vec::<f32>().expect("rows")
+    } else {
+        Vec::new()
+    };
+    let entry = capture.stats.entry(name.to_owned()).or_insert_with(|| NomicActStats {
+        rows_seen: 0,
+        sum_abs: vec![0.0; k],
+        sum_sq: vec![0.0; k],
+        rows: Vec::new(),
+    });
+    entry.rows_seen += rows;
+    for (acc, v) in entry.sum_abs.iter_mut().zip(&sum_abs) {
+        *acc += *v as f64;
+    }
+    for (acc, v) in entry.sum_sq.iter_mut().zip(&sum_sq) {
+        *acc += *v as f64;
+    }
+    for row in picked.chunks(k) {
+        entry.rows.push(row.to_vec());
+    }
+}
+
+/// The operand handed to one linear: captured if a capture is running, then
+/// fake-quantised according to `mode`.
+fn linear_input<B: Backend>(x: Tensor<B, 3>, mode: ActQuant, name: &str) -> Tensor<B, 3> {
+    capture_linear_input(&x, name);
+    fake_quant_act(x, mode)
+}
+
 /// NVFP4 fake quantisation of `[b, s, k]` activations: one f32 scale per
 /// token row (row max maps to 6 x 448), one E4M3 scale per block of sixteen
 /// along `k`, E2M1 codes {0, 0.5, 1, 1.5, 2, 3, 4, 6} by nearest on the
@@ -1891,6 +1998,7 @@ struct NomicLayer<B: Backend> {
     n_heads: usize,
     head_dim: usize,
     act: ActQuant,
+    prefix: String,
 }
 
 impl<B: Backend> NomicLayer<B> {
@@ -1915,6 +2023,7 @@ impl<B: Backend> NomicLayer<B> {
             n_heads,
             head_dim,
             act,
+            prefix: p.to_owned(),
         }
     }
 
@@ -1930,7 +2039,9 @@ impl<B: Backend> NomicLayer<B> {
         let [b, s, d] = x.dims();
         let (h, hd) = (self.n_heads, self.head_dim);
         // packed qkv → [b,s,3d] then split into q,k,v each [b,s,d].
-        let qkv = self.wqkv.forward(fake_quant_act(x.clone(), self.act));
+        let qkv = self
+            .wqkv
+            .forward(linear_input(x.clone(), self.act, &format!("{}.attn.Wqkv", self.prefix)));
         let q = qkv.clone().narrow(2, 0, d);
         let k = qkv.clone().narrow(2, d, d);
         let v = qkv.narrow(2, 2 * d, d);
@@ -1945,15 +2056,18 @@ impl<B: Backend> NomicLayer<B> {
         let probs = softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, s, d]);
         // POST-norm: norm AFTER the residual add.
-        let att = fake_quant_act(att, self.act);
+        let att = linear_input(att, self.act, &format!("{}.attn.out_proj", self.prefix));
         let h1 = self.norm1.forward(self.out_proj.forward(att).add(x));
-        // SwiGLU: fc2(fc11(x) * silu(fc12(x))).
-        let h1q = fake_quant_act(h1.clone(), self.act);
+        // SwiGLU: fc2(fc11(x) * silu(fc12(x))). fc11 and fc12 read the same
+        // input, recorded once under `mlp.fc1`.
+        let h1q = linear_input(h1.clone(), self.act, &format!("{}.mlp.fc1", self.prefix));
         let gated = self
             .fc11
             .forward(h1q.clone())
             .mul(silu(self.fc12.forward(h1q)));
-        let mlp = self.fc2.forward(fake_quant_act(gated, self.act));
+        let mlp = self
+            .fc2
+            .forward(linear_input(gated, self.act, &format!("{}.mlp.fc2", self.prefix)));
         self.norm2.forward(mlp.add(h1))
     }
 }

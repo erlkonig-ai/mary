@@ -404,6 +404,135 @@ fn fake_nvfp4_weights(keymap: &mut Keymap, only: &[String], scale_search: bool) 
     (tensors, elements)
 }
 
+/// Candidate exponents for the activation-aware scale `s = mean|x|^alpha`.
+const AWQ_ALPHAS: [f32; 6] = [0.0, 0.2, 0.4, 0.5, 0.6, 0.8];
+
+/// Output error of a quantised weight on real inputs: sum over reservoir
+/// rows of |(W - Wq) x|^2, the quantity AWQ minimises.
+fn output_error(w: &[f32], wq: &[f32], cols: usize, rows: &[Vec<f32>]) -> f64 {
+    let diff: Vec<f32> = w.iter().zip(wq).map(|(a, b)| a - b).collect();
+    let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(32).max(1);
+    let chunk = rows.len().div_ceil(threads).max(1);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = rows
+            .chunks(chunk)
+            .map(|part| {
+                let diff = &diff;
+                scope.spawn(move || {
+                    let mut err = 0f64;
+                    for x in part {
+                        for row in diff.chunks(cols) {
+                            let acc: f32 = row.iter().zip(x).map(|(d, xi)| d * xi).sum();
+                            err += (acc as f64) * (acc as f64);
+                        }
+                    }
+                    err
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().expect("error worker")).sum()
+    })
+}
+
+/// One tensor's activation-aware NVFP4: scale each input channel by
+/// `mean|x|^alpha` (geometric mean one) before rounding and divide it back
+/// after, so the rounding grid follows the channels the inputs actually
+/// exercise; the alpha with the least output error on the captured rows wins.
+/// Returns the chosen alpha and the error ratio against plain rounding.
+fn awq_quantize_tensor(
+    data: &mut [f32],
+    cols: usize,
+    stats: &mary::embed::NomicActStats,
+    scale_search: bool,
+) -> (f32, f64) {
+    let mean_abs = stats.mean_abs();
+    let original = data.to_vec();
+    let plain: Vec<f32> = {
+        let mut w = original.clone();
+        for row in w.chunks_mut(cols) {
+            let (q, _) = nvfp4_quantize_with(row, scale_search);
+            row.copy_from_slice(&q);
+        }
+        w
+    };
+    let plain_err = output_error(&original, &plain, cols, &stats.rows);
+    let mut best = (0f32, plain_err, plain);
+    for &alpha in AWQ_ALPHAS.iter().skip(1) {
+        let mut s: Vec<f32> = mean_abs.iter().map(|m| (m + 1e-8).powf(alpha)).collect();
+        let log_mean = s.iter().map(|v| v.ln() as f64).sum::<f64>() / s.len() as f64;
+        let norm = log_mean.exp() as f32;
+        for v in &mut s {
+            *v /= norm;
+        }
+        let mut w = original.clone();
+        for row in w.chunks_mut(cols) {
+            for (v, si) in row.iter_mut().zip(&s) {
+                *v *= si;
+            }
+            let (q, _) = nvfp4_quantize_with(row, scale_search);
+            for ((v, qi), si) in row.iter_mut().zip(q).zip(&s) {
+                *v = qi / si;
+            }
+        }
+        let err = output_error(&original, &w, cols, &stats.rows);
+        if err < best.1 {
+            best = (alpha, err, w);
+        }
+    }
+    data.copy_from_slice(&best.2);
+    (best.0, if plain_err > 0.0 { best.1 / plain_err } else { 1.0 })
+}
+
+/// Activation-aware fake NVFP4 over the keymap: every linear that has
+/// captured input statistics is quantised with its best alpha, the rest
+/// plainly. Prints one line per tensor.
+fn fake_nvfp4_weights_awq(
+    keymap: &mut Keymap,
+    only: &[String],
+    scale_search: bool,
+    stats: &std::collections::HashMap<String, mary::embed::NomicActStats>,
+) -> (usize, usize) {
+    let mut tensors = 0usize;
+    let mut elements = 0usize;
+    let mut names: Vec<String> = keymap.keys().cloned().collect();
+    names.sort();
+    for name in names {
+        let lower = name.to_ascii_lowercase();
+        let (data, shape) = keymap.get_mut(&name).expect("key exists");
+        if shape.len() != 2 || !lower.contains("weight") {
+            continue;
+        }
+        if !only.is_empty() && !only.iter().any(|pattern| lower.contains(&pattern.to_ascii_lowercase())) {
+            continue;
+        }
+        if lower.contains("embed") || lower.contains("norm") || lower.contains("ln") {
+            continue;
+        }
+        let cols = shape[1];
+        if cols % BLOCK != 0 {
+            continue;
+        }
+        let prefix = name.trim_end_matches(".weight");
+        let key = prefix.replace(".mlp.fc11", ".mlp.fc1").replace(".mlp.fc12", ".mlp.fc1");
+        match stats.get(&key) {
+            Some(st) if st.rows.len() >= 16 && st.sum_abs.len() == cols => {
+                let (alpha, ratio) = awq_quantize_tensor(data, cols, st, scale_search);
+                eprintln!("  {name}: alpha {alpha:.1}, output error x{ratio:.3} of plain ({} rows)", st.rows.len());
+            }
+            _ => {
+                for row in data.chunks_mut(cols) {
+                    let (q, _) = nvfp4_quantize_with(row, scale_search);
+                    row.copy_from_slice(&q);
+                }
+                eprintln!("  {name}: no captured inputs, plain rounding");
+            }
+        }
+        tensors += 1;
+        elements += data.len();
+    }
+    (tensors, elements)
+}
+
 fn recall_at_k(baseline: &[usize], candidate: &[usize]) -> f32 {
     let hits = candidate.iter().filter(|c| baseline.contains(c)).count();
     hits as f32 / baseline.len().max(1) as f32
@@ -431,6 +560,10 @@ struct ProbeOptions {
     /// Leave every weight in f32, so the run measures only what the model's
     /// own activation quantisation (`NOMIC_ACT_QUANT`) costs.
     keep_weights: bool,
+    /// Activation-aware rounding: capture every linear's inputs over this many
+    /// calibration texts, then choose each tensor's channel scale exponent by
+    /// least output error before rounding. Zero means plain rounding.
+    calibrate: usize,
 }
 
 /// f32 document and query vectors, saved after the first run so a sweep over
@@ -581,11 +714,38 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
     let mut quantized = keymap;
     let (tensors, elements) = if options.keep_weights {
         (0, 0)
+    } else if options.calibrate > 0 {
+        // Calibration texts spread over the corpus, embedded through the f32
+        // model with capture on; the captured inputs drive the per-tensor
+        // scale search below.
+        let n = options.calibrate.min(rows.len());
+        let stride = rows.len() / n;
+        let started = Instant::now();
+        let f32_model =
+            mary::embed::nomic_text_from_parts(quantized.clone(), tokenizer.clone(), device.clone())?;
+        mary::embed::nomic_activation_capture_start(8);
+        for i in 0..n {
+            let _ = f32_model.embed_document(&rows[i * stride].2)?;
+        }
+        let stats = mary::embed::nomic_activation_capture_take();
+        drop(f32_model);
+        let rows_captured: usize = stats.values().map(|s| s.rows.len()).sum();
+        eprintln!(
+            "captured inputs of {} linears over {n} texts, {rows_captured} reservoir rows, in {:.1} s",
+            stats.len(),
+            started.elapsed().as_secs_f64()
+        );
+        let started = Instant::now();
+        let out = fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, &stats);
+        eprintln!("activation-aware scale search took {:.1} s", started.elapsed().as_secs_f64());
+        out
     } else {
         fake_nvfp4_weights(&mut quantized, &options.only, options.scale_search)
     };
     let rounding = if options.keep_weights {
         "weights left in f32"
+    } else if options.calibrate > 0 {
+        "activation-aware scales"
     } else if options.scale_search {
         "block scale search"
     } else {
@@ -663,9 +823,10 @@ fn main() -> Result<()> {
                     skip_output_variants: args.iter().any(|a| a == "--weights-only"),
                     scale_search: args.iter().any(|a| a == "--scale-search"),
                     keep_weights: args.iter().any(|a| a == "--keep-weights"),
+                    calibrate: flag("--calibrate").map(|s| s.parse()).transpose()?.unwrap_or(0),
                 },
             )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--list-tensors]")),
+        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--list-tensors]")),
     }
 }
