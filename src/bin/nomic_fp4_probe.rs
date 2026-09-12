@@ -823,6 +823,38 @@ fn vision(model: &Path, quantization: &str, packed: &Path, packed_quantization: 
     Ok(())
 }
 
+/// Print mary's vectors for a few texts (query side) and image files as JSON,
+/// to set beside a reference implementation's vectors of the same inputs.
+fn dump(text_pile: &Path, text_quantization: &str, vision_pile: &Path, vision_quantization: &str, texts: &[String], images: &[PathBuf]) -> Result<()> {
+    use mary::embed::LocalEmbedder;
+    let device = mary::embed::default_device();
+    let mut out = serde_json::Map::new();
+    if !texts.is_empty() {
+        let (keymap, tokenizer) = load_parts(text_pile, text_quantization)?;
+        let emb = mary::embed::nomic_text_from_parts(keymap, tokenizer, device.clone())?;
+        let mut arr = Vec::new();
+        for t in texts {
+            let mut v = emb.embed_query(t)?;
+            l2_normalize(&mut v);
+            arr.push(serde_json::json!({ "text": t, "vector": v }));
+        }
+        out.insert("texts".into(), serde_json::Value::Array(arr));
+    }
+    if !images.is_empty() {
+        let emb = mary::embed::load_nomic_vision_from_keymap(vision_keymap(vision_pile, vision_quantization)?, device)?;
+        let mut arr = Vec::new();
+        for p in images {
+            let bytes = fs::read(p).with_context(|| format!("read {}", p.display()))?;
+            let mut v = emb.embed_image(&bytes)?;
+            l2_normalize(&mut v);
+            arr.push(serde_json::json!({ "image": p.display().to_string(), "vector": v }));
+        }
+        out.insert("images".into(), serde_json::Value::Array(arr));
+    }
+    println!("{}", serde_json::Value::Object(out));
+    Ok(())
+}
+
 fn recall_at_k(baseline: &[usize], candidate: &[usize]) -> f32 {
     let hits = candidate.iter().filter(|c| baseline.contains(c)).count();
     hits as f32 / baseline.len().max(1) as f32
@@ -1136,6 +1168,15 @@ fn main() -> Result<()> {
                 sources.push(("journal".to_string(), attr, h));
             }
             extract(&pile, &sources, &out, max_chars)
+        }
+        Some("dump") => {
+            let text_pile = PathBuf::from(flag("--text-model").ok_or_else(|| anyhow!("--text-model"))?);
+            let vision_pile = PathBuf::from(flag("--vision-model").ok_or_else(|| anyhow!("--vision-model"))?);
+            let tq = flag("--text-quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
+            let vq = flag("--vision-quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
+            let texts: Vec<String> = flag("--texts").map(|s| s.split('|').map(str::to_string).collect()).unwrap_or_default();
+            let images: Vec<PathBuf> = flag("--images").map(|s| s.split(',').map(PathBuf::from).collect()).unwrap_or_default();
+            dump(&text_pile, &tq, &vision_pile, &vq, &texts, &images)
         }
         Some("vision") => {
             let model = PathBuf::from(flag("--model").ok_or_else(|| anyhow!("--model"))?);

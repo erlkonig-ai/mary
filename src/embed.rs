@@ -2176,6 +2176,16 @@ impl<B: Backend> NomicTextModel<B> {
         }
         // Masked MEAN pool: mask is all-ones here → plain mean over the seq dim.
         let pooled = x.mean_dim(1).reshape([1, d]); // [1,768]
+        // v1.5 recipe (model card): `F.layer_norm(embeddings, (768,))` between
+        // the mean pool and the L2 normalisation, no affine, eps 1e-5. It
+        // recentres and rescales each vector; text-to-text rankings barely
+        // move, but the vision model was aligned against vectors that had
+        // been through it, so without it a text query has near-zero
+        // similarity to every image (measured 2026-06-21 and 2026-09-12).
+        let mean = pooled.clone().mean_dim(1); // [1,1]
+        let centred = pooled.sub(mean);
+        let var = centred.clone().powf_scalar(2.0).mean_dim(1); // [1,1]
+        let pooled = centred.div(var.add_scalar(1e-5).sqrt());
         l2_normalize(pooled)
     }
 }
@@ -2371,15 +2381,18 @@ pub fn load_nomic_text_from_keymap(
 //   - MLP is a gated SwiGLU WITH an inner LayerNorm on the 2048 hidden
 //     (`norm_mlp: true`): `fc2(norm(fc11(x) * silu(fc12(x))))`. All of attn,
 //     mlp, patch-proj carry biases here (unlike nomic-TEXT which is bias-free).
-//   - Pooling = the `selector` (NomicMultiHeadAttentionPooling): a single
-//     learned `latent` query cross-attends over the 197 hidden tokens →
-//     [b,1,768], then `out = attn_out + mlp(norm1(attn_out))` (gated SwiGLU,
-//     no inner norm here). That pooled [b,768] IS `last_hidden_state`; the
-//     parity gate's `last_hidden_state[:,0]` selects it. L2-normalize → 768-d.
+//   - Pooling = the model card's `F.normalize(last_hidden_state[:, 0])`, where
+//     `last_hidden_state` is `[b,197,768]`: the encoder output PLUS the
+//     `selector`'s term broadcast over every token. The selector is one
+//     learned `latent` query cross-attending over the tokens (`[b,1,768]`),
+//     then `mlp(norm1(attn_out))`, and the reference does
+//     `hidden_states + mlp(normed)`; token 0 of that is the encoder CLS plus
+//     the pooled MLP term (verified 2026-09-13 with the published remote code,
+//     transformers 4.46). An earlier version of this port returned
+//     `attn_out + mlp` as the embedding; those vectors had cosine 0.08-0.11 to
+//     the reference's and no text query could find an image.
 //
 // Gotchas pinned during the parity pass (see `src/bin/nomic_vision_test.rs`):
-//   - `last_hidden_state` is the SELECTOR output, not the raw CLS hidden state
-//     (the HF model overloads the name). CLS-only pooling fails parity.
 //   - eps: encoder/selector LayerNorms use layer_norm_epsilon=1e-6; the MLP's
 //     inner `norm` is a plain `nn.LayerNorm` with its DEFAULT eps=1e-5.
 //   - RoPE excludes the CLS token (`num_prefix_tokens = max(register_tokens,1)
@@ -2637,14 +2650,19 @@ impl<B: Backend> NomicSelector<B> {
         let probs = softmax(scores, 3);
         let att = probs.matmul(v).swap_dims(1, 2).reshape([b, 1, d]); // [b,1,d]
         let attn_out = self.out_proj.forward(att); // [b,1,d]
-        // residual gated-SwiGLU (no inner norm): out = attn_out + fc2(fc11(n)*silu(fc12(n))).
-        let normed = self.norm1.forward(attn_out.clone());
+        // The reference adds `mlp(norm1(attn_out))`, one vector, to EVERY
+        // encoder token (`hidden_states + self.mlp(normed)` broadcasts the
+        // `[b,1,d]` pooled term over `[b,197,d]`), and the model card takes
+        // token 0 of that. So the selector's contribution is this term alone;
+        // `attn_out` itself is never part of the embedding. An earlier port
+        // returned `attn_out + mlp` and its vectors had cosine 0.08 to 0.11 to
+        // the reference's (verified 2026-09-13).
+        let normed = self.norm1.forward(attn_out);
         let gated = self
             .fc11
             .forward(normed.clone())
             .mul(silu(self.fc12.forward(normed)));
-        let mlp = self.fc2.forward(gated);
-        attn_out.add(mlp).reshape([b, d])
+        self.fc2.forward(gated).reshape([b, d])
     }
 }
 
@@ -2720,7 +2738,16 @@ impl<B: Backend> NomicVisionModel<B> {
             Some(r) => x.add(r),
             None => x,
         };
-        let pooled = self.selector.forward(hidden); // [b,768]
+        // The embedding is token 0 of the reference's `last_hidden_state`,
+        // which is the encoder output plus the selector's pooled MLP term
+        // broadcast over every token (see `NomicSelector::forward`): the
+        // encoder CLS plus that term, L2-normalised. Measured 2026-09-13
+        // against the published models on CPU: the encoder CLS alone has
+        // cosine 0.81 to 0.86 to the reference vector, the old selector
+        // output 0.08 to 0.11.
+        let [b, _, d] = hidden.dims();
+        let cls = hidden.clone().narrow(1, 0, 1).reshape([b, d]); // [b,768]
+        let pooled = cls.add(self.selector.forward(hidden));
         l2_normalize(pooled)
     }
 }

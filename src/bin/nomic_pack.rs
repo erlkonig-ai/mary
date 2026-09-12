@@ -55,15 +55,13 @@ fn read_texts(path: &Path) -> Result<Vec<String>> {
 
 /// Image files under `dir`, sorted by path.
 fn image_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    // Every regular file: the decoder decides what is an image (a pile export
+    // names files by content hash, without an extension), and a file that does
+    // not decode is skipped and named below.
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .with_context(|| format!("read {}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| {
-            matches!(
-                p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
-                Some("jpg" | "jpeg" | "png" | "webp" | "gif" | "bmp")
-            )
-        })
+        .filter(|p| p.is_file())
         .collect();
     files.sort();
     Ok(files)

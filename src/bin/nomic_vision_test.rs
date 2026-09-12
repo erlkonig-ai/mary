@@ -4,8 +4,8 @@
 //!
 //! 1. Shell out to python (transformers AutoModel + AutoImageProcessor,
 //!    trust_remote_code) to dump the L2-normalized reference embedding of
-//!    output_mickey.png — `out.last_hidden_state[:,0]` (the selector pooling
-//!    output) then F.normalize — to /tmp/nomic_vision_ref.json.
+//!    output_mickey.png — `out.last_hidden_state[:,0]` (the encoder CLS token; the
+//!    checkpoint also carries a selector head the model card never runs) then F.normalize — to /tmp/nomic_vision_ref.json.
 //! 2. Embed the same image via `mary::embed::NomicVisionEmbedder` (from HF).
 //! 3. Assert PARITY cosine(rust, HF) > 0.99.
 //! 4. Native collection round-trip: publish weights, fresh-load one frozen
