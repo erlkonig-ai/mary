@@ -609,20 +609,28 @@ pub fn write_packed_pile(
     let mut tokenizer_json = tokenizer_json;
     if append {
         ensure!(out.exists(), "--append needs an existing pile, {} is not one", out.display());
-        let snapshot = crate::model_collection::load_model_collection_local_latest(out)
-            .map_err(|e| anyhow::anyhow!("open {} to append: {e}", out.display()))?;
-        ensure!(
-            crate::selection::select_model_roots(
-                snapshot.facts(),
-                snapshot.store(),
-                crate::selection::ModelSelector::Source { source, quantization },
-            )
-            .is_err(),
-            "{} already carries a {source} root labelled {quantization}",
-            out.display()
-        );
-        if crate::tokenizer::find_tokenizer(snapshot.facts()).is_some() {
-            tokenizer_json = None;
+        // A pile that has no model collection yet (a self pile taking its first
+        // model, JP's "just put it into self.pile and let replication take care
+        // of the rest") gets one below; a pile that has one must not already
+        // carry this root or a tokenizer.
+        match crate::model_collection::load_model_collection_local_latest(out) {
+            Ok(snapshot) => {
+                ensure!(
+                    crate::selection::select_model_roots(
+                        snapshot.facts(),
+                        snapshot.store(),
+                        crate::selection::ModelSelector::Source { source, quantization },
+                    )
+                    .is_err(),
+                    "{} already carries a {source} root labelled {quantization}",
+                    out.display()
+                );
+                if crate::tokenizer::find_tokenizer(snapshot.facts()).is_some() {
+                    tokenizer_json = None;
+                }
+            }
+            Err(e) if e.to_string().contains("no collection named") => {}
+            Err(e) => return Err(anyhow::anyhow!("open {} to append: {e}", out.display())),
         }
     } else {
         ensure!(
