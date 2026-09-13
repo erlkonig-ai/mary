@@ -892,6 +892,10 @@ burn-ndarray = "0.21.0"
 
 [patch.crates-io]
 
+# Keep the current TribleSpace transport's tested multi-sender wakeup fix when
+# Mary owns the build; Cargo ignores patches from dependency manifests.
+netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
+
 # CubeCL 0.10 emitted generic aliases and registration statements by iterating
 # randomized HashMaps. Pin the deterministic macro expansion fix so independent
 # cohort builds produce the same executable code.
