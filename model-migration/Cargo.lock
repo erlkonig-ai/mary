@@ -5176,6 +5176,7 @@ dependencies = [
  "triblespace-core",
  "triblespace-core-macros",
  "triblespace-macros-common",
+ "triblespace-paths",
 ]
 
 [[package]]
@@ -5185,6 +5186,13 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "triblespace-paths"
+version = "0.47.0"
+dependencies = [
+ "triblespace-core",
 ]
 
 [[package]]
