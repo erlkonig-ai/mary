@@ -468,6 +468,10 @@ name = "inkling_session"
 required-features = ["inkling-cuda"]
 
 [[bin]]
+name = "inkling_sequence_gate"
+required-features = ["inkling-cuda"]
+
+[[bin]]
 name = "inkling_learn"
 required-features = ["inkling-cuda", "tokenizer"]
 

@@ -87,6 +87,14 @@ use super::fp4quant::e2m1_bits;
 use super::moegroup::BlockPlanDev;
 use super::seam::{handle_of, handle_of_any};
 
+/// A separately versioned contextual teacher, not the static frozen control.
+#[path = "ema.rs"]
+pub mod ema;
+
+#[cfg(test)]
+#[path = "soft_target_gpu_tests.rs"]
+mod soft_target_gpu_tests;
+
 type Client = ComputeClient<cubecl::cuda::CudaRuntime>;
 type Dev = burn::backend::cuda::CudaDevice;
 
@@ -560,6 +568,11 @@ pub enum Target<'a> {
     /// A distribution per row, `[rows, vocab_eff]` f32, held to at `weight`
     /// times the NLL's scale: the gradient is `weight * (softmax - dist)`.
     Dist { dist: &'a T2, weight: f32 },
+    /// Explicit response-only forward-KL targets. Distribution row zero is
+    /// residual row `start`; prompt and trailing rows have zero head gradient.
+    /// The caller supplies this sequence's own temporal rows/history, never
+    /// an unrelated-conversation batch (the short-conv backward is temporal).
+    DistRange { dist: &'a T2, start: usize, weight: f32 },
 }
 
 /// What a session holds to learn: the step and the transposed head.
@@ -578,6 +591,11 @@ pub struct Learner {
 }
 
 impl Learner {
+    /// The seeded optimizer-step counter, suitable for an EMA update boundary.
+    pub fn step(&self) -> u64 {
+        u64::from(self.steps)
+    }
+
     /// `INK_LEARN_LR=<f32>` arms learning of the last layer's routed experts
     /// at that step; unset or zero leaves the session as it was.
     /// `INK_LEARN_RN=1` swaps stochastic rounding for nearest (the control).
@@ -641,6 +659,50 @@ impl Learner {
             steps: Self::seed_from_env(),
         }
     }
+}
+
+fn soft_target_range(
+    rows: usize,
+    width: usize,
+    start: usize,
+    pass_rows: usize,
+    vocab_eff: usize,
+    weight: f32,
+) -> Result<std::ops::Range<usize>> {
+    anyhow::ensure!(rows > 0 && vocab_eff > 0, "soft targets need nonempty rows and vocabulary");
+    anyhow::ensure!(width == vocab_eff, "soft target width {width} differs from vocabulary {vocab_eff}");
+    anyhow::ensure!(weight.is_finite() && weight > 0.0, "soft target weight must be finite and positive");
+    let end = start.checked_add(rows).ok_or_else(|| anyhow::anyhow!("soft target range overflow"))?;
+    anyhow::ensure!(end <= pass_rows, "soft target range {start}..{end} exceeds {pass_rows} residual rows");
+    Ok(start..end)
+}
+
+/// Validate an explicit teacher distribution before any optimizer mutation.
+/// Only three aggregate scalars leave the device, never vocabulary contents.
+/// The 1e-4 mass tolerance allows F32 softmax/reduction roundoff; targets are
+/// rejected rather than silently renormalized. This synchronizes the client.
+pub fn validate_soft_targets(
+    dist: &T2,
+    start: usize,
+    pass_rows: usize,
+    vocab_eff: usize,
+    weight: f32,
+) -> Result<()> {
+    let [rows, width] = dist.dims();
+    soft_target_range(rows, width, start, pass_rows, vocab_eff, weight)?;
+    let d = dist.clone().cast(burn::tensor::DType::F32);
+    let stats = Tensor::cat(vec![
+        d.clone().min().reshape([1, 1]),
+        d.clone().sum().reshape([1, 1]),
+        d.sum_dim(1).sub_scalar(1.0).abs().max().reshape([1, 1]),
+    ], 0).into_data().to_vec::<f32>()
+        .map_err(|e| anyhow::anyhow!("reading soft target validation: {e}"))?;
+    anyhow::ensure!(
+        stats.len() == 3 && stats.iter().all(|v| v.is_finite())
+            && stats[0] >= 0.0 && stats[2] <= 1e-4,
+        "soft targets must be finite, nonnegative, normalized probability rows"
+    );
+    Ok(())
 }
 
 /// What one learning pass did.
@@ -720,6 +782,17 @@ pub fn learn_last_layer(
     use super::moegroup::{fp4_linear_grouped_bf16_launch, gather_grouped_bf16_from_bf16};
     let t0 = std::time::Instant::now();
     let [n, h] = xd.dims();
+    anyhow::ensure!(learner.lr.is_finite() && learner.lr > 0.0, "learning rate must be finite and positive");
+    anyhow::ensure!(slice_rows > 0, "a learning slice must contain rows");
+    let next_step = learner.steps.checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("learner step counter exhausted"))?;
+    if let Target::DistRange { dist, start, weight } = &target {
+        validate_soft_targets(dist, *start, n, vocab_eff, *weight)?;
+    }
+    let first = match &target {
+        Target::DistRange { start, .. } => *start,
+        _ => 0,
+    };
     let scored = match &target {
         Target::Ids { ids, skip } => {
             anyhow::ensure!(
@@ -730,7 +803,7 @@ pub fn learn_last_layer(
             );
             ids.len()
         }
-        Target::Dist { dist, .. } => {
+        Target::Dist { dist, .. } | Target::DistRange { dist, .. } => {
             let [rows, width] = dist.dims();
             anyhow::ensure!(
                 width == vocab_eff,
@@ -739,11 +812,11 @@ pub fn learn_last_layer(
             rows
         }
     };
-    anyhow::ensure!(scored > 0 && scored <= n, "a learning pass wants scored rows");
+    anyhow::ensure!(scored > 0 && first.checked_add(scored).is_some_and(|end| end <= n), "a learning pass wants scored rows");
     // The mean is over the rows that carry gradient; skipped rows weigh zero.
     let kept = match &target {
         Target::Ids { skip, .. } => skip.iter().filter(|&&s| !s).count(),
-        Target::Dist { .. } => scored,
+        Target::Dist { .. } | Target::DistRange { .. } => scored,
     };
     anyhow::ensure!(kept > 0, "every scored row of this pass is skipped; nothing to learn");
     let sconv = keep.sconv.as_ref().expect("the session fills in the last layer's taps");
@@ -755,7 +828,7 @@ pub fn learn_last_layer(
     while lo < scored {
         let hi = (lo + slice_rows).min(scored);
         let rows = hi - lo;
-        let logits = head(xd.clone().slice([lo..hi, 0..h]));
+        let logits = head(xd.clone().slice([first + lo..first + hi, 0..h]));
         let g = match &target {
             Target::Ids { ids, skip } => {
                 let idx: Vec<i64> = ids[lo..hi].iter().map(|&t| t as i64).collect();
@@ -772,7 +845,7 @@ pub fn learn_last_layer(
                     .scatter(1, idx, minus, burn::tensor::IndexingUpdateOp::Add)
                     .mul(weight)
             }
-            Target::Dist { dist, weight } => {
+            Target::Dist { dist, weight } | Target::DistRange { dist, weight, .. } => {
                 let p = burn::tensor::activation::softmax(
                     logits.cast(burn::tensor::DType::F32),
                     1,
@@ -783,7 +856,7 @@ pub fn learn_last_layer(
         };
         let g_full: T2 = Tensor::zeros([rows, vocab_pad], dev).slice_assign([0..rows, 0..vocab_eff], g);
         let g_slice = dev_lane::linear_w(g_full, &learner.unembed_t);
-        g_hs = g_hs.slice_assign([lo..hi, 0..h], g_slice);
+        g_hs = g_hs.slice_assign([first + lo..first + hi, 0..h], g_slice);
         lo = hi;
     }
     // hs = rms_norm(xd) / mup, so d/d(rms) = g_hs / mup.
@@ -883,7 +956,7 @@ pub fn learn_last_layer(
 
     // The steps. w2 sees g_rows (f32) and act (bf16); w13 sees g_both (bf16)
     // and the gathered expert input (bf16).
-    learner.steps += 1;
+    learner.steps = next_step;
     let seed = learner.steps.wrapping_mul(0x9E37_79B1);
     expert_update_launch::<f32, half::bf16>(
         client, &w2, &groups, &g_rows, &act, m_total, h, inter, learner.lr, seed, learner.stochastic,
@@ -1017,6 +1090,34 @@ mod tests {
     use crate::models::inkling::fp4quant::quantize_nvfp4;
     use crate::models::inkling::nvfp4::decode_row;
     use cubecl::cuda::CudaRuntime;
+
+    #[test]
+    fn explicit_soft_targets_name_only_the_response_range() {
+        assert_eq!(soft_target_range(3, 17, 5, 10, 17, 1.0).unwrap(), 5..8);
+        assert!(soft_target_range(0, 17, 5, 10, 17, 1.0).is_err());
+        assert!(soft_target_range(3, 16, 5, 10, 17, 1.0).is_err());
+        assert!(soft_target_range(3, 17, 8, 10, 17, 1.0).is_err());
+        assert!(soft_target_range(3, 17, usize::MAX, usize::MAX, 17, 1.0).is_err());
+        for weight in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(soft_target_range(3, 17, 5, 10, 17, weight).is_err());
+        }
+    }
+
+    #[test]
+    #[ignore = "opt-in tiny CUDA distribution-validation test; requires the GPU reservation"]
+    fn explicit_soft_targets_refuse_invalid_probability_rows() {
+        let dev = Dev::default();
+        let dist = |v: Vec<f32>| -> T2 { Tensor::from_data(TensorData::new(v, [2, 3]), &dev) };
+        assert!(validate_soft_targets(&dist(vec![0.0, 0.25, 0.75, 0.2, 0.3, 0.5]), 2, 5, 3, 1.0).is_ok());
+        for bad in [
+            vec![0.0, 0.25, f32::NAN, 0.2, 0.3, 0.5],
+            vec![0.0, 0.25, f32::INFINITY, 0.2, 0.3, 0.5],
+            vec![-0.1, 0.35, 0.75, 0.2, 0.3, 0.5],
+            vec![0.0, 0.25, 0.75, 0.2, 0.3, 0.4],
+        ] {
+            assert!(validate_soft_targets(&dist(bad), 2, 5, 3, 1.0).is_err());
+        }
+    }
 
     fn fill(n: usize, seed: f32) -> Vec<f32> {
         (0..n)

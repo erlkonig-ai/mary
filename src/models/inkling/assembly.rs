@@ -29,6 +29,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 
+#[path = "packed_bank.rs"]
+mod packed_bank;
+
 use crate::models::inkling::attn::{AttnDims, AttnWeights, LogScaling};
 use crate::models::inkling::bf16gemm::Bf16W;
 use crate::models::inkling::block::Routing;
@@ -2631,6 +2634,12 @@ pub struct LayerCache {
 pub struct MoeState {
     /// The device row-plan state, or `None` before the first routed layer.
     pub route: Option<DevRoute>,
+    /// Pack independent token rows by expert even below the default width
+    /// threshold. Resident batching opts in; ordinary decode is unchanged.
+    pub pack_rows: bool,
+    /// Explicit execution bank for one layer's EMA teacher. The static
+    /// checkpoint control remains a separate bank selected by `frozen`.
+    pub teacher: Option<(usize, crate::models::inkling::devplan::ExpertTable)>,
     /// The layer whose forward is kept for a learning pass, if learning is
     /// armed on this session (the last layer, on the rank that owns the head).
     #[cfg(feature = "inkling-cuda")]
@@ -2644,6 +2653,31 @@ pub struct MoeState {
     /// Where the host time inside a routed layer went. Measurement, kept beside
     /// the state it describes rather than threaded through every caller.
     pub host: HostT,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExpertRowPlan {
+    Device,
+    LiveSource,
+    ExplicitBank,
+}
+
+fn host_row_plan(
+    rows: usize,
+    forced: bool,
+    per_expert: bool,
+    learning: bool,
+    external_bank: bool,
+) -> ExpertRowPlan {
+    if learning || !(rows > crate::models::inkling::fp4gemm::MTILE || forced || per_expert) {
+        ExpertRowPlan::Device
+    } else if external_bank {
+        // This branch can ONLY consume the passed table. In particular,
+        // per-expert/diagnostic env settings cannot send it to live source.
+        ExpertRowPlan::ExplicitBank
+    } else {
+        ExpertRowPlan::LiveSource
+    }
 }
 
 /// One routed-MoE layer, on the DEFAULT lane: the router decision on the device,
@@ -2748,7 +2782,11 @@ pub fn moe_layer(
         st.host.slice += t_s.elapsed().as_secs_f64();
         dr.tabs.insert((layer, frozen), tb);
     }
-    let tb = dr.tabs[&(layer, frozen)].as_ref().with_context(|| {
+    let teacher = st.teacher.as_ref().filter(|(teacher_layer, _)| {
+        !frozen && *teacher_layer == layer
+    });
+    let external_bank = frozen || teacher.is_some();
+    let tb = teacher.map(|(_, table)| table).or_else(|| dr.tabs[&(layer, frozen)].as_ref()).with_context(|| {
         format!(
             "{p}: the {} routed experts have no single aligned host mapping, so the device \
              expert table cannot be built and this layer would need the host row plan. A \
@@ -2794,7 +2832,8 @@ pub fn moe_layer(
     // two lanes against each other at one row (the decode step), where the
     // device plan's point is the readback it avoids and the grouped kernel's
     // schedule is the question.
-    let host_plan_forced = std::env::var("INK_HOST_PLAN").ok().as_deref() == Some("1");
+    let host_plan_forced = st.pack_rows
+        || std::env::var("INK_HOST_PLAN").ok().as_deref() == Some("1");
     // `INK_DECODE_EXPERTS=per`: at ONE row, run the routed experts one expert
     // at a time on the harness's per-expert kernels instead of the grouped
     // kernel's decode schedule. Profiled 2026-09-05 (sky, layers 0:21, ctx
@@ -2805,9 +2844,14 @@ pub fn moe_layer(
     // for the whole stack.
     let per_expert_decode =
         n == 1 && std::env::var("INK_DECODE_EXPERTS").ok().as_deref() == Some("per");
-    let wide = (n > crate::models::inkling::fp4gemm::MTILE || host_plan_forced || per_expert_decode)
-        && !(st.learn_layer == Some(layer) && !frozen);
-    if wide {
+    let row_plan = host_row_plan(
+        n,
+        host_plan_forced,
+        per_expert_decode,
+        st.learn_layer == Some(layer) && !external_bank,
+        external_bank,
+    );
+    if row_plan != ExpertRowPlan::Device {
         let g = crate::models::inkling::seam::tensor_of(
             client.clone(),
             dev.clone(),
@@ -2834,15 +2878,21 @@ pub fn moe_layer(
                     .push((ti, row[k + j]));
             }
         }
-        let acc = match (cp.is_nvfp4(&format!("{p}mlp.experts.w13_weight")), per_expert_decode) {
-            (true, true) => {
+        let acc = match (row_plan, tb.scaled, per_expert_decode) {
+            (ExpertRowPlan::ExplicitBank, _, _) => {
+                // Offsets AND wmap come from this exact teacher/frozen table.
+                // Source-resolving helpers cannot service this branch.
+                packed_bank::run(client, dev, p, tb, &by_expert, &hn, n, h, inter,
+                    cp.experts_swizzled(), &mut st.host)?
+            }
+            (ExpertRowPlan::LiveSource, true, true) => {
                 st.host.per_expert += 1;
                 st.host.expert_slots += by_expert.len();
                 per_expert_fp4(
                     cp, aliases, client, dev, p, &by_expert, &hn, n, h, inter, &mut st.host,
                 )?
             }
-            (true, false) => routed_experts_fp4(
+            (ExpertRowPlan::LiveSource, true, false) => routed_experts_fp4(
                 cp,
                 aliases,
                 client,
@@ -2856,14 +2906,14 @@ pub fn moe_layer(
                 false,
                 &mut st.host,
             )?,
-            (false, true) => {
+            (ExpertRowPlan::LiveSource, false, true) => {
                 st.host.per_expert += 1;
                 st.host.expert_slots += by_expert.len();
                 per_expert_bf16(
                     cp, aliases, client, dev, p, &by_expert, &hn, n, h, inter, &mut st.host,
                 )?
             }
-            (false, false) => routed_experts_bf16(
+            (ExpertRowPlan::LiveSource, false, false) => routed_experts_bf16(
                 cp,
                 aliases,
                 client,
@@ -2876,8 +2926,9 @@ pub fn moe_layer(
                 inter,
                 &mut st.host,
             )?,
+            (ExpertRowPlan::Device, _, _) => unreachable!("device plans skip the host branch"),
         };
-        if let Some(al) = aliases {
+        if let Some(al) = aliases && row_plan == ExpertRowPlan::LiveSource {
             for _ in 0..by_expert.len() {
                 al.note_alias(tb.expert_bytes);
             }
@@ -2968,7 +3019,7 @@ pub fn moe_layer(
     // A learning pass needs this layer's expert input and its plan after the
     // layer is over; keep them when the session armed this layer.
     #[cfg(feature = "inkling-cuda")]
-    if st.learn_layer == Some(layer) && !frozen {
+    if st.learn_layer == Some(layer) && !external_bank {
         st.learn = Some(super::learn::LearnKeep {
             layer,
             hn: hn.clone(),
@@ -4789,6 +4840,37 @@ pub fn expert_rows<B: Backend>(
 #[cfg(test)]
 mod ann_temp_tests {
     use super::*;
+
+    #[test]
+    fn external_expert_banks_never_fall_through_to_live_host_weights() {
+        for rows in [1, 2, 16, 64, 4096] {
+            for forced in [false, true] {
+                for per_expert in [false, true] {
+                    assert_ne!(host_row_plan(rows, forced, per_expert, false, true),
+                        ExpertRowPlan::LiveSource);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn independent_rows_pack_without_changing_default_decode() {
+        assert_eq!(host_row_plan(1, false, false, false, false), ExpertRowPlan::Device);
+        assert_eq!(host_row_plan(16, false, false, false, false), ExpertRowPlan::Device);
+        assert_eq!(host_row_plan(2, true, false, false, false), ExpertRowPlan::LiveSource);
+        assert_eq!(host_row_plan(17, false, false, false, false), ExpertRowPlan::LiveSource);
+        assert_eq!(host_row_plan(64, true, false, true, false), ExpertRowPlan::Device);
+    }
+
+    #[test]
+    fn external_prompts_pack_but_actual_learning_keeps_device_rows() {
+        assert_eq!(host_row_plan(17, false, false, false, true), ExpertRowPlan::ExplicitBank);
+        assert_eq!(host_row_plan(2, true, false, false, true), ExpertRowPlan::ExplicitBank);
+        assert_eq!(host_row_plan(1, false, true, false, true), ExpertRowPlan::ExplicitBank);
+        for external in [false, true] {
+            assert_eq!(host_row_plan(4096, true, true, true, external), ExpertRowPlan::Device);
+        }
+    }
 
     /// [`normals`] really is standard normal, and really does depend on the step.
     ///

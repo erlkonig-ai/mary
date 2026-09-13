@@ -125,6 +125,10 @@ use super::target::{
 use super::tp::Tp;
 use super::tpcomm::Group;
 
+#[path = "sequence.rs"]
+mod sequence;
+pub use sequence::Sequence;
+
 /// The next sequence id. Process-wide and monotone, so no two sequences —
 /// across sessions or across one session's resets — ever share one, and a
 /// [`Checkpoint`] can therefore be refused by the session it does not belong to
@@ -143,6 +147,22 @@ fn required_cache_span(kind: AttnKind, position: usize, window: usize) -> (usize
         }
         AttnKind::Global => (0, position),
     }
+}
+
+/// The configured trainable layer and the initial automatic-capture layer.
+/// Configuration belongs to the resident weights; capture belongs to a pass.
+/// Typed SDFT deliberately has only the former outside an explicit update.
+#[cfg(feature = "inkling-cuda")]
+fn learning_layers(
+    last_layer: usize,
+    has_learner: bool,
+    partial: bool,
+    partial_allowed: bool,
+    distillation: bool,
+) -> (Option<usize>, Option<usize>) {
+    let trainable = (has_learner && (!partial || partial_allowed)).then_some(last_layer);
+    let capture = if distillation { None } else { trainable };
+    (trainable, capture)
 }
 
 /// A Session exposes a layer boundary, but not the routed lane's internal
@@ -245,6 +265,17 @@ pub struct SessionConfig {
     /// only one chunk long.
     pub context_budget: usize,
 
+    /// Additional independent sequences, in creation order. Each entry reserves
+    /// its own persistent KV and convolution histories before weights load.
+    /// Empty by default: sharing weights does not make another cache free.
+    pub sequence_context_budgets: Vec<usize>,
+    /// Other resident device allocations (for example the explicit EMA bank).
+    /// Charged before copying the model; this does not allocate those objects.
+    pub extra_reserved_bytes: u64,
+    /// Typed opt-in to explicit self-distillation. This arms the learner only
+    /// for learn_distribution, without the environment's automatic SFT/control.
+    pub distillation: Option<super::sdft::Config>,
+
     /// How many positions one [`Session::extend`] pass appends to an existing
     /// cache at once.
     ///
@@ -304,6 +335,9 @@ impl SessionConfig {
             prefill_budget: 4096,
             target_budget: DEFAULT_TARGET_BUDGET,
             context_budget: 4096,
+            sequence_context_budgets: Vec::new(),
+            extra_reserved_bytes: 0,
+            distillation: None,
             extend_batch: 4096,
         }
     }
@@ -383,6 +417,11 @@ pub struct Session {
     /// (`INK_LEARN_LR`); see [`super::learn`].
     #[cfg(feature = "inkling-cuda")]
     learner: Option<super::learn::Learner>,
+    /// Configured mutable weight bank, independent of the transient forward
+    /// capture flag in MoeState. Resetting/swapping a conversation must not
+    /// make its learned resident weights disappear from export.
+    #[cfg(feature = "inkling-cuda")]
+    trainable_layer: Option<usize>,
     /// Rows she generated since the last scored pass, kept for the anchor
     /// (`INK_LEARN_ANCHOR`); see [`super::learn::AnchorRow`].
     #[cfg(feature = "inkling-cuda")]
@@ -415,6 +454,14 @@ pub struct Session {
     /// Maximum number of positions this sequence may retain. Admission prices
     /// its persistent KV before the weight arena is allocated.
     context_budget: usize,
+    /// Capsules cannot move between models/clients even when their shapes match.
+    sequence_owner: u64,
+    /// Explicitly admitted capacities not yet handed to a caller.
+    sequence_context_budgets: std::collections::VecDeque<usize>,
+    /// Version of this sequence's explicitly selected teacher table, if any.
+    sequence_teacher_version: Option<u64>,
+    /// The one typed SDFT bank reservation has not yet been consumed.
+    teacher_bank_available: bool,
     /// Whether a pass FAILED PART WAY THROUGH the layer stack, leaving the
     /// caches at two different positions.
     ///
@@ -646,6 +693,9 @@ impl Drop for TargetExtension<'_> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassMode {
     Commit,
+    /// Commit and expose the last head plus residual, without implicit learning.
+    Observe,
+    ObserveAll,
     /// Commit, and also score every row against the id that followed it:
     /// `ids[1..]` inside the pass and `next` after it, when the caller knows
     /// what came next. See [`Session::extend_scored`].
@@ -655,6 +705,7 @@ enum PassMode {
 
 enum PassOutput {
     Committed(usize),
+    Observed { logits: T2, residual: T2 },
     /// The committed token and the per-row negative log-likelihoods, in nats.
     Scored { best: usize, nll: ScoredNll },
     Target(Vec<usize>),
@@ -792,7 +843,7 @@ impl Session {
         Self::load_inner(cfg, Some(group))
     }
 
-    fn load_inner(cfg: SessionConfig, group: Option<Group>) -> Result<Self> {
+    fn load_inner(mut cfg: SessionConfig, group: Option<Group>) -> Result<Self> {
         super::fatal::arm();
 
         // Refuse an arbitrary raw client before opening or copying a byte of
@@ -835,6 +886,44 @@ impl Session {
 
         let (lo, hi) = (cfg.layers.start, cfg.layers.end);
         let partial = validate_layer_range(&cfg.layers, t.num_hidden_layers, tp)?;
+        if let Some(distillation) = &cfg.distillation {
+            distillation.validate()?;
+            anyhow::ensure!(!partial && !t.is_dense(hi - 1),
+                "SDFT requires a complete stack with a routed final layer");
+            anyhow::ensure!(distillation.sequences < cfg.prefill_budget.min(SCORE_ROWS),
+                "SDFT students plus foreground exceed the admitted independent batch width");
+            anyhow::ensure!(distillation.max_rollout <= cfg.prefill_budget.min(SCORE_ROWS),
+                "SDFT rollout exceeds the single soft-target pass admission");
+            let learning_rows = super::sdft_admission::captured_rows(
+                distillation.max_rollout, distillation.context_budget,
+                if t.use_sconv { t.sconv_kernel_size } else { 1 },
+            )?;
+            anyhow::ensure!(learning_rows <= cfg.prefill_budget,
+                "SDFT response plus convolution history needs {learning_rows} rows, prefill budget is {}",
+                cfg.prefill_budget);
+            anyhow::ensure!(cfg.sequence_context_budgets.is_empty(),
+                "typed SDFT supplies its own sequence admissions; do not also supply manual capsules");
+            anyhow::ensure!(src.is_nvfp4(&format!("model.llm.layers.{}.mlp.experts.w13_weight", hi - 1)),
+                "SDFT's final routed layer must use packed NVFP4 storage");
+            cfg.sequence_context_budgets.extend(distillation.sequence_budgets()?);
+            #[cfg(feature = "inkling-cuda")]
+            {
+                let inter = match tp {
+                    Some(tp) => tp.share("intermediate_size", t.intermediate_size)
+                        .map_err(|e| anyhow::anyhow!(e))?,
+                    None => t.intermediate_size,
+                };
+                let workspace = super::sdft_admission::workspace_bytes(t, distillation, inter)?;
+                let ema = super::learn::ema::memory_bytes(t.n_routed_experts, t.hidden_size, inter)?;
+                // The learner's transposed packed head is separate from the
+                // inference head. Its BF16 transpose exists during binding.
+                let head = (t.vocab_size as u128) * (t.hidden_size as u128);
+                let reserve = u64::try_from(ema.total as u128 + head * 5 + workspace.total as u128)
+                    .context("SDFT learner admission overflow")?;
+                cfg.extra_reserved_bytes = cfg.extra_reserved_bytes.checked_add(reserve)
+                    .context("SDFT resident reservation overflow")?;
+            }
+        }
         // A batched append is a prefill-shaped pass against an existing cache:
         // its activations are a function of its width in exactly the same way,
         // and `prefill_budget` is the width admission reserved headroom for.
@@ -910,7 +999,18 @@ impl Session {
             cfg.prefill_budget,
             cfg.context_budget,
             admission,
-        );
+        )
+        .checked_add(sequence::extra_sequence_bytes(
+            t,
+            lo..hi,
+            &cfg.sequence_context_budgets,
+            admission,
+            tp,
+        )?)
+        .context("independent sequence admission overflow")?;
+        let attention_bytes = attention_bytes
+            .checked_add(cfg.extra_reserved_bytes)
+            .context("extra resident admission overflow")?;
 
         // Move this rank's share into ONE anonymous allocation before any GPU
         // handle can alias it. The routed experts are cut here or nowhere: there
@@ -949,7 +1049,7 @@ impl Session {
         #[cfg(feature = "inkling-cuda")]
         {
             let partial_ok = std::env::var("INK_LEARN_PARTIAL").map(|v| v == "1").unwrap_or(false);
-            if super::learn::Learner::from_env().is_some() && (!partial || partial_ok) {
+            if cfg.distillation.is_none() && super::learn::Learner::from_env().is_some() && (!partial || partial_ok) {
                 let layer = hi - 1;
                 let (n, bytes) = src.freeze_experts(&format!("model.llm.layers.{layer}."))?;
                 println!(
@@ -1005,14 +1105,23 @@ impl Session {
             // ratio.
             let packed = quantized_bf16(&client, &leaf.bytes, rows, cols);
             #[cfg(feature = "inkling-cuda")]
-            let learner = super::learn::Learner::from_env().map(|(lr, stochastic)| {
+            let learner_config = match &cfg.distillation {
+                Some(distillation) => Some((distillation.learning_rate, true)),
+                None => super::learn::Learner::from_env(),
+            };
+            #[cfg(feature = "inkling-cuda")]
+            let learner = learner_config.map(|(lr, stochastic)| {
                 println!(
                     "  learning           : last layer's routed experts, lr {lr}, {} rounding",
                     if stochastic { "stochastic" } else { "nearest" }
                 );
                 let mut learner =
                     super::learn::Learner::bind(&client, &leaf.bytes, rows, cols, lr, stochastic);
-                learner.anchor = super::learn::Learner::anchor_from_env();
+                if cfg.distillation.is_some() {
+                    learner.steps = 0;
+                } else {
+                    learner.anchor = super::learn::Learner::anchor_from_env();
+                }
                 if let Some(w) = learner.anchor {
                     println!(
                         "  anchor             : her rows held to the distribution that said them, weight {w}"
@@ -1028,17 +1137,22 @@ impl Session {
                 learner,
             )
         };
-        // Learning keeps the LAST layer's forward, on the rank that owns the
-        // head: a partial stack has no loss to learn from.
+        // The mutable resident weight bank is configured once. Automatic SFT
+        // captures that bank's forwards continuously; explicit SDFT enables
+        // capture only during learn_distribution, but exports the SAME bank.
         let mut moe = MoeState::default();
         #[cfg(feature = "inkling-cuda")]
-        {
+        let trainable_layer = {
             // `INK_LEARN_PARTIAL=1` arms it on a partial stack too, for the
             // mechanics only: the head then unembeds a hidden state the stack
             // did not finish, so the loss is diagnostic and so is the step.
             let partial_ok = std::env::var("INK_LEARN_PARTIAL").map(|v| v == "1").unwrap_or(false);
-            moe.learn_layer = (learner.is_some() && (!partial || partial_ok)).then(|| hi - 1);
-        }
+            let (trainable, capture) = learning_layers(
+                hi - 1, learner.is_some(), partial, partial_ok, cfg.distillation.is_some(),
+            );
+            moe.learn_layer = capture;
+            trainable
+        };
         #[cfg(not(feature = "inkling-cuda"))]
         let _ = &learner;
 
@@ -1095,6 +1209,8 @@ impl Session {
             #[cfg(feature = "inkling-cuda")]
             learner,
             #[cfg(feature = "inkling-cuda")]
+            trainable_layer,
+            #[cfg(feature = "inkling-cuda")]
             anchor: Vec::new(),
             caches: Vec::new(),
             pos: 0,
@@ -1103,6 +1219,10 @@ impl Session {
             prefill_budget: cfg.prefill_budget,
             target_budget: cfg.target_budget,
             context_budget: cfg.context_budget,
+            sequence_owner: next_seq(),
+            sequence_context_budgets: cfg.sequence_context_budgets.into(),
+            sequence_teacher_version: None,
+            teacher_bank_available: cfg.distillation.is_some(),
             torn: false,
             seq: next_seq(),
         })
@@ -1236,13 +1356,6 @@ impl Session {
         self.group.as_mut()
     }
 
-    /// This rank's cut of every expert the learner has moved, in the pile's
-    /// byte order ([`super::learned::export_learned`]).
-    ///
-    /// Syncs the device first: the arena is written by the update kernel, and
-    /// a host read that raced it would carry a mixture of two steps. Off the
-    /// token path by construction -- this runs when a caller asks for the
-    /// learned model, not per pass.
     /// Whether a learner is armed on this session.
     pub fn learning(&self) -> bool {
         #[cfg(feature = "inkling-cuda")]
@@ -1253,6 +1366,15 @@ impl Session {
         {
             false
         }
+    }
+
+    /// The configured resident weight bank eligible for learning/export. This
+    /// does not say whether the current forward is being kept for backward.
+    pub fn trainable_layer(&self) -> Option<usize> {
+        #[cfg(feature = "inkling-cuda")]
+        { self.trainable_layer }
+        #[cfg(not(feature = "inkling-cuda"))]
+        { None }
     }
 
     /// The model root the weights were loaded from, if one was named or
@@ -1268,10 +1390,17 @@ impl Session {
         &self.src
     }
 
+    /// This rank's changed student experts in the pile's byte order. The
+    /// configured trainable layer survives sequence reset/swap and temporary
+    /// capture suppression, including between explicit SDFT updates.
+    ///
+    /// Syncs before reading the device-mutated arena. Exports STUDENT packed
+    /// weights only: EMA shadows, teacher versions, optimizer step/rounding
+    /// counter, and rollout RNG state are not a resumable checkpoint here.
     pub fn export_learned(&mut self) -> Result<Vec<super::learned::LearnedCut>> {
         #[cfg(feature = "inkling-cuda")]
         {
-            let Some(layer) = self.moe.learn_layer else {
+            let Some(layer) = self.trainable_layer else {
                 return Ok(Vec::new());
             };
             cubecl::future::block_on(self.client.sync())
@@ -1359,7 +1488,7 @@ impl Session {
         let boundary = TargetBoundary::new(self.pos, self.last, width.rows())?;
         let predictions = match self.forward_pass(proposed, PassMode::Target) {
             Ok(PassOutput::Target(predictions)) => predictions,
-            Ok(PassOutput::Committed(_) | PassOutput::Scored { .. }) => {
+            Ok(PassOutput::Committed(_) | PassOutput::Scored { .. } | PassOutput::Observed { .. }) => {
                 unreachable!("a target pass returned a committed prediction")
             }
             Err(source) => {
@@ -1482,9 +1611,16 @@ impl Session {
         self.last = None;
         if let Some(audio) = &mut self.audio {
             audio.queue.pending.clear();
+            audio.queue.slot = None;
         }
         if let Some(vision) = &mut self.vision {
             vision.queue.pending.clear();
+            vision.queue.slot = None;
+        }
+        #[cfg(feature = "inkling-cuda")]
+        {
+            self.anchor.clear();
+            self.moe.learn = None;
         }
         // Throwing the caches away is what un-tears a torn session: there is
         // nothing left for the layers to disagree about.
@@ -1496,6 +1632,8 @@ impl Session {
         // conversation's cache while the caller believed it had started a fresh
         // one.
         self.seq = next_seq();
+        self.moe.teacher = None;
+        self.sequence_teacher_version = None;
     }
 
     /// Keep where this session stands, so it can be put back here later.
@@ -1933,7 +2071,7 @@ impl Session {
             Ok(PassOutput::Scored { best, nll }) => {
                 self.validate_cache_completeness().map(|_| (best, nll))
             }
-            Ok(PassOutput::Target(_)) => {
+            Ok(PassOutput::Target(_) | PassOutput::Observed { .. }) => {
                 unreachable!("an ordinary pass returned target predictions")
             }
             Err(error) => Err(error),
@@ -2102,7 +2240,7 @@ impl Session {
                 // builds from absolute positions is what makes the untrimmed
                 // rows harmless, and `commit` below is what makes the store
                 // bounded again.
-                (true, PassMode::Commit | PassMode::Scored { .. }, true) => {
+                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, true) => {
                     let y = dev_lane::attention_steps(
                         hn,
                         &ld.attn,
@@ -2135,7 +2273,7 @@ impl Session {
                     self.caches[slot].attn_sconv = dev_lane::conv_history(all, t.sconv_kernel_size);
                     out
                 }
-                (true, PassMode::Commit | PassMode::Scored { .. }, false) => {
+                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, false) => {
                     let y = dev_lane::attention_step(
                         hn,
                         &ld.attn,
@@ -2154,7 +2292,7 @@ impl Session {
                     self.caches[slot].attn_sconv = hist;
                     out
                 }
-                (false, PassMode::Commit | PassMode::Scored { .. }, _) => {
+                (false, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, _) => {
                     let (y, attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
                     let y = tp_reduce(y, &mut tp_calls);
@@ -2247,7 +2385,7 @@ impl Session {
                 // need the batched form, and a widened pass that left one of
                 // them on the single-row kernel would convolve `n` positions
                 // out of one position's history with no error at all.
-                (true, PassMode::Commit | PassMode::Scored { .. }, true) => {
+                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, true) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
@@ -2257,7 +2395,7 @@ impl Session {
                         Some(dev_lane::conv_history(all, t.sconv_kernel_size));
                     o
                 }
-                (true, PassMode::Commit | PassMode::Scored { .. }, false) => {
+                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, false) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
@@ -2266,7 +2404,7 @@ impl Session {
                     self.caches[slot].mlp_sconv = Some(hi);
                     o
                 }
-                (false, PassMode::Commit | PassMode::Scored { .. }, _) => {
+                (false, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, _) => {
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
                     self.caches[slot].mlp_sconv = Some(hist);
                     dev_lane::short_conv(y, ld.mlp_sconv.clone())
@@ -2349,6 +2487,15 @@ impl Session {
             logits
         };
         match mode {
+            PassMode::Observe | PassMode::ObserveAll => {
+                let logits = head(if mode == PassMode::ObserveAll { xd.clone() }
+                    else { xd.clone().slice([n - 1..n, 0..h]) });
+                self.pos += n;
+                // A caller will sample these logits. There is no implicit
+                // argmax readback, and no claim that we know its chosen token.
+                self.last = None;
+                Ok(PassOutput::Observed { logits, residual: xd })
+            }
             PassMode::Commit => {
                 let logits = head(xd.clone().slice([n - 1..n, 0..h]));
                 let best = argmax_row_dev(logits.clone());
@@ -2662,6 +2809,35 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(feature = "inkling-cuda")]
+    fn sdft_exports_configured_layer_without_automatic_capture() {
+        let (trainable, capture) = learning_layers(41, true, false, false, true);
+        assert_eq!(trainable, Some(41));
+        assert_eq!(capture, None);
+    }
+
+    #[test]
+    #[cfg(feature = "inkling-cuda")]
+    fn ordinary_learning_captures_and_exports_the_same_configured_layer() {
+        assert_eq!(learning_layers(41, true, false, false, false), (Some(41), Some(41)));
+    }
+
+    #[test]
+    #[cfg(feature = "inkling-cuda")]
+    fn nonlearning_and_unapproved_partial_stacks_have_no_trainable_layer() {
+        for distillation in [false, true] {
+            assert_eq!(learning_layers(41, false, false, false, distillation), (None, None));
+            assert_eq!(learning_layers(20, true, true, false, distillation), (None, None));
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "inkling-cuda")]
+    fn explicitly_allowed_partial_learning_retains_its_diagnostic_layer() {
+        assert_eq!(learning_layers(20, true, true, true, false), (Some(20), Some(20)));
+    }
 
     #[test]
     fn complete_cache_span_is_exact_on_both_sides_of_the_window() {

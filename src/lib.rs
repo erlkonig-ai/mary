@@ -62,6 +62,8 @@ pub mod say;
 /// graph. Storage adapters supply the facts and blob reader; this module owns
 /// only the graph semantics.
 pub mod selection;
+/// Seeded categorical sampling shared by autoregressive model runtimes.
+pub mod sampling;
 /// In-process Qwen3-TTS voice synthesis (the production speak path):
 /// clone the reference kit, speak arbitrary text, weights loaded from a durable
 /// standalone pile — no safetensors, no separate binary in the path.

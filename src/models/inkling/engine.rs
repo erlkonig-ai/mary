@@ -99,6 +99,9 @@ pub struct EngineConfig {
     /// graph (`Model::persist_learned`). `None`: nothing learned is ever
     /// written back.
     pub signing_key: Option<std::path::PathBuf>,
+    /// Independent, explicitly supplied learning examples; disabled by default
+    /// in callers. Teacher and extra sequence memory is admitted at load.
+    pub distillation: Option<super::sdft::Config>,
 }
 
 /// The tensor-parallel placement of one rank.
@@ -112,6 +115,10 @@ pub struct TensorParallel {
 /// A loaded rank-0 model: the [`Model`] `InklingMind` consults.
 pub struct Engine {
     session: Session,
+    distillation: Option<super::sdft_runtime::Runtime>,
+    distillation_schedule: Option<super::sdft_schedule::Scheduler>,
+    distillation_config: Option<super::sdft::Config>,
+    distillation_samplers: Vec<crate::sampling::Sampler>,
     codec: InklingContextCodec,
     /// Leaked once at load; see the module header. Held so a reinitialization
     /// can build a fresh decode stream over the same tokenizer.
@@ -174,6 +181,7 @@ pub struct Engine {
 /// needs to stay in lockstep arrives as a [`Pass`].
 pub struct Follower {
     session: Session,
+    distillation: Option<super::sdft_runtime::Runtime>,
     digest: blake3::Hasher,
     ready: Ready,
     /// This rank's rewind points, by the index rank 0 names them by.
@@ -199,8 +207,13 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
         false => "observed-v1",
     };
     let mut execution_manifest = begin_execution_manifest(execution_profile)?;
+    if let Some(distillation) = &config.distillation {
+        distillation.validate()?;
+        execution_manifest.field("distillation", &serde_json::to_vec(distillation)?);
+    }
 
     let mut session_config = SessionConfig::new(&config.pile);
+    session_config.distillation = config.distillation.clone();
     if let Some(layers) = config.layers.clone() {
         session_config = session_config.layers(layers);
     }
@@ -378,8 +391,12 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // The one place the two ranks' code diverges, and it is one `if`.
     if tp_rank.is_some_and(|rank| rank != 0) {
         drop(codec);
+        let distillation = config.distillation.clone().map(|cfg| {
+            super::sdft_runtime::Runtime::new(&mut session, cfg)
+        }).transpose()?;
         return Ok(Loaded::Follower(Follower {
             session,
+            distillation,
             digest: blake3::Hasher::new(),
             ready,
             checkpoints: Vec::new(),
@@ -393,9 +410,28 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // carried token is never advanced twice: it entered this sequence when it
     // was generated, while `carry` only catches the KV cache up to that fact.
     let tokenizer: &'static tokenizers::Tokenizer = Box::leak(Box::new(tokenizer));
+    let distillation = config.distillation.clone().map(|cfg| {
+        super::sdft_runtime::Runtime::new(&mut session, cfg)
+    }).transpose()?;
+    let distillation_schedule = config.distillation.clone().map(|cfg| {
+        super::sdft_schedule::Scheduler::new(
+            cfg, vec![codec.special_ids().content_model_end_sampling as usize],
+        )
+    }).transpose()?;
+    let distillation_samplers = match &config.distillation {
+        Some(cfg) => (0..cfg.sequences).map(|slot| crate::sampling::Sampler::new(
+            crate::sampling::SamplingConfig { temperature: cfg.temperature, ..Default::default() },
+            cfg.seed.wrapping_add(slot as u64),
+        )).collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
     Ok(Loaded::Engine(Engine {
         signing_key: config.signing_key.clone(),
         session,
+        distillation,
+        distillation_schedule,
+        distillation_config: config.distillation,
+        distillation_samplers,
         codec,
         tokenizer,
         decode: detokenizer(tokenizer),
@@ -469,6 +505,14 @@ impl Follower {
                 group.follow()?
             };
             match pass {
+                Pass::Distill(work) => {
+                    let runtime = self.distillation.as_mut()
+                        .context("rank zero requested SDFT without an admitted teacher")?;
+                    let outcome = runtime.execute(&mut self.session, &work)?;
+                    if let super::sdft_runtime::Outcome::Decoded { foreground: Some(token), .. } = outcome {
+                        self.fold(token);
+                    }
+                }
                 Pass::Prefill(ids) => {
                     let token = self
                         .session
@@ -551,6 +595,7 @@ impl Follower {
                     group.agree(digest)?;
                 }
                 Pass::Export => {
+                    let identity = self.session.model_identity();
                     let cuts = self
                         .session
                         .export_learned()
@@ -559,7 +604,7 @@ impl Follower {
                         .session
                         .group_mut()
                         .context("a follower with no Group cannot export")?;
-                    group.send_cuts(&cuts)?;
+                    group.send_cuts(&cuts, identity)?;
                 }
                 Pass::Finish => {
                     eprintln!("inkling: rank 0 ended the run; this rank is stopping cleanly");
@@ -590,12 +635,141 @@ fn fold_pass(digest: &mut blake3::Hasher, token: usize, position: usize) {
     digest.update(&(position as u64).to_be_bytes());
 }
 
+fn distillation_recipe(
+    requested: &super::resident::VersionRecipe,
+    config: &super::sdft::Config,
+    student_version: u64,
+    teacher_version: u64,
+    execution_identity: &str,
+) -> Result<super::resident::VersionRecipe> {
+    Ok(super::resident::VersionRecipe {
+        lr: f64::from(config.learning_rate),
+        anchor: None,
+        seed: config.seed,
+        steps: student_version,
+        span: requested.span.clone(),
+        explanation: format!(
+            "Background on-policy self-distillation: demonstration-conditioned EMA teacher, \
+             response-only forward KL, last routed layer, stochastic NVFP4 updates. \
+             Student step {student_version}; teacher version {teacher_version}. Config: {}. \
+             This version saves student weights only; EMA, queue and sampler RNG restart \
+             from the configured initial state on reload. Execution: {execution_identity}.",
+            serde_json::to_string(config)?,
+        ),
+        code_revision: requested.code_revision.clone(),
+    })
+}
+
 // ── the engine ──────────────────────────────────────────────────────────────
 
 impl Engine {
     /// What loaded, and whether its tokens are the model's.
     pub fn ready(&self) -> &Ready {
         &self.ready
+    }
+
+    /// Admit an explicitly supplied training example without changing the
+    /// foreground context. Preparation runs only at a background-work boundary.
+    pub fn enqueue_distillation(&mut self, example: super::sdft::Example) -> Result<()> {
+        example.validate()?;
+        let config = self.distillation_config.as_ref()
+            .context("self-distillation was not admitted when the model loaded")?;
+        let prepared = super::sdft::PreparedExample {
+            student: self.codec.encode_distillation_prompt(&example.prompt, None)?,
+            teacher: self.codec.encode_distillation_prompt(&example.prompt, Some(&example.demonstration))?,
+        };
+        prepared.validate(config, self.session.config().text_config.effective_vocab())?;
+        self.distillation_schedule.as_mut().expect("admitted scheduler").enqueue(prepared)
+    }
+
+    pub fn distillation_pending(&self) -> bool {
+        self.distillation_schedule.as_ref().is_some_and(|schedule| schedule.pending())
+    }
+
+    /// Execute one background operation. This is a cooperative boundary, not a
+    /// thread racing weight updates against live collectives. Prompt prefill,
+    /// teacher scoring and backward are deliberately absent from `pass`.
+    pub fn background_step(&mut self) -> Result<bool> {
+        anyhow::ensure!(!self.terminated, "cannot learn after model shutdown");
+        let Some(runtime) = &self.distillation else { return Ok(false); };
+        let work = self.distillation_schedule.as_ref().expect("admitted scheduler")
+            .next_idle(runtime.version(), runtime.teacher_version())?;
+        let Some(work) = work else { return Ok(false); };
+        self.run_distillation(work)?;
+        Ok(true)
+    }
+
+    fn distillation_decode_work(&self, active: usize) -> Result<Option<super::sdft::Work>> {
+        match (&self.distillation, &self.distillation_schedule) {
+            (Some(runtime), Some(schedule)) =>
+                schedule.next_decode(active, runtime.version(), runtime.teacher_version()),
+            _ => Ok(None),
+        }
+    }
+
+    fn run_distillation(&mut self, work: super::sdft::Work) -> Result<Option<usize>> {
+        use super::sdft::{Report, Work};
+        use super::sdft_runtime::Outcome;
+        self.distillation.as_ref().context("SDFT runtime not admitted")?
+            .validate(&self.session, &work)?;
+        self.lead(&Pass::Distill(work.clone()))?;
+        let start = std::time::Instant::now();
+        let runtime = self.distillation.as_mut().expect("validated runtime");
+        let outcome = runtime.execute(&mut self.session, &work)?;
+        let student_version = runtime.version();
+        let teacher_version = runtime.teacher_version();
+        match (work, outcome) {
+            (Work::Prepare { slot, .. }, Outcome::Logits(logits)) => {
+                let values = super::assembly::down(logits);
+                let token = self.distillation_samplers[slot].token(&values)?;
+                self.distillation_schedule.as_mut().expect("admitted scheduler")
+                    .prepared(slot, token, student_version, teacher_version)?;
+                Ok(None)
+            }
+            (Work::Decode { active, slots, .. }, Outcome::Decoded { foreground, logits }) => {
+                let [rows, vocab] = logits.dims();
+                let offset = usize::from(active.is_some());
+                anyhow::ensure!(rows == slots.len() + offset && active.is_some() == foreground.is_some(),
+                    "SDFT batch output does not match the ordered work");
+                let values = super::assembly::down(logits);
+                let mut sampled = Vec::with_capacity(slots.len());
+                for (row, &slot) in slots.iter().enumerate() {
+                    let begin = (row + offset) * vocab;
+                    sampled.push(self.distillation_samplers[slot].token(&values[begin..begin + vocab])?);
+                }
+                self.distillation_schedule.as_mut().expect("admitted scheduler")
+                    .decoded(&slots, &sampled)?;
+                if let Some(token) = foreground {
+                    fold_pass(&mut self.digest, token, self.session.position());
+                }
+                Ok(foreground)
+            }
+            (Work::Score { slot, .. }, Outcome::Scored { rows, teacher_version }) => {
+                self.distillation_schedule.as_mut().expect("admitted scheduler").scored(slot)?;
+                eprintln!("inkling-sdft: scored slot={slot} teacher={teacher_version} rows={rows} wall_seconds={:.6}", start.elapsed().as_secs_f64());
+                Ok(None)
+            }
+            (Work::Learn { slot, student_version: rollout_version, teacher_version }, Outcome::Learned(report)) => {
+                self.distillation_schedule.as_mut().expect("admitted scheduler")
+                    .learned(slot, student_version)?;
+                let report = Report {
+                    student_version: rollout_version,
+                    teacher_version,
+                    updated_student_version: student_version,
+                    response_tokens: report.rows,
+                    update_host_seconds: start.elapsed().as_secs_f64(),
+                };
+                eprintln!("inkling-sdft: learned {}", serde_json::to_string(&report)?);
+                Ok(None)
+            }
+            (Work::UpdateTeacher { .. }, Outcome::TeacherUpdated(report)) => {
+                self.distillation_schedule.as_mut().expect("admitted scheduler").teacher_updated()?;
+                eprintln!("inkling-sdft: teacher version={} student={} bytes={} enqueue_seconds={:.6}",
+                    report.version, report.student_step, report.bytes.total, start.elapsed().as_secs_f64());
+                Ok(None)
+            }
+            _ => anyhow::bail!("SDFT runtime returned the wrong kind of result"),
+        }
     }
 
     /// Make one `Session` pass, having first told every other rank to make it.
@@ -605,6 +779,16 @@ impl Engine {
     /// pass is the synchronisation, and the kernel's socket buffer absorbs the
     /// skew.
     fn pass(&mut self, pass: Pass) -> Result<usize> {
+        let active = match &pass {
+            Pass::Extend(ids) if ids.len() == 1 => Some(ids[0]),
+            Pass::Step => self.session.next_token(),
+            _ => None,
+        };
+        if let Some(active) = active
+            && let Some(work) = self.distillation_decode_work(active)?
+        {
+            return self.run_distillation(work)?.context("a foreground batch produced no foreground token");
+        }
         self.lead(&pass)?;
         let token = match &pass {
             Pass::Prefill(ids) => self
@@ -679,17 +863,25 @@ impl Engine {
     /// [`super::learned`] for why the identity of the resulting model is
     /// still an open decision.
     pub fn export_learned(&mut self) -> Result<Vec<super::learned::LearnedExpert>> {
+        let Some(layer) = self.session.trainable_layer() else { return Ok(Vec::new()); };
         if self.session.group_mut().is_some() {
             self.lead(&Pass::Export)?;
         }
-        let mut cuts = self
+        let cuts = self
             .session
             .export_learned()
             .context("export rank 0's learned experts")?;
+        let world = self.ready.tp_world;
+        let mut exports = vec![super::learned::RankExport {
+            rank: 0, world: world as u32, model_identity: self.session.model_identity(), cuts,
+        }];
         if let Some(group) = self.session.group_mut() {
-            cuts.extend(group.recv_cuts()?);
+            exports.extend(group.recv_cuts()?);
         }
-        super::learned::assemble(cuts)
+        super::learned::assemble_completed_exports(
+            self.session.source(), world, layer,
+            self.session.config().text_config.n_routed_experts, exports,
+        )
     }
 
     /// Tell every other rank to do something that is not a pass.
@@ -801,6 +993,7 @@ impl Engine {
         // a primed session: the carry alone is a token, so a consult with no
         // new context is still a one-row `extend` rather than a bare `step`.
         let primed = self.session.position() > 0;
+        let has_scoring_rows = ids.len() > 1;
         let pass = match primed {
             false => Pass::Prefill(ids),
             true => Pass::Extend(ids),
@@ -814,7 +1007,7 @@ impl Engine {
         // makes a learning change measurable at all: `INK_SCORE=0` turns it
         // off for a run that wants the head's last row only.
         let unscored = std::mem::take(&mut self.delta_unscored);
-        let (first, scored) = match (self.score && !unscored, unscored) {
+        let (first, scored) = match (self.score && !unscored && has_scoring_rows, unscored) {
             (true, _) => self.pass_scored(pass)?,
             // The cover goes in in pieces with a rewind point after each, and
             // one at its end.
@@ -962,6 +1155,14 @@ impl Model for Engine {
         &self.ready
     }
 
+    fn background_pending(&self) -> bool {
+        !self.terminated && self.distillation_pending()
+    }
+
+    fn background_step(&mut self) -> Result<bool> {
+        Engine::background_step(self)
+    }
+
     fn context(&mut self, context: &InklingContext) -> Result<()> {
         let ids = self
             .codec
@@ -1028,8 +1229,8 @@ impl Model for Engine {
         self.delta.extend(ids);
         // The payloads behind the slots just emitted, each medium to its own
         // queue, in the order the slots were emitted.
-        for record in self.codec.sensed(context) {
-            match &record.media {
+        for media in self.codec.media(context) {
+            match media {
                 SenseMedia::Dmel { levels } => self.delta_audio.extend_from_slice(levels),
                 SenseMedia::Text { .. } => {}
                 SenseMedia::Patches { patches } => self.delta_vision.extend_from_slice(patches),
@@ -1100,12 +1301,15 @@ impl Model for Engine {
         // leaked and `'static`, so a fresh stream costs nothing but its own
         // state.
         self.decode = detokenizer(self.tokenizer);
-        self.delta = replacement;
+        self.delta.clear();
         self.delta_unscored = true;
         self.delta_audio.clear();
         self.delta_vision.clear();
         self.carry = None;
         self.turn = 0;
+        // History can contain media as well as text. Use the ordinary typed
+        // installation path to rebuild payload queues and cover boundaries.
+        self.context(initialization)?;
 
         eprintln!(
             "inkling: reinitialized after {} turn(s) at position {}; {} replacement token(s) staged",
@@ -1238,6 +1442,8 @@ impl Model for Engine {
         if self.terminated || !self.session.learning() {
             return Ok(None);
         }
+        anyhow::ensure!(!self.distillation.as_ref().is_some_and(|runtime| runtime.is_poisoned()),
+            "cannot persist weights after an interrupted background update");
         let Some(key_path) = self.signing_key.clone() else {
             return Ok(None);
         };
@@ -1248,12 +1454,23 @@ impl Model for Engine {
             return Ok(None);
         }
         let parent = self.session.model_root();
+        // Drive's ordinary recipe describes live-result SFT armed by env vars.
+        // Typed SDFT has a different objective, seed and step counter. Keep
+        // the caller's context span, but never mislabel background updates as
+        // one optimizer step per foreground turn.
+        let recipe = match (&self.distillation_config, &self.distillation) {
+            (Some(config), Some(runtime)) => distillation_recipe(
+                recipe, config, runtime.version(), runtime.teacher_version(),
+                &self.ready.execution_identity,
+            )?,
+            _ => recipe.clone(),
+        };
         let mut store = Pile::open(std::path::Path::new(&self.ready.pile))
             .map_err(|e| anyhow::anyhow!("open {} to write a version: {e:?}", self.ready.pile))?;
         store
             .refresh()
             .map_err(|e| anyhow::anyhow!("refresh {}: {e:?}", self.ready.pile))?;
-        let version = super::version::learned_version(&mut store, &learned, parent, recipe)?;
+        let version = super::version::learned_version(&mut store, &learned, parent, &recipe)?;
         let persisted = super::resident::Persisted {
             root: version.root,
             parent: version.parent,
@@ -1679,6 +1896,26 @@ mod tests {
     use super::{
         reject_sealed_environment, sealed_environment_rejections, validate_reinitialize_boundary,
     };
+
+    #[test]
+    fn sdft_recipe_uses_optimizer_steps_and_typed_config_not_live_sft() {
+        let live = super::super::resident::VersionRecipe {
+            lr: 999.0, anchor: Some(5.0), seed: 999, steps: 999,
+            span: "context epoch 3".to_string(),
+            explanation: "live SFT".to_string(),
+            code_revision: "drive candidate".to_string(),
+        };
+        let cfg = super::super::sdft::Config { learning_rate: 0.25, seed: 17, ..Default::default() };
+        let recipe = super::distillation_recipe(&live, &cfg, 7, 3, "exact-binary").unwrap();
+        assert_eq!(recipe.lr, 0.25);
+        assert_eq!(recipe.anchor, None);
+        assert_eq!((recipe.seed, recipe.steps), (17, 7));
+        assert_eq!(recipe.span, live.span);
+        assert!(recipe.explanation.contains("teacher version 3"));
+        assert!(recipe.explanation.contains("student weights only"));
+        assert!(recipe.explanation.contains("exact-binary"));
+        assert!(!recipe.explanation.contains("live SFT"));
+    }
 
     fn byte_fallback_tokenizer() -> Tokenizer {
         let vocab = [

@@ -533,6 +533,12 @@ impl Group {
             Err(error) => return Err(error).context("read the next pass command"),
         }
         let count = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
+        if header[0] == Pass::DISTILL {
+            anyhow::ensure!(count <= Pass::MAX_DISTILL_BYTES, "rank-link SDFT frame exceeds its byte budget");
+            let mut bytes = vec![0; count];
+            peer.read_exact(&mut bytes).context("read SDFT work")?;
+            return Pass::decode_distillation(&bytes);
+        }
         if header[0] == Pass::AUDIO || header[0] == Pass::VISION {
             let mut slot = [0u8; 4];
             peer.read_exact(&mut slot)
@@ -601,11 +607,13 @@ impl Group {
     /// Send rank 0 this rank's learned cuts, in answer to [`Pass::Export`].
     /// Only a non-zero rank may call it.
     ///
-    /// `[count u32be][count x LearnedCut]` on the socket to rank 0. A whole
+    /// `[rank u32be][model identity 32][count u32be][count x LearnedCut]`
+    /// on the socket to rank 0. Even count zero is an explicit successful
+    /// response; socket accept order is NOT tensor-parallel rank order. A whole
     /// layer's worth on this model is under two gibibytes, and the write
     /// blocks against rank 0's read of it, which rank 0 makes after its own
     /// export -- so the socket buffer, not a second thread, absorbs the skew.
-    pub fn send_cuts(&mut self, cuts: &[super::learned::LearnedCut]) -> Result<()> {
+    pub fn send_cuts(&mut self, cuts: &[super::learned::LearnedCut], model_identity: [u8; 32]) -> Result<()> {
         anyhow::ensure!(
             self.tp.rank() != 0,
             "rank 0 collects learned cuts; it has nobody to send them to"
@@ -614,6 +622,9 @@ impl Group {
             .socks
             .first_mut()
             .context("this rank has no rendezvous socket to rank 0")?;
+        peer.write_all(&(self.tp.rank() as u32).to_be_bytes())
+            .context("send the exporting rank")?;
+        peer.write_all(&model_identity).context("send the export's model identity")?;
         peer.write_all(&(cuts.len() as u32).to_be_bytes())
             .context("send the learned-cut count")?;
         let mut frame = Vec::new();
@@ -629,26 +640,36 @@ impl Group {
 
     /// Receive every other rank's learned cuts after leading [`Pass::Export`].
     /// Only rank 0 may call it.
-    pub fn recv_cuts(&mut self) -> Result<Vec<super::learned::LearnedCut>> {
+    pub fn recv_cuts(&mut self) -> Result<Vec<super::learned::RankExport>> {
         anyhow::ensure!(
             self.tp.rank() == 0,
             "only rank 0 collects learned cuts; rank {} sends its own",
             self.tp.rank()
         );
-        let mut cuts = Vec::new();
+        let mut exports = Vec::new();
         for (index, peer) in self.socks.iter_mut().enumerate() {
+            let mut rank = [0u8; 4];
+            let mut model_identity = [0u8; 32];
+            peer.read_exact(&mut rank).context("receive the exporting rank")?;
+            let rank = u32::from_be_bytes(rank);
+            anyhow::ensure!(rank > 0 && (rank as usize) < self.tp.world(), "invalid exporting peer rank {rank}");
+            peer.read_exact(&mut model_identity).context("receive the export's model identity")?;
             let mut count = [0u8; 4];
             peer.read_exact(&mut count)
                 .with_context(|| format!("receive peer {index}'s learned-cut count"))?;
             let count = u32::from_be_bytes(count) as usize;
+            let mut cuts = Vec::new();
             for i in 0..count {
                 cuts.push(
                     super::learned::LearnedCut::decode(peer)
                         .with_context(|| format!("receive peer {index}'s learned cut {i}/{count}"))?,
                 );
             }
+            exports.push(super::learned::RankExport {
+                rank, world: self.tp.world() as u32, model_identity, cuts,
+            });
         }
-        Ok(cuts)
+        Ok(exports)
     }
 
     /// Whether every peer's end of the rank link is still open.
@@ -738,6 +759,9 @@ fn connect_with_deadline(addr: &str, wait: Duration) -> Result<TcpStream> {
 /// and the order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Pass {
+    /// Background work ordered by rank zero. Only an explicitly included
+    /// foreground row produces a token in the live conversation.
+    Distill(super::sdft::Work),
     /// `Session::prefill` over these ids: the first pass of a sequence.
     Prefill(Vec<usize>),
     /// `Session::extend` over these ids: carry, then whatever is new.
@@ -801,6 +825,9 @@ impl Pass {
     const EVICT: u8 = 0x0D;
     const CHECKPOINT: u8 = 0x0E;
     const REWIND: u8 = 0x0F;
+    // A private command ordinal, not a durable schema or model identifier.
+    const DISTILL: u8 = Self::REWIND + 1;
+    const MAX_DISTILL_BYTES: usize = 16 * 1024 * 1024;
 
     /// `[tag u8][count u32be][count x u32be ids]`.
     ///
@@ -809,6 +836,18 @@ impl Pass {
     /// generated token after the first costs — is NINE bytes: one tag, one
     /// u32be count, one u32be id.
     fn encode(&self) -> Vec<u8> {
+        if let Pass::Distill(work) = self {
+            // Structured learning work is infrequent control data; the
+            // ordinary one-token serving frame remains nine bytes. One bulk
+            // read also avoids a socket read per token in a long prompt.
+            let bytes = serde_json::to_vec(work).expect("integer-valued SDFT work serializes");
+            assert!(bytes.len() <= Self::MAX_DISTILL_BYTES, "SDFT work exceeds its frame budget");
+            let mut frame = Vec::with_capacity(5 + bytes.len());
+            frame.push(Self::DISTILL);
+            frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            frame.extend_from_slice(&bytes);
+            return frame;
+        }
         // `[tag][count u32be][slot u32be][count bytes]`: the count is the
         // byte count here, and the reader knows the tag before it reads on.
         let payload = match self {
@@ -850,7 +889,7 @@ impl Pass {
                 one_id = [*index];
                 (Self::REWIND, &one_id[..])
             }
-            Pass::Audio { .. } | Pass::Vision { .. } => unreachable!("encoded above"),
+            Pass::Audio { .. } | Pass::Vision { .. } | Pass::Distill(_) => unreachable!("encoded above"),
         };
         let mut frame = Vec::with_capacity(5 + 4 * ids.len());
         frame.push(tag);
@@ -859,6 +898,11 @@ impl Pass {
             frame.extend_from_slice(&(*id as u32).to_be_bytes());
         }
         frame
+    }
+
+    fn decode_distillation(bytes: &[u8]) -> Result<Self> {
+        anyhow::ensure!(bytes.len() <= Self::MAX_DISTILL_BYTES, "SDFT work exceeds its frame budget");
+        Ok(Pass::Distill(serde_json::from_slice(bytes).context("decode SDFT work")?))
     }
 
     fn decode(tag: u8, ids: Vec<usize>) -> Result<Self> {
@@ -873,8 +917,8 @@ impl Pass {
             Ok(())
         }
         Ok(match tag {
-            Self::AUDIO | Self::VISION => {
-                anyhow::bail!("a sense frame is read by Group::follow itself")
+            Self::AUDIO | Self::VISION | Self::DISTILL => {
+                anyhow::bail!("a byte payload frame is read by Group::follow itself")
             }
             Self::EVICT => {
                 anyhow::ensure!(
@@ -1174,6 +1218,28 @@ pub fn reduce_activation(
 #[cfg(test)]
 mod tests {
     use super::Pass;
+
+    #[test]
+    fn distillation_work_round_trips_without_becoming_foreground_tokens() {
+        use crate::models::inkling::sdft::{PreparedExample, Work};
+        for work in [
+            Work::Prepare { slot: 2, example: PreparedExample { student: vec![1, 2], teacher: vec![3, 4, 5] } },
+            Work::Decode { active: Some(7), slots: vec![2, 0], tokens: vec![10, 11] },
+            Work::Decode { active: None, slots: vec![0], tokens: vec![5] },
+            Work::Score { slot: 2, continuation: vec![10, 11], student_version: u32::MAX as u64 + 9 },
+            Work::Learn { slot: 2, student_version: 7, teacher_version: 3 },
+            Work::UpdateTeacher { student_version: 9, teacher_version: 3 },
+        ] {
+            let pass = Pass::Distill(work);
+            let frame = pass.encode();
+            let count = u32::from_be_bytes(frame[1..5].try_into().unwrap()) as usize;
+            assert_eq!(frame[0], Pass::DISTILL);
+            assert_eq!(frame.len(), count + 5);
+            assert_eq!(Pass::decode_distillation(&frame[5..]).unwrap(), pass);
+            assert!(Pass::decode_distillation(&frame[5..frame.len() - 1]).is_err());
+        }
+        assert!(Pass::decode_distillation(br#"{"op":"decode","active":null,"slots":[],"tokens":[],"surprise":1}"#).is_err());
+    }
 
     /// The rank link's framing, which is the ONLY thing the two boxes now say
     /// to each other outside NCCL.
