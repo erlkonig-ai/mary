@@ -1807,12 +1807,19 @@ mod tests {
             .put::<blobencodings::SimpleArchive, _>(entity! { metadata::tag: test_id(0x56) })
             .unwrap();
         let data = inlineencodings::Handle::<blobencodings::SimpleArchive>::to_hash(data_handle);
-        let mut bytes = CollectionCommit::sign(&old, source, data, metadata).to_bytes();
+        let valid = CollectionCommit::sign(&old, source, data, metadata);
+        let mut bytes = valid.to_bytes();
         bytes[5 * 32] ^= 1;
-        pile.insert(CollectionRecord::Commit(CollectionCommit::from_bytes(
-            bytes,
-        )))
-        .unwrap();
+        assert!(CollectionCommit::from_bytes(bytes).is_err());
+        pile.insert(CollectionRecord::Commit(valid)).unwrap();
+        pile.close().unwrap();
+
+        // The checked foreign decoder rejects bad signatures. Corrupt this
+        // fixture's final persisted COMMIT so the migration audits local evidence.
+        let mut raw = std::fs::read(path.path()).unwrap();
+        *raw.last_mut().unwrap() ^= 1;
+        std::fs::write(path.path(), raw).unwrap();
+        let mut pile = Pile::open(path.path()).unwrap();
 
         assert_policy_transfer_fails_before_publication(
             &mut pile,
