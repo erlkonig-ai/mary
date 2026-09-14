@@ -63,12 +63,13 @@
 
 use anyhow::{Context, Result};
 
+use super::cache_pile::{CacheCommand, CacheConfig, CacheKey, CacheReply, CacheStore, Prefix};
 use super::resident::{
     Consult, ContextPlacement, ContextPreflight, ContextPreflighted, ExecutionManifest,
-    InklingContext, InklingContextCodec, Model, Ready, Reinitialized, TurnEnd, context_preflight, SenseMedia,
+    InklingContext, InklingContextCodec, Model, Ready, Reinitialized, SenseMedia, TurnEnd,
+    context_preflight,
 };
 use super::session::{Session, SessionConfig};
-use super::cache_pile::{CacheCommand, CacheConfig, CacheKey, CacheReply, CacheStore, Prefix};
 use super::tp::Tp;
 use super::tpcomm::{Group, Pass, transport_note};
 
@@ -213,11 +214,15 @@ pub struct Follower {
 pub fn load(config: EngineConfig) -> Result<Loaded> {
     super::session::validate_weight_storage(config.weight_storage, config.distillation.is_some())?;
     if let Some(cache) = &config.cache {
-        anyhow::ensure!(config.distillation.is_none(),
-            "durable inference caches do not snapshot an SDFT teacher, optimizer or sampler");
+        anyhow::ensure!(
+            config.distillation.is_none(),
+            "durable inference caches do not snapshot an SDFT teacher, optimizer or sampler"
+        );
         if cache.pile.exists() {
-            anyhow::ensure!(std::fs::canonicalize(&cache.pile)? != std::fs::canonicalize(&config.pile)?,
-                "the cache must not be the model pile");
+            anyhow::ensure!(
+                std::fs::canonicalize(&cache.pile)? != std::fs::canonicalize(&config.pile)?,
+                "the cache must not be the model pile"
+            );
         }
     }
     let cache = config.cache.as_ref().map(CacheStore::open).transpose()?;
@@ -261,7 +266,10 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     execution_manifest.field("preallocate_kv", &[u8::from(config.preallocate_kv)]);
     execution_manifest.field("weight_arena", b"explicit-storage-v1");
     execution_manifest.field("weight_storage", config.weight_storage.as_str().as_bytes());
-    execution_manifest.field("cached_attention", config.cached_attention.as_str().as_bytes());
+    execution_manifest.field(
+        "cached_attention",
+        config.cached_attention.as_str().as_bytes(),
+    );
     let prefill_budget = session_config.prefill_budget;
     let context_budget = session_config.context_budget;
     let extend_batch = session_config.extend_batch;
@@ -287,8 +295,11 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
             );
             let mut group = Group::form_default(tensor_parallel.tp, &tensor_parallel.rendezvous)
                 .context("form the tensor-parallel group")?;
-            group.agree_cached_attention(config.cached_attention)
-                .context("agree on cached-attention policy before collective warmup and weight loading")?;
+            group
+                .agree_cached_attention(config.cached_attention)
+                .context(
+                    "agree on cached-attention policy before collective warmup and weight loading",
+                )?;
             group
                 .warm()
                 .context("warm and verify the tensor-parallel group")?;
@@ -322,12 +333,16 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
             "the model collection in {} carries more than one tokenizer",
             config.pile.display()
         );
-        let tokenizer = crate::tokenizer::build_tokenizer(facts, source.reader(), tok_id)
-            .map_err(|error| anyhow::anyhow!("build the tokenizer from the model graph: {error}"))?;
+        let tokenizer =
+            crate::tokenizer::build_tokenizer(facts, source.reader(), tok_id).map_err(|error| {
+                anyhow::anyhow!("build the tokenizer from the model graph: {error}")
+            })?;
         let content =
             crate::tokenizer::build_tokenizer_with_added(facts, source.reader(), tok_id, false)
                 .map_err(|error| {
-                    anyhow::anyhow!("build the content-only tokenizer from the model graph: {error}")
+                    anyhow::anyhow!(
+                        "build the content-only tokenizer from the model graph: {error}"
+                    )
                 })?;
         (format!("{tok_id:X}"), tokenizer, content)
     };
@@ -422,9 +437,11 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // The one place the two ranks' code diverges, and it is one `if`.
     if tp_rank.is_some_and(|rank| rank != 0) {
         drop(codec);
-        let distillation = config.distillation.clone().map(|cfg| {
-            super::sdft_runtime::Runtime::new(&mut session, cfg)
-        }).transpose()?;
+        let distillation = config
+            .distillation
+            .clone()
+            .map(|cfg| super::sdft_runtime::Runtime::new(&mut session, cfg))
+            .transpose()?;
         return Ok(Loaded::Follower(Follower {
             session,
             cache,
@@ -442,19 +459,33 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     // carried token is never advanced twice: it entered this sequence when it
     // was generated, while `carry` only catches the KV cache up to that fact.
     let tokenizer: &'static tokenizers::Tokenizer = Box::leak(Box::new(tokenizer));
-    let distillation = config.distillation.clone().map(|cfg| {
-        super::sdft_runtime::Runtime::new(&mut session, cfg)
-    }).transpose()?;
-    let distillation_schedule = config.distillation.clone().map(|cfg| {
-        super::sdft_schedule::Scheduler::new(
-            cfg, vec![codec.special_ids().content_model_end_sampling as usize],
-        )
-    }).transpose()?;
+    let distillation = config
+        .distillation
+        .clone()
+        .map(|cfg| super::sdft_runtime::Runtime::new(&mut session, cfg))
+        .transpose()?;
+    let distillation_schedule = config
+        .distillation
+        .clone()
+        .map(|cfg| {
+            super::sdft_schedule::Scheduler::new(
+                cfg,
+                vec![codec.special_ids().content_model_end_sampling as usize],
+            )
+        })
+        .transpose()?;
     let distillation_samplers = match &config.distillation {
-        Some(cfg) => (0..cfg.sequences).map(|slot| crate::sampling::Sampler::new(
-            crate::sampling::SamplingConfig { temperature: cfg.temperature, ..Default::default() },
-            cfg.seed.wrapping_add(slot as u64),
-        )).collect::<Result<Vec<_>>>()?,
+        Some(cfg) => (0..cfg.sequences)
+            .map(|slot| {
+                crate::sampling::Sampler::new(
+                    crate::sampling::SamplingConfig {
+                        temperature: cfg.temperature,
+                        ..Default::default()
+                    },
+                    cfg.seed.wrapping_add(slot as u64),
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
         None => Vec::new(),
     };
     Ok(Loaded::Engine(Engine {
@@ -539,20 +570,40 @@ impl Follower {
             };
             match pass {
                 Pass::Cache(command) => {
-                    let result = rank_cache(&mut self.session, self.cache.as_mut(), &self.ready, &command);
-                    if result.is_ok() && let CacheCommand::Restore(prefix) = command {
+                    let result = rank_cache(
+                        &mut self.session,
+                        self.cache.as_mut(),
+                        &self.ready,
+                        &command,
+                    );
+                    if result.is_ok()
+                        && let CacheCommand::Restore(prefix) = command
+                    {
                         self.checkpoints.clear();
-                        self.digest = restored_digest(prefix, self.session.next_token()
-                            .context("restored cache has no next prediction")?);
+                        self.digest = restored_digest(
+                            prefix,
+                            self.session
+                                .next_token()
+                                .context("restored cache has no next prediction")?,
+                        );
                     }
                     let reply = CacheReply::from_result(result);
-                    self.session.group_mut().context("follower lost rank link")?.cache_replies(reply)?;
+                    self.session
+                        .group_mut()
+                        .context("follower lost rank link")?
+                        .cache_replies(reply)?;
                 }
                 Pass::Distill(work) => {
-                    let runtime = self.distillation.as_mut()
+                    let runtime = self
+                        .distillation
+                        .as_mut()
                         .context("rank zero requested SDFT without an admitted teacher")?;
                     let outcome = runtime.execute(&mut self.session, &work)?;
-                    if let super::sdft_runtime::Outcome::Decoded { foreground: Some(token), .. } = outcome {
+                    if let super::sdft_runtime::Outcome::Decoded {
+                        foreground: Some(token),
+                        ..
+                    } = outcome
+                    {
                         self.fold(token);
                     }
                 }
@@ -651,7 +702,9 @@ impl Follower {
                     group.send_cuts(&cuts, identity)?;
                 }
                 Pass::Finish => {
-                    if let Some(cache) = self.cache.take() { cache.close()?; }
+                    if let Some(cache) = self.cache.take() {
+                        cache.close()?;
+                    }
                     eprintln!("inkling: rank 0 ended the run; this rank is stopping cleanly");
                     return Ok(());
                 }
@@ -672,7 +725,9 @@ impl Follower {
 
 impl Drop for Follower {
     fn drop(&mut self) {
-        if let Some(cache) = self.cache.take() && let Err(error) = cache.close() {
+        if let Some(cache) = self.cache.take()
+            && let Err(error) = cache.close()
+        {
             eprintln!("inkling: could not close follower cache on drop: {error:#}");
         }
     }
@@ -706,32 +761,51 @@ fn rank_cache(
     let cache = cache.context("every rank must configure its own --kv-cache and --kv-cache-key")?;
     let compatibility = session.cache_identity()?;
     if let CacheCommand::Candidates { limit } = command {
-        return Ok(cache.candidates(compatibility, *limit)?.into_iter().map(|c| c.prefix).collect());
+        return Ok(cache
+            .candidates(compatibility, *limit)?
+            .into_iter()
+            .map(|c| c.prefix)
+            .collect());
     }
     let prefix = match command {
         CacheCommand::Save(prefix) | CacheCommand::Restore(prefix) => *prefix,
         CacheCommand::Candidates { .. } => unreachable!(),
     };
     let key = CacheKey {
-        model: session.model_identity(), compatibility,
-        rank: ready.tp_rank.unwrap_or(0), world: ready.tp_world, prefix,
+        model: session.model_identity(),
+        compatibility,
+        rank: ready.tp_rank.unwrap_or(0),
+        world: ready.tp_world,
+        prefix,
     };
     match command {
         CacheCommand::Save(_) => {
-            anyhow::ensure!(session.position() == prefix.position, "cache save position differs between ranks");
+            anyhow::ensure!(
+                session.position() == prefix.position,
+                "cache save position differs between ranks"
+            );
             cache.begin();
             let state = session.export_cache(&mut |bytes| cache.put_chunk(bytes))?;
             cache.publish(key, serde_json::to_value(state)?)?;
         }
         CacheCommand::Restore(_) => {
-            anyhow::ensure!(session.position() == 0, "cache restore requires a fresh session");
-            let candidate = cache.candidates(compatibility, prefix.position)?.into_iter()
-                .find(|candidate| candidate.prefix == prefix).context("the agreed cache prefix disappeared")?;
+            anyhow::ensure!(
+                session.position() == 0,
+                "cache restore requires a fresh session"
+            );
+            let candidate = cache
+                .candidates(compatibility, prefix.position)?
+                .into_iter()
+                .find(|candidate| candidate.prefix == prefix)
+                .context("the agreed cache prefix disappeared")?;
             let reader = cache.read(&candidate, &key)?;
-            let state = serde_json::from_value(reader.state.clone()).context("decode session cache state")?;
+            let state = serde_json::from_value(reader.state.clone())
+                .context("decode session cache state")?;
             session.restore_cache(&state, &mut |hash, bytes| reader.chunk(hash, bytes))?;
-            anyhow::ensure!(session.position() == prefix.position && session.next_token().is_some(),
-                "restored session does not match the agreed prefix");
+            anyhow::ensure!(
+                session.position() == prefix.position && session.next_token().is_some(),
+                "restored session does not match the agreed prefix"
+            );
         }
         CacheCommand::Candidates { .. } => unreachable!(),
     }
@@ -809,16 +883,31 @@ impl Engine {
         cancelled: &dyn Fn() -> bool,
         on_progress: &mut dyn FnMut(&WarmupProgress),
     ) -> Result<WarmupReport> {
-        anyhow::ensure!(!self.terminated && self.session.position() == 0 && self.turn == 0
-            && self.delta.is_empty() && self.carry.is_none()
-            && self.checkpoints.is_empty() && self.checkpoint_ends.is_empty(),
-            "warmup requires an unused engine without RAM rewind points");
-        anyhow::ensure!(self.cache.is_some() && self.distillation.is_none() && !self.session.learning(),
-            "warmup requires a durable cache and an inference-only model");
-        anyhow::ensure!(matches!(context, InklingContext::Initialize { .. }),
-            "warmup prepares exactly one Initialize context");
-        anyhow::ensure!(self.codec.media(context).into_iter().all(|m| matches!(m, SenseMedia::Text { .. })),
-            "initial warmup caches support text only; staged media is not a token-prefix identity");
+        anyhow::ensure!(
+            !self.terminated
+                && self.session.position() == 0
+                && self.turn == 0
+                && self.delta.is_empty()
+                && self.carry.is_none()
+                && self.checkpoints.is_empty()
+                && self.checkpoint_ends.is_empty(),
+            "warmup requires an unused engine without RAM rewind points"
+        );
+        anyhow::ensure!(
+            self.cache.is_some() && self.distillation.is_none() && !self.session.learning(),
+            "warmup requires a durable cache and an inference-only model"
+        );
+        anyhow::ensure!(
+            matches!(context, InklingContext::Initialize { .. }),
+            "warmup prepares exactly one Initialize context"
+        );
+        anyhow::ensure!(
+            self.codec
+                .media(context)
+                .into_iter()
+                .all(|m| matches!(m, SenseMedia::Text { .. })),
+            "initial warmup caches support text only; staged media is not a token-prefix identity"
+        );
         self.context(context)?;
         let ids = std::mem::take(&mut self.delta);
         self.delta_unscored = false;
@@ -828,13 +917,22 @@ impl Engine {
     fn cache_command(&mut self, command: CacheCommand) -> Result<Vec<Vec<Prefix>>> {
         self.lead(&Pass::Cache(command.clone()))?;
         let local = CacheReply::from_result(rank_cache(
-            &mut self.session, self.cache.as_mut(), &self.ready, &command,
+            &mut self.session,
+            self.cache.as_mut(),
+            &self.ready,
+            &command,
         ));
-        if local.error.is_none() && let CacheCommand::Restore(prefix) = command {
+        if local.error.is_none()
+            && let CacheCommand::Restore(prefix) = command
+        {
             self.checkpoints.clear();
             self.checkpoint_ends.clear();
-            self.digest = restored_digest(prefix, self.session.next_token()
-                .context("restored cache has no next prediction")?);
+            self.digest = restored_digest(
+                prefix,
+                self.session
+                    .next_token()
+                    .context("restored cache has no next prediction")?,
+            );
         }
         let replies = match self.session.group_mut() {
             Some(group) => group.cache_replies(local)?,
@@ -852,7 +950,10 @@ impl Engine {
     }
 
     fn restore_common_prefix(&mut self, ids: &[usize], mode: PrefixMode) -> Result<usize> {
-        anyhow::ensure!(self.session.position() == 0, "resume requires a fresh cache");
+        anyhow::ensure!(
+            self.session.position() == 0,
+            "resume requires a fresh cache"
+        );
         let offers = self.cache_command(CacheCommand::Candidates { limit: ids.len() })?;
         let selected = super::cache_pile::common_prefix(ids, &offers)?;
         if let Some(prefix) = selected {
@@ -860,8 +961,11 @@ impl Engine {
             self.cache_command(CacheCommand::Restore(prefix))?;
             self.agree_sequence()?;
             mode.checkpoint(|| self.take_checkpoint(true))?;
-            eprintln!("inkling-cache: restored_tokens={} restore_host_seconds={:.6}",
-                prefix.position, start.elapsed().as_secs_f64());
+            eprintln!(
+                "inkling-cache: restored_tokens={} restore_host_seconds={:.6}",
+                prefix.position,
+                start.elapsed().as_secs_f64()
+            );
             return Ok(prefix.position);
         }
         Ok(0)
@@ -872,8 +976,10 @@ impl Engine {
         let prefix = super::cache_pile::token_prefix(&ids[..position])?;
         let start = std::time::Instant::now();
         self.cache_command(CacheCommand::Save(prefix))?;
-        eprintln!("inkling-cache: saved_tokens={position} checkpoint_host_seconds={:.6}",
-            start.elapsed().as_secs_f64());
+        eprintln!(
+            "inkling-cache: saved_tokens={position} checkpoint_host_seconds={:.6}",
+            start.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 
@@ -884,38 +990,70 @@ impl Engine {
         cancelled: &dyn Fn() -> bool,
         on_progress: &mut dyn FnMut(&WarmupProgress),
     ) -> Result<WarmupReport> {
-        anyhow::ensure!(!ids.is_empty() && ids.len() <= self.context_budget,
-            "prepared prefix must fit the admitted context budget");
-        anyhow::ensure!(!self.session.learning() && self.distillation.is_none()
-            && self.delta_audio.is_empty() && self.delta_vision.is_empty(),
-            "prepared-prefix caching requires text-only inference without learning");
+        anyhow::ensure!(
+            !ids.is_empty() && ids.len() <= self.context_budget,
+            "prepared prefix must fit the admitted context budget"
+        );
+        anyhow::ensure!(
+            !self.session.learning()
+                && self.distillation.is_none()
+                && self.delta_audio.is_empty()
+                && self.delta_vision.is_empty(),
+            "prepared-prefix caching requires text-only inference without learning"
+        );
         if cancelled() {
-            on_progress(&WarmupProgress { total_tokens: ids.len(), ..Default::default() });
-            return Ok(WarmupReport { total_tokens: ids.len(), cancelled: true, ..Default::default() });
+            on_progress(&WarmupProgress {
+                total_tokens: ids.len(),
+                ..Default::default()
+            });
+            return Ok(WarmupReport {
+                total_tokens: ids.len(),
+                cancelled: true,
+                ..Default::default()
+            });
         }
         let restored = self.restore_common_prefix(ids, mode)?;
         let mut progress = WarmupProgress {
-            restored_tokens: restored, prepared_tokens: restored,
-            saved_tokens: restored, total_tokens: ids.len(),
+            restored_tokens: restored,
+            prepared_tokens: restored,
+            saved_tokens: restored,
+            total_tokens: ids.len(),
         };
         on_progress(&progress);
-        let spacing = self.cache.as_ref().context("prefix caching is not configured")?.checkpoint_tokens;
+        let spacing = self
+            .cache
+            .as_ref()
+            .context("prefix caching is not configured")?
+            .checkpoint_tokens;
         let width = self.ready.prefill_budget.max(1);
-        let mut next_save = restored.checked_div(spacing).and_then(|n| n.checked_add(1))
-            .and_then(|n| n.checked_mul(spacing)).unwrap_or(usize::MAX);
+        let mut next_save = restored
+            .checked_div(spacing)
+            .and_then(|n| n.checked_add(1))
+            .and_then(|n| n.checked_mul(spacing))
+            .unwrap_or(usize::MAX);
         let mut was_cancelled = cancelled();
         while progress.prepared_tokens < ids.len() && !was_cancelled {
             let from = progress.prepared_tokens;
             let to = from.saturating_add(width).min(ids.len()).min(next_save);
-            let pass = if from == 0 { Pass::Prefill(ids[from..to].to_vec()) }
-                else { Pass::Extend(ids[from..to].to_vec()) };
+            let pass = if from == 0 {
+                Pass::Prefill(ids[from..to].to_vec())
+            } else {
+                Pass::Extend(ids[from..to].to_vec())
+            };
             let start = std::time::Instant::now();
             self.pass(pass)?;
             progress.prepared_tokens = self.session.position();
-            anyhow::ensure!(progress.prepared_tokens == to, "warmup pass advanced an unexpected number of rows");
-            let epoch = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis();
-            eprintln!("inkling-warmup: chunk_start={from} chunk_end={to} end_unix_ms={epoch} model_host_seconds={:.6}",
-                start.elapsed().as_secs_f64());
+            anyhow::ensure!(
+                progress.prepared_tokens == to,
+                "warmup pass advanced an unexpected number of rows"
+            );
+            let epoch = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis();
+            eprintln!(
+                "inkling-warmup: chunk_start={from} chunk_end={to} end_unix_ms={epoch} model_host_seconds={:.6}",
+                start.elapsed().as_secs_f64()
+            );
             if to >= next_save || to == ids.len() {
                 mode.checkpoint(|| self.take_checkpoint(to == ids.len()))?;
                 self.save_prefix(ids, to)?;
@@ -932,8 +1070,11 @@ impl Engine {
             on_progress(&progress);
         }
         Ok(WarmupReport {
-            restored_tokens: restored, prepared_tokens: progress.prepared_tokens,
-            saved_tokens: progress.saved_tokens, total_tokens: ids.len(), cancelled: was_cancelled,
+            restored_tokens: restored,
+            prepared_tokens: progress.prepared_tokens,
+            saved_tokens: progress.saved_tokens,
+            total_tokens: ids.len(),
+            cancelled: was_cancelled,
         })
     }
 
@@ -946,18 +1087,29 @@ impl Engine {
     /// foreground context. Preparation runs only at a background-work boundary.
     pub fn enqueue_distillation(&mut self, example: super::sdft::Example) -> Result<()> {
         example.validate()?;
-        let config = self.distillation_config.as_ref()
+        let config = self
+            .distillation_config
+            .as_ref()
             .context("self-distillation was not admitted when the model loaded")?;
         let prepared = super::sdft::PreparedExample {
-            student: self.codec.encode_distillation_prompt(&example.prompt, None)?,
-            teacher: self.codec.encode_distillation_prompt(&example.prompt, Some(&example.demonstration))?,
+            student: self
+                .codec
+                .encode_distillation_prompt(&example.prompt, None)?,
+            teacher: self
+                .codec
+                .encode_distillation_prompt(&example.prompt, Some(&example.demonstration))?,
         };
         prepared.validate(config, self.session.config().text_config.effective_vocab())?;
-        self.distillation_schedule.as_mut().expect("admitted scheduler").enqueue(prepared)
+        self.distillation_schedule
+            .as_mut()
+            .expect("admitted scheduler")
+            .enqueue(prepared)
     }
 
     pub fn distillation_pending(&self) -> bool {
-        self.distillation_schedule.as_ref().is_some_and(|schedule| schedule.pending())
+        self.distillation_schedule
+            .as_ref()
+            .is_some_and(|schedule| schedule.pending())
     }
 
     /// Execute one background operation. This is a cooperative boundary, not a
@@ -965,18 +1117,26 @@ impl Engine {
     /// teacher scoring and backward are deliberately absent from `pass`.
     pub fn background_step(&mut self) -> Result<bool> {
         anyhow::ensure!(!self.terminated, "cannot learn after model shutdown");
-        let Some(runtime) = &self.distillation else { return Ok(false); };
-        let work = self.distillation_schedule.as_ref().expect("admitted scheduler")
+        let Some(runtime) = &self.distillation else {
+            return Ok(false);
+        };
+        let work = self
+            .distillation_schedule
+            .as_ref()
+            .expect("admitted scheduler")
             .next_idle(runtime.version(), runtime.teacher_version())?;
-        let Some(work) = work else { return Ok(false); };
+        let Some(work) = work else {
+            return Ok(false);
+        };
         self.run_distillation(work)?;
         Ok(true)
     }
 
     fn distillation_decode_work(&self, active: usize) -> Result<Option<super::sdft::Work>> {
         match (&self.distillation, &self.distillation_schedule) {
-            (Some(runtime), Some(schedule)) =>
-                schedule.next_decode(active, runtime.version(), runtime.teacher_version()),
+            (Some(runtime), Some(schedule)) => {
+                schedule.next_decode(active, runtime.version(), runtime.teacher_version())
+            }
             _ => Ok(None),
         }
     }
@@ -984,7 +1144,9 @@ impl Engine {
     fn run_distillation(&mut self, work: super::sdft::Work) -> Result<Option<usize>> {
         use super::sdft::{Report, Work};
         use super::sdft_runtime::Outcome;
-        self.distillation.as_ref().context("SDFT runtime not admitted")?
+        self.distillation
+            .as_ref()
+            .context("SDFT runtime not admitted")?
             .validate(&self.session, &work)?;
         self.lead(&Pass::Distill(work.clone()))?;
         let start = std::time::Instant::now();
@@ -996,35 +1158,64 @@ impl Engine {
             (Work::Prepare { slot, .. }, Outcome::Logits(logits)) => {
                 let values = super::assembly::down(logits);
                 let token = self.distillation_samplers[slot].token(&values)?;
-                self.distillation_schedule.as_mut().expect("admitted scheduler")
+                self.distillation_schedule
+                    .as_mut()
+                    .expect("admitted scheduler")
                     .prepared(slot, token, student_version, teacher_version)?;
                 Ok(None)
             }
             (Work::Decode { active, slots, .. }, Outcome::Decoded { foreground, logits }) => {
                 let [rows, vocab] = logits.dims();
                 let offset = usize::from(active.is_some());
-                anyhow::ensure!(rows == slots.len() + offset && active.is_some() == foreground.is_some(),
-                    "SDFT batch output does not match the ordered work");
+                anyhow::ensure!(
+                    rows == slots.len() + offset && active.is_some() == foreground.is_some(),
+                    "SDFT batch output does not match the ordered work"
+                );
                 let values = super::assembly::down(logits);
                 let mut sampled = Vec::with_capacity(slots.len());
                 for (row, &slot) in slots.iter().enumerate() {
                     let begin = (row + offset) * vocab;
-                    sampled.push(self.distillation_samplers[slot].token(&values[begin..begin + vocab])?);
+                    sampled.push(
+                        self.distillation_samplers[slot].token(&values[begin..begin + vocab])?,
+                    );
                 }
-                self.distillation_schedule.as_mut().expect("admitted scheduler")
+                self.distillation_schedule
+                    .as_mut()
+                    .expect("admitted scheduler")
                     .decoded(&slots, &sampled)?;
                 if let Some(token) = foreground {
                     fold_pass(&mut self.digest, token, self.session.position());
                 }
                 Ok(foreground)
             }
-            (Work::Score { slot, .. }, Outcome::Scored { rows, teacher_version }) => {
-                self.distillation_schedule.as_mut().expect("admitted scheduler").scored(slot)?;
-                eprintln!("inkling-sdft: scored slot={slot} teacher={teacher_version} rows={rows} wall_seconds={:.6}", start.elapsed().as_secs_f64());
+            (
+                Work::Score { slot, .. },
+                Outcome::Scored {
+                    rows,
+                    teacher_version,
+                },
+            ) => {
+                self.distillation_schedule
+                    .as_mut()
+                    .expect("admitted scheduler")
+                    .scored(slot)?;
+                eprintln!(
+                    "inkling-sdft: scored slot={slot} teacher={teacher_version} rows={rows} wall_seconds={:.6}",
+                    start.elapsed().as_secs_f64()
+                );
                 Ok(None)
             }
-            (Work::Learn { slot, student_version: rollout_version, teacher_version }, Outcome::Learned(report)) => {
-                self.distillation_schedule.as_mut().expect("admitted scheduler")
+            (
+                Work::Learn {
+                    slot,
+                    student_version: rollout_version,
+                    teacher_version,
+                },
+                Outcome::Learned(report),
+            ) => {
+                self.distillation_schedule
+                    .as_mut()
+                    .expect("admitted scheduler")
                     .learned(slot, student_version)?;
                 let report = Report {
                     student_version: rollout_version,
@@ -1037,9 +1228,17 @@ impl Engine {
                 Ok(None)
             }
             (Work::UpdateTeacher { .. }, Outcome::TeacherUpdated(report)) => {
-                self.distillation_schedule.as_mut().expect("admitted scheduler").teacher_updated()?;
-                eprintln!("inkling-sdft: teacher version={} student={} bytes={} enqueue_seconds={:.6}",
-                    report.version, report.student_step, report.bytes.total, start.elapsed().as_secs_f64());
+                self.distillation_schedule
+                    .as_mut()
+                    .expect("admitted scheduler")
+                    .teacher_updated()?;
+                eprintln!(
+                    "inkling-sdft: teacher version={} student={} bytes={} enqueue_seconds={:.6}",
+                    report.version,
+                    report.student_step,
+                    report.bytes.total,
+                    start.elapsed().as_secs_f64()
+                );
                 Ok(None)
             }
             _ => anyhow::bail!("SDFT runtime returned the wrong kind of result"),
@@ -1061,7 +1260,9 @@ impl Engine {
         if let Some(active) = active
             && let Some(work) = self.distillation_decode_work(active)?
         {
-            return self.run_distillation(work)?.context("a foreground batch produced no foreground token");
+            return self
+                .run_distillation(work)?
+                .context("a foreground batch produced no foreground token");
         }
         self.lead(&pass)?;
         let token = match &pass {
@@ -1137,7 +1338,9 @@ impl Engine {
     /// [`super::learned`] for why the identity of the resulting model is
     /// still an open decision.
     pub fn export_learned(&mut self) -> Result<Vec<super::learned::LearnedExpert>> {
-        let Some(layer) = self.session.trainable_layer() else { return Ok(Vec::new()); };
+        let Some(layer) = self.session.trainable_layer() else {
+            return Ok(Vec::new());
+        };
         if self.session.group_mut().is_some() {
             self.lead(&Pass::Export)?;
         }
@@ -1147,14 +1350,20 @@ impl Engine {
             .context("export rank 0's learned experts")?;
         let world = self.ready.tp_world;
         let mut exports = vec![super::learned::RankExport {
-            rank: 0, world: world as u32, model_identity: self.session.model_identity(), cuts,
+            rank: 0,
+            world: world as u32,
+            model_identity: self.session.model_identity(),
+            cuts,
         }];
         if let Some(group) = self.session.group_mut() {
             exports.extend(group.recv_cuts()?);
         }
         super::learned::assemble_completed_exports(
-            self.session.source(), world, layer,
-            self.session.config().text_config.n_routed_experts, exports,
+            self.session.source(),
+            world,
+            layer,
+            self.session.config().text_config.n_routed_experts,
+            exports,
         )
     }
 
@@ -1290,13 +1499,23 @@ impl Engine {
                     Pass::Prefill(ids) | Pass::Extend(ids) => ids,
                     other => anyhow::bail!("{other:?} is not a pass that installs a cover"),
                 };
-                if self.cache.is_some() && self.session.position() == 0
-                    && self.carry.is_none() && self.cover_base == 0
+                if self.cache.is_some()
+                    && self.session.position() == 0
+                    && self.carry.is_none()
+                    && self.cover_base == 0
                 {
-                    self.prepare_cached_prefix(&ids, PrefixMode::LivePrefix, &|| false, &mut |_| {})?;
+                    self.prepare_cached_prefix(
+                        &ids,
+                        PrefixMode::LivePrefix,
+                        &|| false,
+                        &mut |_| {},
+                    )?;
                     // A fully restored prefix already has its next prediction.
                     // Extend([]) would Step and silently append an extra token.
-                    let first = self.session.next_token().context("prepared prefix has no prediction")?;
+                    let first = self
+                        .session
+                        .next_token()
+                        .context("prepared prefix has no prediction")?;
                     (first, super::session::ScoredNll::default())
                 } else {
                     let spacing = Self::checkpoint_spacing();
@@ -1412,7 +1631,9 @@ impl Engine {
     fn take_checkpoint(&mut self, end: bool) -> Result<()> {
         let pos = self.session.position();
         let mut index = self.checkpoints.len();
-        if let (true, Some(last), Some(true)) = (end, self.checkpoints.last(), self.checkpoint_ends.last()) {
+        if let (true, Some(last), Some(true)) =
+            (end, self.checkpoints.last(), self.checkpoint_ends.last())
+        {
             if pos < last.position() + Self::checkpoint_spacing() / 2 {
                 index -= 1;
             }
@@ -1428,7 +1649,11 @@ impl Engine {
         self.checkpoint_ends.push(end);
         eprintln!(
             "inkling: rewind point {index} at position {pos}{}",
-            if end { " (end of the installed delta)" } else { "" }
+            if end {
+                " (end of the installed delta)"
+            } else {
+                ""
+            }
         );
         Ok(())
     }
@@ -1493,7 +1718,8 @@ impl Model for Engine {
                 .codec
                 .encode_with_parts(context)
                 .context("locate the cover's parts")?;
-            let base = self.session.position() + usize::from(self.carry.is_some()) + self.delta.len();
+            let base =
+                self.session.position() + usize::from(self.carry.is_some()) + self.delta.len();
             if matches!(context, InklingContext::Initialize { .. }) {
                 self.cover_base = base;
                 self.cover_ids.clear();
@@ -1698,7 +1924,9 @@ impl Model for Engine {
             self.lead(&Pass::Rewind { index })?;
             let cp = &self.checkpoints[index];
             let at = cp.position();
-            self.session.rewind(cp).context("rewind rank 0 to the point")?;
+            self.session
+                .rewind(cp)
+                .context("rewind rank 0 to the point")?;
             self.checkpoints.truncate(index + 1);
             self.checkpoint_ends.truncate(index + 1);
             at
@@ -1719,7 +1947,8 @@ impl Model for Engine {
         };
         // The unchanged tail between the point and the first changed recall
         // goes back in first, exactly as it was, unscored.
-        let replay: Vec<usize> = self.cover_ids[at - self.cover_base..position - self.cover_base].to_vec();
+        let replay: Vec<usize> =
+            self.cover_ids[at - self.cover_base..position - self.cover_base].to_vec();
         self.cover_ids.truncate(position - self.cover_base);
         self.parts.retain(|&p| p < position);
         self.carry = None;
@@ -1740,8 +1969,13 @@ impl Model for Engine {
         if self.terminated || !self.session.learning() {
             return Ok(None);
         }
-        anyhow::ensure!(!self.distillation.as_ref().is_some_and(|runtime| runtime.is_poisoned()),
-            "cannot persist weights after an interrupted background update");
+        anyhow::ensure!(
+            !self
+                .distillation
+                .as_ref()
+                .is_some_and(|runtime| runtime.is_poisoned()),
+            "cannot persist weights after an interrupted background update"
+        );
         let Some(key_path) = self.signing_key.clone() else {
             return Ok(None);
         };
@@ -1758,7 +1992,10 @@ impl Model for Engine {
         // one optimizer step per foreground turn.
         let recipe = match (&self.distillation_config, &self.distillation) {
             (Some(config), Some(runtime)) => distillation_recipe(
-                recipe, config, runtime.version(), runtime.teacher_version(),
+                recipe,
+                config,
+                runtime.version(),
+                runtime.teacher_version(),
                 &self.ready.execution_identity,
             )?,
             _ => recipe.clone(),
@@ -1790,7 +2027,8 @@ impl Model for Engine {
             Ok(())
         } else {
             self.terminated = true;
-            self.announce(Pass::Finish).context("tell the peer rank the run is over")
+            self.announce(Pass::Finish)
+                .context("tell the peer rank the run is over")
         };
         // Release the peer even if local storage fails to close, and close
         // locally even when the peer link is already gone after an abort.
@@ -1902,7 +2140,8 @@ fn sealed_environment_rejections(names: impl IntoIterator<Item = String>) -> Vec
             let rank_local = RANK_LOCAL_EXACT.contains(&name.as_str())
                 || name == "NCCL_DEBUG"
                 || name.starts_with("NCCL_DEBUG_");
-            !rank_local && !HOST_DIAGNOSTICS.contains(&name.as_str())
+            !rank_local
+                && !HOST_DIAGNOSTICS.contains(&name.as_str())
                 && (EXACT.contains(&name.as_str())
                     || PREFIXES.iter().any(|prefix| name.starts_with(prefix)))
         })
@@ -2224,7 +2463,9 @@ mod tests {
                 signing_key: None,
                 distillation: Some(super::super::sdft::Config::default()),
             };
-            let error = super::load(config).err().expect("inference-only SDFT must be refused");
+            let error = super::load(config)
+                .err()
+                .expect("inference-only SDFT must be refused");
             assert!(error.to_string().contains("weights require inference only"));
         }
     }
@@ -2233,10 +2474,12 @@ mod tests {
     fn warmup_only_never_requests_ram_rewind_points() {
         let mut requests = Vec::new();
         for boundary in ["restore", "periodic_save", "final_or_cancelled_save"] {
-            super::PrefixMode::WarmupOnly.checkpoint(|| {
-                requests.push(boundary);
-                anyhow::bail!("warmup must not request a checkpoint on either rank")
-            }).unwrap();
+            super::PrefixMode::WarmupOnly
+                .checkpoint(|| {
+                    requests.push(boundary);
+                    anyhow::bail!("warmup must not request a checkpoint on either rank")
+                })
+                .unwrap();
         }
         assert!(requests.is_empty());
     }
@@ -2246,24 +2489,37 @@ mod tests {
         let mut requests = Vec::new();
         let boundaries = ["restore", "periodic_save", "final_or_cancelled_save"];
         for boundary in boundaries {
-            super::PrefixMode::LivePrefix.checkpoint(|| {
-                requests.push(boundary);
-                Ok(())
-            }).unwrap();
+            super::PrefixMode::LivePrefix
+                .checkpoint(|| {
+                    requests.push(boundary);
+                    Ok(())
+                })
+                .unwrap();
         }
         assert_eq!(requests, boundaries);
-        assert!(super::PrefixMode::LivePrefix.checkpoint(|| anyhow::bail!("checkpoint failed")).is_err());
+        assert!(
+            super::PrefixMode::LivePrefix
+                .checkpoint(|| anyhow::bail!("checkpoint failed"))
+                .is_err()
+        );
     }
 
     #[test]
     fn sdft_recipe_uses_optimizer_steps_and_typed_config_not_live_sft() {
         let live = super::super::resident::VersionRecipe {
-            lr: 999.0, anchor: Some(5.0), seed: 999, steps: 999,
+            lr: 999.0,
+            anchor: Some(5.0),
+            seed: 999,
+            steps: 999,
             span: "context epoch 3".to_string(),
             explanation: "live SFT".to_string(),
             code_revision: "drive candidate".to_string(),
         };
-        let cfg = super::super::sdft::Config { learning_rate: 0.25, seed: 17, ..Default::default() };
+        let cfg = super::super::sdft::Config {
+            learning_rate: 0.25,
+            seed: 17,
+            ..Default::default()
+        };
         let recipe = super::distillation_recipe(&live, &cfg, 7, 3, "exact-binary").unwrap();
         assert_eq!(recipe.lr, 0.25);
         assert_eq!(recipe.anchor, None);
@@ -2356,11 +2612,22 @@ mod tests {
     #[test]
     fn sealed_diagnostics_exception_is_exact_not_a_prefix() {
         let rejected = sealed_environment_rejections(
-            ["INK_HOST_STALL_TRACE", "CUBECL_HOST_STALL_TRACE",
-             "INK_HOST_STALL_TRACE_EXTRA", "CUBECL_HOST_STALL_TRACE_EXTRA"]
-                .into_iter().map(str::to_owned),
+            [
+                "INK_HOST_STALL_TRACE",
+                "CUBECL_HOST_STALL_TRACE",
+                "INK_HOST_STALL_TRACE_EXTRA",
+                "CUBECL_HOST_STALL_TRACE_EXTRA",
+            ]
+            .into_iter()
+            .map(str::to_owned),
         );
-        assert_eq!(rejected, ["CUBECL_HOST_STALL_TRACE_EXTRA", "INK_HOST_STALL_TRACE_EXTRA"]);
+        assert_eq!(
+            rejected,
+            [
+                "CUBECL_HOST_STALL_TRACE_EXTRA",
+                "INK_HOST_STALL_TRACE_EXTRA"
+            ]
+        );
     }
 
     #[test]

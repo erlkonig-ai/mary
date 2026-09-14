@@ -352,8 +352,14 @@ impl Weights {
         shard: Option<super::tp::Tp>,
         weight_storage: super::pile::WeightStorage,
     ) -> Result<(usize, usize, u64, u64)> {
-        self.src
-            .copy_share(layers, global_dense, attention_bytes, policy, shard, weight_storage)
+        self.src.copy_share(
+            layers,
+            global_dense,
+            attention_bytes,
+            policy,
+            shard,
+            weight_storage,
+        )
     }
 
     // ---- what the source SAYS about itself --------------------------------

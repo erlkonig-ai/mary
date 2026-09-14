@@ -66,8 +66,10 @@ impl WeightStorage {
 }
 
 fn validate_managed_concurrent_access(concurrent: i32) -> Result<()> {
-    anyhow::ensure!(concurrent != 0,
-        "cuda-managed weights require concurrent managed access: CPU metadata reads may overlap GPU work");
+    anyhow::ensure!(
+        concurrent != 0,
+        "cuda-managed weights require concurrent managed access: CPU metadata reads may overlap GPU work"
+    );
     Ok(())
 }
 
@@ -75,8 +77,12 @@ const MIN_ZERO_BYTES_PER_WORKER: usize = 1 << 20;
 const MAX_ZERO_WORKERS: usize = 64;
 
 fn weight_zero_workers(len: usize, requested: usize) -> usize {
-    if len == 0 { return 0; }
-    requested.max(1).min(MAX_ZERO_WORKERS)
+    if len == 0 {
+        return 0;
+    }
+    requested
+        .max(1)
+        .min(MAX_ZERO_WORKERS)
         .min((len / MIN_ZERO_BYTES_PER_WORKER).max(1))
 }
 
@@ -125,8 +131,10 @@ unsafe impl Sync for ManagedWeightArena {}
 
 impl ManagedWeightArena {
     fn new(len: usize, copy_threads: usize) -> Result<Self> {
-        anyhow::ensure!(len > 0 && len <= isize::MAX as usize,
-            "managed weight arena length must be in 1..=isize::MAX");
+        anyhow::ensure!(
+            len > 0 && len <= isize::MAX as usize,
+            "managed weight arena length must be in 1..=isize::MAX"
+        );
         let context = cudarc::driver::CudaContext::new(0)
             .context("retain CUDA primary context for managed weights")?;
         validate_managed_concurrent_access(context.attribute(
@@ -137,25 +145,40 @@ impl ManagedWeightArena {
         // UNINITIALIZED CPU-readable managed memory, not a Rust byte slice.
         let raw = unsafe {
             cudarc::driver::result::malloc_managed(
-                len, cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL,
+                len,
+                cudarc::driver::sys::CUmemAttach_flags::CU_MEM_ATTACH_GLOBAL,
             )
-        }.with_context(|| format!("allocate {len} bytes of CUDA managed weights"))?;
+        }
+        .with_context(|| format!("allocate {len} bytes of CUDA managed weights"))?;
         let ptr = std::ptr::NonNull::new(raw as *mut u8)
             .context("CUDA returned a null managed weight allocation")?;
-        let arena = Self { ptr, len, context: Some(context) };
-        eprintln!("    managed weight allocation: bytes={len} alloc_seconds={:.6}",
-            allocated_at.elapsed().as_secs_f64());
+        let arena = Self {
+            ptr,
+            len,
+            context: Some(context),
+        };
+        eprintln!(
+            "    managed weight allocation: bytes={len} alloc_seconds={:.6}",
+            allocated_at.elapsed().as_secs_f64()
+        );
         let started = std::time::Instant::now();
         // SAFETY: the allocation is uniquely owned, len bytes long, and has no
         // GPU alias yet. MaybeUninit permits the allocation's initial contents;
         // no u8 slice or ByteSource is published before every worker joins.
         let uninitialized = unsafe {
-            std::slice::from_raw_parts_mut(arena.ptr.as_ptr().cast::<std::mem::MaybeUninit<u8>>(), len)
+            std::slice::from_raw_parts_mut(
+                arena.ptr.as_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                len,
+            )
         };
         let workers = initialize_weight_bytes(uninitialized, copy_threads);
-        eprintln!("    managed weight initialization: bytes={len} zero_seconds={:.6}",
-            started.elapsed().as_secs_f64());
-        eprintln!("    managed weight initialization workers: requested={copy_threads} active={workers}");
+        eprintln!(
+            "    managed weight initialization: bytes={len} zero_seconds={:.6}",
+            started.elapsed().as_secs_f64()
+        );
+        eprintln!(
+            "    managed weight initialization workers: requested={copy_threads} active={workers}"
+        );
         Ok(arena)
     }
 
@@ -175,26 +198,35 @@ impl ManagedWeightArena {
 unsafe impl anybytes::ByteSource for ManagedWeightArena {
     type Owner = Self;
 
-    fn as_bytes(&self) -> &[u8] { self.as_slice() }
-    fn get_owner(self) -> Self { self }
+    fn as_bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+    fn get_owner(self) -> Self {
+        self
+    }
 }
 
 impl Drop for ManagedWeightArena {
     fn drop(&mut self) {
         use cudarc::driver::result;
-        let Some(context) = self.context.take() else { return };
+        let Some(context) = self.context.take() else {
+            return;
+        };
         // An alias can be released on CubeCL's server thread. Never call back
         // into its client here: bind and synchronize the driver directly.
         let previous = match result::ctx::get_current() {
             Ok(previous) => previous,
             Err(error) => {
                 std::mem::forget(context);
-                eprintln!("managed weight arena: cannot inspect CUDA context ({error}); leaking allocation and context for safety");
+                eprintln!(
+                    "managed weight arena: cannot inspect CUDA context ({error}); leaking allocation and context for safety"
+                );
                 return;
             }
         };
         let own = context.cu_ctx();
-        let released = context.bind_to_thread()
+        let released = context
+            .bind_to_thread()
             .and_then(|()| result::ctx::synchronize())
             // SAFETY: successful context synchronization proves all submitted
             // GPU work complete; the final owner holds the only free operation.
@@ -203,7 +235,9 @@ impl Drop for ManagedWeightArena {
             Ok(()) => drop(context),
             Err(error) => {
                 std::mem::forget(context);
-                eprintln!("managed weight arena: CUDA cleanup failed ({error}); leaking allocation and context for safety");
+                eprintln!(
+                    "managed weight arena: CUDA cleanup failed ({error}); leaking allocation and context for safety"
+                );
             }
         }
         // CudaContext::drop itself binds its context. Restore a different
@@ -212,9 +246,9 @@ impl Drop for ManagedWeightArena {
         if previous != Some(own) {
             // SAFETY: a different context belonged to this thread on entry and
             // has not been released here; null restores no current context.
-            if let Err(error) = unsafe {
-                result::ctx::set_current(previous.unwrap_or(std::ptr::null_mut()))
-            } {
+            if let Err(error) =
+                unsafe { result::ctx::set_current(previous.unwrap_or(std::ptr::null_mut())) }
+            {
                 eprintln!("managed weight arena: cannot restore caller CUDA context: {error}");
             }
         }
@@ -229,11 +263,13 @@ enum WeightArena {
 impl WeightArena {
     fn new(len: usize, storage: WeightStorage, copy_threads: usize) -> Result<Self> {
         match storage {
-            WeightStorage::Host | WeightStorage::HostReadOnly => {
-                Ok(Self::Host(memmap2::MmapMut::map_anon(len)
-                    .with_context(|| format!("map {len} bytes for the startup weight arena"))?))
+            WeightStorage::Host | WeightStorage::HostReadOnly => Ok(Self::Host(
+                memmap2::MmapMut::map_anon(len)
+                    .with_context(|| format!("map {len} bytes for the startup weight arena"))?,
+            )),
+            WeightStorage::CudaManaged => {
+                Ok(Self::Managed(ManagedWeightArena::new(len, copy_threads)?))
             }
-            WeightStorage::CudaManaged => Ok(Self::Managed(ManagedWeightArena::new(len, copy_threads)?)),
         }
     }
 
@@ -250,13 +286,19 @@ impl WeightArena {
 impl std::ops::Deref for WeightArena {
     type Target = [u8];
     fn deref(&self) -> &[u8] {
-        match self { Self::Host(arena) => arena, Self::Managed(arena) => arena.as_slice() }
+        match self {
+            Self::Host(arena) => arena,
+            Self::Managed(arena) => arena.as_slice(),
+        }
     }
 }
 
 impl std::ops::DerefMut for WeightArena {
     fn deref_mut(&mut self) -> &mut [u8] {
-        match self { Self::Host(arena) => arena, Self::Managed(arena) => arena.as_mut_slice() }
+        match self {
+            Self::Host(arena) => arena,
+            Self::Managed(arena) => arena.as_mut_slice(),
+        }
     }
 }
 
@@ -266,7 +308,9 @@ impl std::ops::DerefMut for WeightArena {
 fn finish_weight_arena(arena: memmap2::MmapMut, read_only: bool) -> Result<Bytes> {
     if read_only {
         Ok(Bytes::from_source(
-            arena.make_read_only().context("seal inference weight arena read-only")?,
+            arena
+                .make_read_only()
+                .context("seal inference weight arena read-only")?,
         ))
     } else {
         Ok(Bytes::from_source(arena))
@@ -277,8 +321,16 @@ fn finish_weight_arena(arena: memmap2::MmapMut, read_only: bool) -> Result<Bytes
 /// Cloning Bytes retains its mapping; it does not duplicate the weight payload.
 fn weight_arena_mapping(
     bytes: &Bytes,
-) -> (usize, usize, std::sync::Arc<dyn std::any::Any + Send + Sync>) {
-    (bytes.as_ptr() as usize, bytes.len(), std::sync::Arc::new(bytes.clone()))
+) -> (
+    usize,
+    usize,
+    std::sync::Arc<dyn std::any::Any + Send + Sync>,
+) {
+    (
+        bytes.as_ptr() as usize,
+        bytes.len(),
+        std::sync::Arc::new(bytes.clone()),
+    )
 }
 
 /// One line of the kernel's memory accounting, for a startup that competes with
@@ -2339,7 +2391,11 @@ impl PileSource {
                 gib(device_weights),
                 gib(overhead),
                 gib(attention_bytes),
-                gib(super::budget::allocator_overhead_bytes(policy, machine, attention_bytes)),
+                gib(super::budget::allocator_overhead_bytes(
+                    policy,
+                    machine,
+                    attention_bytes
+                )),
             );
         }
         println!(
@@ -2381,7 +2437,8 @@ impl PileSource {
         // sweep's scheduling changed. Speed is an experiment, not a guarantee.
         // The payload layout and later copy/swizzle work are unchanged.
         let (mut arena, skew) = {
-            let bytes = total.checked_add(VIEW_ALIGN - 1)
+            let bytes = total
+                .checked_add(VIEW_ALIGN - 1)
                 .context("startup weight arena size overflow")?;
             let arena = WeightArena::new(bytes, weight_storage, threads)?;
             let skew = arena.as_ptr().align_offset(VIEW_ALIGN);
@@ -2641,7 +2698,11 @@ impl PileSource {
         println!(
             "    startup weight arena: base={arena_base:#x} bytes={arena_len} storage={} protection={} seal_seconds={:.6}",
             weight_storage.as_str(),
-            if weight_storage == WeightStorage::HostReadOnly { "read-only" } else { "read-write" },
+            if weight_storage == WeightStorage::HostReadOnly {
+                "read-only"
+            } else {
+                "read-write"
+            },
             seal_start.elapsed().as_secs_f64(),
         );
         let view: anybytes::View<[u8]> = bytes
@@ -2738,7 +2799,10 @@ mod tests {
         assert_eq!(weight_zero_workers(MIN_ZERO_BYTES_PER_WORKER - 1, 8), 1);
         assert_eq!(weight_zero_workers(2 * MIN_ZERO_BYTES_PER_WORKER + 3, 8), 2);
         assert_eq!(weight_zero_workers(8 * MIN_ZERO_BYTES_PER_WORKER, 3), 3);
-        assert_eq!(weight_zero_workers(usize::MAX, usize::MAX), MAX_ZERO_WORKERS);
+        assert_eq!(
+            weight_zero_workers(usize::MAX, usize::MAX),
+            MAX_ZERO_WORKERS
+        );
     }
 
     #[test]
@@ -2755,8 +2819,15 @@ mod tests {
                     // SAFETY: guards were initialized above; the entire target
                     // range was initialized before its scoped workers returned.
                     let actual = unsafe { byte.assume_init() };
-                    let expected = if (7..7 + len).contains(&index) { 0 } else { 0xa5 };
-                    assert_eq!(actual, expected, "len={len} requested={requested} index={index}");
+                    let expected = if (7..7 + len).contains(&index) {
+                        0
+                    } else {
+                        0xa5
+                    };
+                    assert_eq!(
+                        actual, expected,
+                        "len={len} requested={requested} index={index}"
+                    );
                 }
             }
         }
@@ -2817,17 +2888,26 @@ mod tests {
         assert_eq!(slice.as_ref(), b"weights!");
         drop(slice);
         drop(bytes);
-        let retained = weak.upgrade().expect("alias keepalive retains managed bytes");
+        let retained = weak
+            .upgrade()
+            .expect("alias keepalive retains managed bytes");
         assert_eq!(&retained[32..40], b"weights!");
         drop(retained);
         std::thread::spawn(move || -> Result<()> {
             assert!(cudarc::driver::result::ctx::get_current()?.is_none());
             drop(keepalive);
-            assert!(cudarc::driver::result::ctx::get_current()?.is_none(),
-                "managed owner cleanup must restore no current context");
+            assert!(
+                cudarc::driver::result::ctx::get_current()?.is_none(),
+                "managed owner cleanup must restore no current context"
+            );
             Ok(())
-        }).join().map_err(|_| anyhow::anyhow!("managed owner drop thread panicked"))??;
-        assert!(weak.upgrade().is_none(), "the final managed byte owner expired");
+        })
+        .join()
+        .map_err(|_| anyhow::anyhow!("managed owner drop thread panicked"))??;
+        assert!(
+            weak.upgrade().is_none(),
+            "the final managed byte owner expired"
+        );
         Ok(())
     }
 
@@ -2845,45 +2925,60 @@ mod tests {
         const SAMPLE_BYTES: usize = 64;
         let bytes = std::env::var("INK_MANAGED_INIT_SCREEN_BYTES")
             .context("explicit test-only INK_MANAGED_INIT_SCREEN_BYTES is required")?
-            .parse::<u64>().context("INK_MANAGED_INIT_SCREEN_BYTES must be a byte count")?;
-        anyhow::ensure!((MIN_BYTES..=MAX_BYTES).contains(&bytes),
-            "INK_MANAGED_INIT_SCREEN_BYTES must be in {MIN_BYTES}..={MAX_BYTES}");
+            .parse::<u64>()
+            .context("INK_MANAGED_INIT_SCREEN_BYTES must be a byte count")?;
+        anyhow::ensure!(
+            (MIN_BYTES..=MAX_BYTES).contains(&bytes),
+            "INK_MANAGED_INIT_SCREEN_BYTES must be in {MIN_BYTES}..={MAX_BYTES}"
+        );
         let len = usize::try_from(bytes).context("screen allocation does not fit usize")?;
         let parallel = std::thread::available_parallelism()
-            .map(|n| n.get()).unwrap_or(1).min(MAX_ZERO_WORKERS);
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(MAX_ZERO_WORKERS);
         // Keep primary-context startup outside each measured fresh allocation,
         // and retain it across every arena's synchronous destruction.
         let _primary = cudarc::driver::CudaContext::new(0)?;
         for (arm, workers) in [1, parallel, parallel, 1].into_iter().enumerate() {
             let available = mem_available_bytes()?;
-            anyhow::ensure!(available >= MIN_AVAILABLE_BYTES,
+            anyhow::ensure!(
+                available >= MIN_AVAILABLE_BYTES,
                 "managed initialization screen arm {} requires at least 115000000 KiB available; found {} KiB",
-                arm + 1, available / 1024);
+                arm + 1,
+                available / 1024
+            );
             let started = std::time::Instant::now();
             let arena = ManagedWeightArena::new(len, workers)?;
             let new_seconds = started.elapsed().as_secs_f64();
             // The CPU tests check exhaustive coverage. Keep this timing screen
             // bounded to three small samples without another full read pass.
             for offset in [0, len / 2, len - SAMPLE_BYTES] {
-                assert!(arena.as_slice()[offset..offset + SAMPLE_BYTES]
-                    .iter().all(|byte| *byte == 0), "nonzero bytes at offset {offset}");
+                assert!(
+                    arena.as_slice()[offset..offset + SAMPLE_BYTES]
+                        .iter()
+                        .all(|byte| *byte == 0),
+                    "nonzero bytes at offset {offset}"
+                );
             }
             let dropping = std::time::Instant::now();
             drop(arena);
             let drop_seconds = dropping.elapsed().as_secs_f64();
-            println!("{}", serde_json::json!({
-                "event": "managed_weight_initialization_screen",
-                "arm": arm + 1,
-                "bytes": bytes,
-                "workers": workers,
-                "active_workers": weight_zero_workers(len, workers),
-                "new_seconds": new_seconds,
-                "drop_seconds": drop_seconds,
-                // Excludes zero sampling and admission/accounting reads.
-                "total_seconds": new_seconds + drop_seconds,
-                "mem_available_before_bytes": available,
-                "mem_available_before_kib": available / 1024,
-            }));
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "managed_weight_initialization_screen",
+                    "arm": arm + 1,
+                    "bytes": bytes,
+                    "workers": workers,
+                    "active_workers": weight_zero_workers(len, workers),
+                    "new_seconds": new_seconds,
+                    "drop_seconds": drop_seconds,
+                    // Excludes zero sampling and admission/accounting reads.
+                    "total_seconds": new_seconds + drop_seconds,
+                    "mem_available_before_bytes": available,
+                    "mem_available_before_kib": available / 1024,
+                })
+            );
         }
         Ok(())
     }
@@ -2908,7 +3003,10 @@ mod tests {
             assert_eq!(&retained[32..40], b"weights!");
             drop(retained);
             drop(keepalive);
-            assert!(weak.upgrade().is_none(), "the final owner releases the mmap");
+            assert!(
+                weak.upgrade().is_none(),
+                "the final owner releases the mmap"
+            );
         }
         Ok(())
     }
@@ -2922,16 +3020,22 @@ mod tests {
             let bytes = arena.finish(storage)?;
             let ptr = bytes.as_ptr() as usize;
             let maps = std::fs::read_to_string("/proc/self/maps")?;
-            let permissions = maps.lines().find_map(|line| {
-                let mut fields = line.split_whitespace();
-                let (lo, hi) = fields.next()?.split_once('-')?;
-                let lo = usize::from_str_radix(lo, 16).ok()?;
-                let hi = usize::from_str_radix(hi, 16).ok()?;
-                let permissions = fields.next()?;
-                (lo <= ptr && ptr < hi).then_some(permissions)
-            }).expect("the dedicated arena is mapped");
+            let permissions = maps
+                .lines()
+                .find_map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let (lo, hi) = fields.next()?.split_once('-')?;
+                    let lo = usize::from_str_radix(lo, 16).ok()?;
+                    let hi = usize::from_str_radix(hi, 16).ok()?;
+                    let permissions = fields.next()?;
+                    (lo <= ptr && ptr < hi).then_some(permissions)
+                })
+                .expect("the dedicated arena is mapped");
             assert!(permissions.starts_with('r'));
-            assert_eq!(permissions.as_bytes()[1] == b'w', storage == WeightStorage::Host);
+            assert_eq!(
+                permissions.as_bytes()[1] == b'w',
+                storage == WeightStorage::Host
+            );
             assert!(bytes.iter().all(|byte| *byte == 7));
         }
         Ok(())

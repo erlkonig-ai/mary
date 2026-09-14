@@ -185,13 +185,23 @@ pub fn assemble_completed_exports(
     n_routed: usize,
     exports: Vec<RankExport>,
 ) -> Result<Vec<LearnedExpert>> {
-    assemble_completed_with(src.model_identity(), world, layer, n_routed, exports, |name, expert| {
-        let stored = src.expert_packed_stored(name, expert)?;
-        Ok(PackedExpert {
-            codes: stored.codes.to_vec(), scales: stored.scales.to_vec(),
-            scale2: stored.scale2, rows: stored.rows, cols: stored.cols,
-        })
-    })
+    assemble_completed_with(
+        src.model_identity(),
+        world,
+        layer,
+        n_routed,
+        exports,
+        |name, expert| {
+            let stored = src.expert_packed_stored(name, expert)?;
+            Ok(PackedExpert {
+                codes: stored.codes.to_vec(),
+                scales: stored.scales.to_vec(),
+                scale2: stored.scale2,
+                rows: stored.rows,
+                cols: stored.cols,
+            })
+        },
+    )
 }
 
 fn assemble_completed_with(
@@ -206,16 +216,27 @@ fn assemble_completed_with(
 
     let world_u32 = u32::try_from(world).context("export world does not fit its wire field")?;
     let layer_i64 = i64::try_from(layer).context("export layer does not fit its identity field")?;
-    anyhow::ensure!(world > 0 && n_routed > 0, "completed export needs a nonempty world and expert domain");
-    anyhow::ensure!(exports.len() == world,
-        "completed export has {} successful rank responses, expected {world}", exports.len());
+    anyhow::ensure!(
+        world > 0 && n_routed > 0,
+        "completed export needs a nonempty world and expert domain"
+    );
+    anyhow::ensure!(
+        exports.len() == world,
+        "completed export has {} successful rank responses, expected {world}",
+        exports.len()
+    );
     let mut seen = vec![false; world];
     for export in &exports {
         let rank = export.rank as usize;
-        anyhow::ensure!(rank < world && export.world == world_u32, "export response rank/world is outside the admitted cohort");
+        anyhow::ensure!(
+            rank < world && export.world == world_u32,
+            "export response rank/world is outside the admitted cohort"
+        );
         anyhow::ensure!(!seen[rank], "export received rank {rank} twice");
-        anyhow::ensure!(export.model_identity == identity,
-            "export rank {rank} did not use the agreed immutable checkpoint");
+        anyhow::ensure!(
+            export.model_identity == identity,
+            "export rank {rank} did not use the agreed immutable checkpoint"
+        );
         seen[rank] = true;
     }
     let w13 = format!("model.llm.layers.{layer}.mlp.experts.w13_weight");
@@ -223,15 +244,26 @@ fn assemble_completed_with(
     let mut changed: BTreeMap<(String, i64), BTreeMap<u32, LearnedCut>> = BTreeMap::new();
     for export in exports {
         for cut in export.cuts {
-            anyhow::ensure!(cut.rank == export.rank && cut.world == export.world,
-                "a learned cut claims a different rank/world than its successful response");
-            anyhow::ensure!(cut.layer == layer_i64 && (cut.name == w13 || cut.name == w2),
-                "a learned cut does not name the configured layer's routed W13/W2 bank");
-            let expert = usize::try_from(cut.expert).context("a learned expert index is negative or too large")?;
-            anyhow::ensure!(expert < n_routed, "learned expert {expert} exceeds the configured expert domain");
+            anyhow::ensure!(
+                cut.rank == export.rank && cut.world == export.world,
+                "a learned cut claims a different rank/world than its successful response"
+            );
+            anyhow::ensure!(
+                cut.layer == layer_i64 && (cut.name == w13 || cut.name == w2),
+                "a learned cut does not name the configured layer's routed W13/W2 bank"
+            );
+            let expert = usize::try_from(cut.expert)
+                .context("a learned expert index is negative or too large")?;
+            anyhow::ensure!(
+                expert < n_routed,
+                "learned expert {expert} exceeds the configured expert domain"
+            );
             let rank = cut.rank;
             let parts = changed.entry((cut.name.clone(), cut.expert)).or_default();
-            anyhow::ensure!(parts.insert(rank, cut).is_none(), "a successful export repeats one expert cut on rank {rank}");
+            anyhow::ensure!(
+                parts.insert(rank, cut).is_none(),
+                "a successful export repeats one expert cut on rank {rank}"
+            );
         }
     }
 
@@ -239,15 +271,30 @@ fn assemble_completed_with(
     for ((name, expert), mut parts) in changed {
         let stored = stored_expert(&name, expert as usize)
             .with_context(|| format!("{name}[{expert}]: read the agreed checkpoint expert"))?;
-        let logical = stored.cols.checked_mul(2).context("checkpoint expert width overflow")?;
-        let elements = stored.rows.checked_mul(logical).context("checkpoint expert size overflow")?;
-        anyhow::ensure!(stored.rows > 0 && logical > 0 && logical % 16 == 0
-            && stored.rows <= u32::MAX as usize && logical <= u32::MAX as usize,
-            "{name}[{expert}]: invalid checkpoint expert dimensions");
-        anyhow::ensure!(stored.codes.len() == elements / 2 && stored.scales.len() == elements / 16,
-            "{name}[{expert}]: checkpoint planes do not match their dimensions");
-        anyhow::ensure!(stored.scale2.is_finite() && stored.scale2 >= 0.0,
-            "{name}[{expert}]: checkpoint global scale is invalid");
+        let logical = stored
+            .cols
+            .checked_mul(2)
+            .context("checkpoint expert width overflow")?;
+        let elements = stored
+            .rows
+            .checked_mul(logical)
+            .context("checkpoint expert size overflow")?;
+        anyhow::ensure!(
+            stored.rows > 0
+                && logical > 0
+                && logical % 16 == 0
+                && stored.rows <= u32::MAX as usize
+                && logical <= u32::MAX as usize,
+            "{name}[{expert}]: invalid checkpoint expert dimensions"
+        );
+        anyhow::ensure!(
+            stored.codes.len() == elements / 2 && stored.scales.len() == elements / 16,
+            "{name}[{expert}]: checkpoint planes do not match their dimensions"
+        );
+        anyhow::ensure!(
+            stored.scale2.is_finite() && stored.scale2 >= 0.0,
+            "{name}[{expert}]: checkpoint global scale is invalid"
+        );
         for rank in 0..world {
             let geometry = match world {
                 1 => Cut::Rows(0..stored.rows),
@@ -255,22 +302,53 @@ fn assemble_completed_with(
             };
             let (rows, columns) = geometry.dims(stored.rows, logical);
             // This also checks packed block boundaries on a W2 column cut.
-            let scales = cut_plane(&stored.scales, stored.rows, logical, Plane::NVFP4_SCALES, &geometry)?;
+            let scales = cut_plane(
+                &stored.scales,
+                stored.rows,
+                logical,
+                Plane::NVFP4_SCALES,
+                &geometry,
+            )?;
             let cut = if let Some(cut) = parts.remove(&(rank as u32)) {
-                anyhow::ensure!(cut.cut == geometry && cut.rows as usize == rows && cut.logical as usize == columns,
-                    "{name}[{expert}] rank {rank}: exported cut differs from checkpoint TP geometry");
-                let cut_elements = rows.checked_mul(columns).context("learned cut size overflow")?;
-                anyhow::ensure!(cut.codes.len() == cut_elements / 2 && cut.scales.len() == scales.len(),
-                    "{name}[{expert}] rank {rank}: exported planes differ from the admitted cut size");
-                anyhow::ensure!(cut.scales.as_slice() == scales.as_ref() && cut.scale2.to_bits() == stored.scale2.to_bits(),
-                    "{name}[{expert}] rank {rank}: the learner changed immutable checkpoint scales");
+                anyhow::ensure!(
+                    cut.cut == geometry
+                        && cut.rows as usize == rows
+                        && cut.logical as usize == columns,
+                    "{name}[{expert}] rank {rank}: exported cut differs from checkpoint TP geometry"
+                );
+                let cut_elements = rows
+                    .checked_mul(columns)
+                    .context("learned cut size overflow")?;
+                anyhow::ensure!(
+                    cut.codes.len() == cut_elements / 2 && cut.scales.len() == scales.len(),
+                    "{name}[{expert}] rank {rank}: exported planes differ from the admitted cut size"
+                );
+                anyhow::ensure!(
+                    cut.scales.as_slice() == scales.as_ref()
+                        && cut.scale2.to_bits() == stored.scale2.to_bits(),
+                    "{name}[{expert}] rank {rank}: the learner changed immutable checkpoint scales"
+                );
                 cut
             } else {
                 LearnedCut {
-                    name: name.clone(), layer: layer_i64, expert, rank: rank as u32,
-                    world: world_u32, cut: geometry.clone(), rows: rows as u32, logical: columns as u32,
-                    codes: cut_plane(&stored.codes, stored.rows, logical, Plane::NVFP4_CODES, &geometry)?.into_owned(),
-                    scales: scales.into_owned(), scale2: stored.scale2,
+                    name: name.clone(),
+                    layer: layer_i64,
+                    expert,
+                    rank: rank as u32,
+                    world: world_u32,
+                    cut: geometry.clone(),
+                    rows: rows as u32,
+                    logical: columns as u32,
+                    codes: cut_plane(
+                        &stored.codes,
+                        stored.rows,
+                        logical,
+                        Plane::NVFP4_CODES,
+                        &geometry,
+                    )?
+                    .into_owned(),
+                    scales: scales.into_owned(),
+                    scale2: stored.scale2,
                 }
             };
             complete.push(cut);
@@ -327,10 +405,15 @@ pub fn assemble(cuts: Vec<LearnedCut>) -> Result<Vec<LearnedExpert>> {
                 let mut next = 0usize;
                 for p in &parts {
                     let Cut::Rows(r) = &p.cut else {
-                        anyhow::bail!("{name}[{expert}]: rank {} cut columns where rank 0 cut rows", p.rank)
+                        anyhow::bail!(
+                            "{name}[{expert}]: rank {} cut columns where rank 0 cut rows",
+                            p.rank
+                        )
                     };
                     anyhow::ensure!(
-                        r.start == next && r.len() == p.rows as usize && p.logical as usize == logical,
+                        r.start == next
+                            && r.len() == p.rows as usize
+                            && p.logical as usize == logical,
                         "{name}[{expert}]: rank {}'s rows {}..{} do not continue at {next}",
                         p.rank,
                         r.start,
@@ -353,7 +436,10 @@ pub fn assemble(cuts: Vec<LearnedCut>) -> Result<Vec<LearnedExpert>> {
                 let mut next = 0usize;
                 for p in &parts {
                     let Cut::Cols(c) = &p.cut else {
-                        anyhow::bail!("{name}[{expert}]: rank {} cut rows where rank 0 cut columns", p.rank)
+                        anyhow::bail!(
+                            "{name}[{expert}]: rank {} cut rows where rank 0 cut columns",
+                            p.rank
+                        )
                     };
                     anyhow::ensure!(
                         c.start == next && c.len() == p.logical as usize && p.rows as usize == rows,
@@ -460,7 +546,9 @@ impl LearnedCut {
         let cut = match kind {
             0 => Cut::Rows(start..end),
             1 => Cut::Cols(start..end),
-            other => anyhow::bail!("a learned cut's kind byte is {other:#04x}, not rows or columns"),
+            other => {
+                anyhow::bail!("a learned cut's kind byte is {other:#04x}, not rows or columns")
+            }
         };
         let rows = take_u32(reader, "rows")?;
         let logical = take_u32(reader, "logical columns")?;
@@ -499,32 +587,78 @@ mod tests {
 
     fn checkpoint(rows: usize, logical: usize) -> PackedExpert {
         PackedExpert {
-            codes: (0..rows * logical / 2).map(|i| (i as u8).wrapping_mul(11)).collect(),
-            scales: (0..rows * logical / 16).map(|i| 0x30 + (i % 8) as u8).collect(),
-            scale2: 0.37, rows, cols: logical / 2,
+            codes: (0..rows * logical / 2)
+                .map(|i| (i as u8).wrapping_mul(11))
+                .collect(),
+            scales: (0..rows * logical / 16)
+                .map(|i| 0x30 + (i % 8) as u8)
+                .collect(),
+            scale2: 0.37,
+            rows,
+            cols: logical / 2,
         }
     }
 
     fn response(rank: u32, cuts: Vec<LearnedCut>) -> RankExport {
-        RankExport { rank, world: 2, model_identity: CHECKPOINT, cuts }
+        RankExport {
+            rank,
+            world: 2,
+            model_identity: CHECKPOINT,
+            cuts,
+        }
     }
 
     fn checkpoint_cut(name: &str, stored: &PackedExpert, rank: u32) -> LearnedCut {
         let logical = stored.cols * 2;
-        let geometry = routed_cut(Tp::new(rank as usize, 2).unwrap(), name, stored.rows, logical).unwrap();
+        let geometry = routed_cut(
+            Tp::new(rank as usize, 2).unwrap(),
+            name,
+            stored.rows,
+            logical,
+        )
+        .unwrap();
         let (rows, columns) = geometry.dims(stored.rows, logical);
         LearnedCut {
-            name: name.into(), layer: 41, expert: 7, rank, world: 2,
-            rows: rows as u32, logical: columns as u32,
-            codes: cut_plane(&stored.codes, stored.rows, logical, Plane::NVFP4_CODES, &geometry).unwrap().into_owned(),
-            scales: cut_plane(&stored.scales, stored.rows, logical, Plane::NVFP4_SCALES, &geometry).unwrap().into_owned(),
-            scale2: stored.scale2, cut: geometry,
+            name: name.into(),
+            layer: 41,
+            expert: 7,
+            rank,
+            world: 2,
+            rows: rows as u32,
+            logical: columns as u32,
+            codes: cut_plane(
+                &stored.codes,
+                stored.rows,
+                logical,
+                Plane::NVFP4_CODES,
+                &geometry,
+            )
+            .unwrap()
+            .into_owned(),
+            scales: cut_plane(
+                &stored.scales,
+                stored.rows,
+                logical,
+                Plane::NVFP4_SCALES,
+                &geometry,
+            )
+            .unwrap()
+            .into_owned(),
+            scale2: stored.scale2,
+            cut: geometry,
         }
     }
 
-    fn complete(name: &str, stored: &PackedExpert, responses: Vec<RankExport>) -> Result<Vec<LearnedExpert>> {
+    fn complete(
+        name: &str,
+        stored: &PackedExpert,
+        responses: Vec<RankExport>,
+    ) -> Result<Vec<LearnedExpert>> {
         assemble_completed_with(CHECKPOINT, 2, 41, 8, responses, |requested, expert| {
-            anyhow::ensure!(requested == name && expert == 7, "unexpected checkpoint request");
+            anyhow::ensure!(
+                requested == name && expert == 7,
+                "unexpected checkpoint request"
+            );
             Ok(stored.clone())
         })
     }
@@ -538,7 +672,12 @@ mod tests {
         changed.codes[0] ^= 3;
         let mut expected = stored.clone();
         expected.codes[64 * 32] ^= 3;
-        let output = complete(name, &stored, vec![response(1, vec![changed]), response(0, vec![])]).unwrap();
+        let output = complete(
+            name,
+            &stored,
+            vec![response(1, vec![changed]), response(0, vec![])],
+        )
+        .unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].name, name);
         assert_eq!(output[0].expert, 7);
@@ -555,17 +694,27 @@ mod tests {
         changed.codes[17] ^= 0x10;
         let mut expected = stored.clone();
         expected.codes[33] ^= 0x10;
-        let output = complete(name, &stored, vec![response(0, vec![changed]), response(1, vec![])]).unwrap();
+        let output = complete(
+            name,
+            &stored,
+            vec![response(0, vec![changed]), response(1, vec![])],
+        )
+        .unwrap();
         assert_eq!(output.len(), 1);
         assert_eq!(output[0].packed, expected);
     }
 
     #[test]
     fn completed_empty_exports_do_not_load_or_transfer_untouched_experts() {
-        let output = assemble_completed_with(CHECKPOINT, 2, 41, 8,
-            vec![response(0, vec![]), response(1, vec![])], |_, _| {
-                anyhow::bail!("an unchanged expert should not be read")
-            }).unwrap();
+        let output = assemble_completed_with(
+            CHECKPOINT,
+            2,
+            41,
+            8,
+            vec![response(0, vec![]), response(1, vec![])],
+            |_, _| anyhow::bail!("an unchanged expert should not be read"),
+        )
+        .unwrap();
         assert!(output.is_empty());
     }
 
@@ -588,7 +737,11 @@ mod tests {
                 Ok(checkpoint(64, 64))
             });
             assert!(result.is_err());
-            assert_eq!(reads.get(), 0, "checkpoint was read before all-rank success was established");
+            assert_eq!(
+                reads.get(),
+                0,
+                "checkpoint was read before all-rank success was established"
+            );
         }
     }
 
@@ -606,17 +759,35 @@ mod tests {
             |c| c.expert = 8,
             |c| c.cut = Cut::Rows(0..64),
             |c| c.rows = 63,
-            |c| { c.codes.pop(); },
-            |c| { c.scales.pop(); },
+            |c| {
+                c.codes.pop();
+            },
+            |c| {
+                c.scales.pop();
+            },
             |c| c.scales[0] ^= 1,
             |c| c.scale2 = f32::NAN,
         ];
         for corrupt in corruptions {
             let mut cut = base.clone();
             corrupt(&mut cut);
-            assert!(complete(name, &stored, vec![response(0, vec![cut]), response(1, vec![])]).is_err());
+            assert!(
+                complete(
+                    name,
+                    &stored,
+                    vec![response(0, vec![cut]), response(1, vec![])]
+                )
+                .is_err()
+            );
         }
-        assert!(complete(name, &stored, vec![response(0, vec![base.clone(), base]), response(1, vec![])]).is_err());
+        assert!(
+            complete(
+                name,
+                &stored,
+                vec![response(0, vec![base.clone(), base]), response(1, vec![])]
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -626,19 +797,37 @@ mod tests {
         let mut codes = stored.codes.clone();
         codes[9] ^= 1;
         let cut = LearnedCut {
-            name: name.into(), layer: 41, expert: 7, rank: 0, world: 1,
-            cut: Cut::Rows(0..64), rows: 64, logical: 64,
-            codes: codes.clone(), scales: stored.scales.clone(), scale2: stored.scale2,
+            name: name.into(),
+            layer: 41,
+            expert: 7,
+            rank: 0,
+            world: 1,
+            cut: Cut::Rows(0..64),
+            rows: 64,
+            logical: 64,
+            codes: codes.clone(),
+            scales: stored.scales.clone(),
+            scale2: stored.scale2,
         };
-        let response = RankExport { rank: 0, world: 1, model_identity: CHECKPOINT, cuts: vec![cut] };
-        let output = assemble_completed_with(CHECKPOINT, 1, 41, 8, vec![response], |_, _| Ok(stored.clone())).unwrap();
+        let response = RankExport {
+            rank: 0,
+            world: 1,
+            model_identity: CHECKPOINT,
+            cuts: vec![cut],
+        };
+        let output = assemble_completed_with(CHECKPOINT, 1, 41, 8, vec![response], |_, _| {
+            Ok(stored.clone())
+        })
+        .unwrap();
         assert_eq!(output[0].packed.codes, codes);
         assert_eq!(output[0].packed.scales, stored.scales);
     }
 
     fn cut(rank: u32, cut: Cut, rows: usize, logical: usize, seed: u8) -> LearnedCut {
         let codes: Vec<u8> = (0..rows * logical / 2).map(|i| (i as u8) ^ seed).collect();
-        let scales: Vec<u8> = (0..rows * logical / 16).map(|i| (i as u8).wrapping_mul(seed)).collect();
+        let scales: Vec<u8> = (0..rows * logical / 16)
+            .map(|i| (i as u8).wrapping_mul(seed))
+            .collect();
         LearnedCut {
             name: "model.llm.layers.41.mlp.experts.x".into(),
             layer: 41,

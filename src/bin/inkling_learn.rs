@@ -26,7 +26,9 @@
 //! ```
 use anyhow::{Context, Result};
 use mary::models::inkling::engine::{self, EngineConfig, Loaded, TensorParallel};
-use mary::models::inkling::resident::{Consult, ExecResultContext, InklingContext, InklingInput, Model};
+use mary::models::inkling::resident::{
+    Consult, ExecResultContext, InklingContext, InklingInput, Model,
+};
 use mary::models::inkling::tpcomm::elect_rank;
 
 fn main() -> Result<()> {
@@ -98,9 +100,7 @@ fn main() -> Result<()> {
                 i += 2;
             }
             "--layers" => {
-                let (a, b) = args[i + 1]
-                    .split_once(':')
-                    .context("--layers wants a:b")?;
+                let (a, b) = args[i + 1].split_once(':').context("--layers wants a:b")?;
                 layers = Some(a.parse()?..b.parse()?);
                 i += 2;
             }
@@ -160,7 +160,10 @@ fn main() -> Result<()> {
     })?;
     let mut engine = match loaded {
         Loaded::Follower(mut follower) => {
-            println!("  rank 1 ready in {:.1}s; following", t0.elapsed().as_secs_f64());
+            println!(
+                "  rank 1 ready in {:.1}s; following",
+                t0.elapsed().as_secs_f64()
+            );
             return follower.follow();
         }
         Loaded::Engine(engine) => engine,
@@ -168,7 +171,10 @@ fn main() -> Result<()> {
     println!(
         "  ready in {:.1}s: {}",
         t0.elapsed().as_secs_f64(),
-        format!("{:?}", engine.ready()).chars().take(200).collect::<String>()
+        format!("{:?}", engine.ready())
+            .chars()
+            .take(200)
+            .collect::<String>()
     );
 
     let mut means = Vec::with_capacity(lines.len());
@@ -213,14 +219,26 @@ fn main() -> Result<()> {
     let later = means.iter().skip(1).sum::<f64>() / (n - 1).max(1) as f64;
     println!(
         "=== {n} turns: mean {all:.4} nats/delta token; turns 1.. {later:.4}; per turn {} ===",
-        means.iter().map(|m| format!("{m:.3}")).collect::<Vec<_>>().join(" ")
+        means
+            .iter()
+            .map(|m| format!("{m:.3}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     );
     if frozen_means.len() == n {
         let f_all = frozen_means.iter().sum::<f64>() / n as f64;
-        let wins = means.iter().zip(&frozen_means).filter(|(m, f)| m < f).count();
+        let wins = means
+            .iter()
+            .zip(&frozen_means)
+            .filter(|(m, f)| m < f)
+            .count();
         println!(
             "=== frozen control: mean {f_all:.4} nats/delta token; learned below frozen on {wins}/{n} turns; per turn {} ===",
-            frozen_means.iter().map(|m| format!("{m:.3}")).collect::<Vec<_>>().join(" ")
+            frozen_means
+                .iter()
+                .map(|m| format!("{m:.3}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
     }
     if export {
@@ -258,8 +276,13 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("refresh {pile}: {e:?}"))?;
             let recipe = VersionRecipe {
                 lr: lr.as_deref().and_then(|v| v.parse().ok()).unwrap_or(0.0),
-                anchor: std::env::var("INK_LEARN_ANCHOR").ok().and_then(|v| v.parse().ok()),
-                seed: std::env::var("INK_LEARN_SEED").ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+                anchor: std::env::var("INK_LEARN_ANCHOR")
+                    .ok()
+                    .and_then(|v| v.parse().ok()),
+                seed: std::env::var("INK_LEARN_SEED")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0),
                 steps: lines.len() as u64,
                 span: format!(
                     "{corpus} lines {from}..{}, {want} generated token(s) a turn",
@@ -274,7 +297,11 @@ fn main() -> Result<()> {
                 version.root,
                 version.name,
                 version.parent,
-                if version.genesis { " (the genesis root, minted now)" } else { "" },
+                if version.genesis {
+                    " (the genesis root, minted now)"
+                } else {
+                    ""
+                },
                 version.replaced,
                 version.members,
                 version.facts.len(),

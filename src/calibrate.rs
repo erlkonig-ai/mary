@@ -106,7 +106,10 @@ impl Calibrated {
 /// `|(W - Wq) x|^2`, the quantity AWQ minimises.
 pub fn output_error(w: &[f32], wq: &[f32], cols: usize, rows: &[Vec<f32>]) -> f64 {
     let diff: Vec<f32> = w.iter().zip(wq).map(|(a, b)| a - b).collect();
-    let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(32).max(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .min(32)
+        .max(1);
     let chunk = rows.len().div_ceil(threads).max(1);
     std::thread::scope(|scope| {
         let handles: Vec<_> = rows
@@ -125,7 +128,10 @@ pub fn output_error(w: &[f32], wq: &[f32], cols: usize, rows: &[Vec<f32>]) -> f6
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("error worker")).sum()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("error worker"))
+            .sum()
     })
 }
 
@@ -153,7 +159,10 @@ fn cholesky(a: &[f64], n: usize) -> Vec<f64> {
 /// Inverse of a symmetric positive definite matrix from its Cholesky factor,
 /// one column of the identity per solve, columns spread over threads.
 fn spd_inverse(l: &[f64], n: usize) -> Vec<f64> {
-    let threads = std::thread::available_parallelism().map_or(8, |v| v.get()).min(32).max(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |v| v.get())
+        .min(32)
+        .max(1);
     let chunk = n.div_ceil(threads).max(1);
     let mut inv = vec![0f64; n * n];
     std::thread::scope(|scope| {
@@ -201,10 +210,20 @@ fn spd_inverse(l: &[f64], n: usize) -> Vec<f64> {
 /// Error-feedback (GPTQ) NVFP4 of `w` (`[rows, cols]`) against input rows `x`
 /// (each of length `cols`), under one global scale from `w`'s own maximum.
 pub fn pack_gptq(w: &[f32], cols: usize, x: &[Vec<f32>]) -> Result<Packed> {
-    ensure!(cols > 0 && cols % BLOCK == 0, "cols {cols} is not a positive multiple of {BLOCK}");
-    ensure!(w.len() % cols == 0, "{} values do not fill rows of {cols}", w.len());
+    ensure!(
+        cols > 0 && cols % BLOCK == 0,
+        "cols {cols} is not a positive multiple of {BLOCK}"
+    );
+    ensure!(
+        w.len() % cols == 0,
+        "{} values do not fill rows of {cols}",
+        w.len()
+    );
     ensure!(!x.is_empty(), "error feedback needs input rows");
-    ensure!(x.iter().all(|r| r.len() == cols), "an input row is not {cols} wide");
+    ensure!(
+        x.iter().all(|r| r.len() == cols),
+        "an input row is not {cols} wide"
+    );
     let rows = w.len() / cols;
     let n = cols;
 
@@ -243,7 +262,10 @@ pub fn pack_gptq(w: &[f32], cols: usize, x: &[Vec<f32>]) -> Result<Packed> {
     }
 
     let scale2 = global_scale(w);
-    let threads = std::thread::available_parallelism().map_or(8, |v| v.get()).min(32).max(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |v| v.get())
+        .min(32)
+        .max(1);
     let chunk = rows.div_ceil(threads).max(1);
     let mut codes = vec![0u8; w.len() / 2];
     let mut scales = vec![0u8; w.len() / BLOCK];
@@ -340,11 +362,25 @@ pub fn pack_linear(
     mean_abs: &[f32],
     opts: &Options<'_>,
 ) -> Result<Calibrated> {
-    ensure!(cols > 0 && cols % BLOCK == 0, "cols {cols} is not a positive multiple of {BLOCK}");
-    ensure!(w.len() % cols == 0, "{} values do not fill rows of {cols}", w.len());
+    ensure!(
+        cols > 0 && cols % BLOCK == 0,
+        "cols {cols} is not a positive multiple of {BLOCK}"
+    );
+    ensure!(
+        w.len() % cols == 0,
+        "{} values do not fill rows of {cols}",
+        w.len()
+    );
     ensure!(!rows.is_empty(), "calibration needs input rows");
-    ensure!(rows.iter().all(|r| r.len() == cols), "an input row is not {cols} wide");
-    ensure!(mean_abs.len() == cols, "mean_abs has {} entries for {cols} columns", mean_abs.len());
+    ensure!(
+        rows.iter().all(|r| r.len() == cols),
+        "an input row is not {cols} wide"
+    );
+    ensure!(
+        mean_abs.len() == cols,
+        "mean_abs has {} entries for {cols} columns",
+        mean_abs.len()
+    );
 
     let plain = pack_nearest(w, cols)?;
     let plain_err = output_error(w, &plain.decode(), cols, rows);
@@ -389,7 +425,11 @@ pub fn pack_linear(
         }
     }
 
-    best.error_ratio = if plain_err > 0.0 { best_err / plain_err } else { 1.0 };
+    best.error_ratio = if plain_err > 0.0 {
+        best_err / plain_err
+    } else {
+        1.0
+    };
     Ok(best)
 }
 
@@ -457,7 +497,10 @@ mod tests {
         let e_plain = output_error(&w, &plain.decode(), cols, &x);
         let e_fed = output_error(&w, &fed.decode(), cols, &x);
         assert!(e_fed <= e_plain, "feedback {e_fed} vs plain {e_plain}");
-        assert_eq!(fed.scale2, plain.scale2, "the global scale is the tensor's, not the feedback's");
+        assert_eq!(
+            fed.scale2, plain.scale2,
+            "the global scale is the tensor's, not the feedback's"
+        );
     }
 
     #[test]
@@ -608,7 +651,11 @@ pub fn write_packed_pile(
 
     let mut tokenizer_json = tokenizer_json;
     if append {
-        ensure!(out.exists(), "--append needs an existing pile, {} is not one", out.display());
+        ensure!(
+            out.exists(),
+            "--append needs an existing pile, {} is not one",
+            out.display()
+        );
         // A pile that has no model collection yet (a self pile taking its first
         // model, JP's "just put it into self.pile and let replication take care
         // of the rest") gets one below; a pile that has one must not already
@@ -619,7 +666,10 @@ pub fn write_packed_pile(
                     crate::selection::select_model_roots(
                         snapshot.facts(),
                         snapshot.store(),
-                        crate::selection::ModelSelector::Source { source, quantization },
+                        crate::selection::ModelSelector::Source {
+                            source,
+                            quantization
+                        },
                     )
                     .is_err(),
                     "{} already carries a {source} root labelled {quantization}",
@@ -648,14 +698,25 @@ pub fn write_packed_pile(
 
     let mut graph = Fragment::empty();
     let mut members: Vec<Id> = Vec::new();
-    let mut add_member = |pile: &mut Pile, graph: &mut Fragment, leaf: Fragment, name: &str, kind: &str| -> Result<()> {
-        let leaf_id = leaf.root().ok_or_else(|| anyhow::anyhow!("{name}: leaf has no root"))?;
+    let mut add_member = |pile: &mut Pile,
+                          graph: &mut Fragment,
+                          leaf: Fragment,
+                          name: &str,
+                          kind: &str|
+     -> Result<()> {
+        let leaf_id = leaf
+            .root()
+            .ok_or_else(|| anyhow::anyhow!("{name}: leaf has no root"))?;
         *graph += leaf;
         let name_h = pile
             .put::<blobencodings::UTF8String, _>(name.to_string())
             .map_err(|e| anyhow::anyhow!("{name}: store name: {e:?}"))?;
         let member = entity! { _ @ attrs::kind: kind, attrs::safetensor_path: name_h, attrs::weight: leaf_id };
-        members.push(member.root().ok_or_else(|| anyhow::anyhow!("{name}: member has no root"))?);
+        members.push(
+            member
+                .root()
+                .ok_or_else(|| anyhow::anyhow!("{name}: member has no root"))?,
+        );
         *graph += member;
         Ok(())
     };
@@ -671,7 +732,13 @@ pub fn write_packed_pile(
                 cal.packed.rows,
                 cal.packed.cols
             );
-            let leaf = put_leaf(&mut pile, Elem::Nvfp4, &dims, anybytes::Bytes::from_source(cal.packed.payload()), name)?;
+            let leaf = put_leaf(
+                &mut pile,
+                Elem::Nvfp4,
+                &dims,
+                anybytes::Bytes::from_source(cal.packed.payload()),
+                name,
+            )?;
             add_member(&mut pile, &mut graph, leaf, name, "matrix")?;
             let scale_name = format!("{name}.input_scale");
             let leaf = put_leaf(
@@ -683,7 +750,13 @@ pub fn write_packed_pile(
             )?;
             add_member(&mut pile, &mut graph, leaf, &scale_name, "vector")?;
         } else {
-            let leaf = put_leaf(&mut pile, Elem::F32, &dims, anybytes::Bytes::from_source(values.clone()), name)?;
+            let leaf = put_leaf(
+                &mut pile,
+                Elem::F32,
+                &dims,
+                anybytes::Bytes::from_source(values.clone()),
+                name,
+            )?;
             let kind = match shape.len() {
                 1 => "vector",
                 2 => "matrix",
@@ -704,7 +777,9 @@ pub fn write_packed_pile(
         attrs::quantization: quantization,
         attrs::member*: members.iter(),
     };
-    let root = model.root().ok_or_else(|| anyhow::anyhow!("model has no root"))?;
+    let root = model
+        .root()
+        .ok_or_else(|| anyhow::anyhow!("model has no root"))?;
     graph += model;
     crate::model_collection::publish_model_fragment(&mut pile, key, graph)
         .map_err(|e| anyhow::anyhow!("publish the packed model: {e}"))?;
@@ -763,9 +838,18 @@ mod pile_tests {
 
         let (rows, cols) = (8, 32);
         let mut keymap: Keymap = HashMap::new();
-        keymap.insert("encoder.layers.0.mlp.fc2.weight".into(), (matrix(rows, cols), vec![rows, cols]));
-        keymap.insert("encoder.layers.0.norm1.weight".into(), (vec![1.0; cols], vec![cols]));
-        keymap.insert("embeddings.word_embeddings.weight".into(), (matrix(4, cols), vec![4, cols]));
+        keymap.insert(
+            "encoder.layers.0.mlp.fc2.weight".into(),
+            (matrix(rows, cols), vec![rows, cols]),
+        );
+        keymap.insert(
+            "encoder.layers.0.norm1.weight".into(),
+            (vec![1.0; cols], vec![cols]),
+        );
+        keymap.insert(
+            "embeddings.word_embeddings.weight".into(),
+            (matrix(4, cols), vec![4, cols]),
+        );
         let x = inputs(32, cols);
         let mut mean_abs = vec![0f32; cols];
         for r in &x {
@@ -780,28 +864,76 @@ mod pile_tests {
         let stats_for = |name: &str| stats.get(&nomic_capture_key(name));
 
         let mut packed_keymap = keymap.clone();
-        let report =
-            pack_keymap(&mut packed_keymap, &[], &stats_for, &Options::default(), &mut |_| {}).unwrap();
-        assert_eq!(report.tensors, 1, "the linear packs; the norm and the embedding do not");
-        assert_ne!(packed_keymap["encoder.layers.0.mlp.fc2.weight"].0, keymap["encoder.layers.0.mlp.fc2.weight"].0);
-        assert_eq!(packed_keymap["encoder.layers.0.norm1.weight"], keymap["encoder.layers.0.norm1.weight"]);
+        let report = pack_keymap(
+            &mut packed_keymap,
+            &[],
+            &stats_for,
+            &Options::default(),
+            &mut |_| {},
+        )
+        .unwrap();
+        assert_eq!(
+            report.tensors, 1,
+            "the linear packs; the norm and the embedding do not"
+        );
+        assert_ne!(
+            packed_keymap["encoder.layers.0.mlp.fc2.weight"].0,
+            keymap["encoder.layers.0.mlp.fc2.weight"].0
+        );
+        assert_eq!(
+            packed_keymap["encoder.layers.0.norm1.weight"],
+            keymap["encoder.layers.0.norm1.weight"]
+        );
 
-        let root = write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None, false)
-            .unwrap();
-        assert!(write_packed_pile(&out, &key, &packed_keymap, &report.packed, "test/model", "nvfp4-calibrated", None, false).is_err(), "refuses an existing file");
+        let root = write_packed_pile(
+            &out,
+            &key,
+            &packed_keymap,
+            &report.packed,
+            "test/model",
+            "nvfp4-calibrated",
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(
+            write_packed_pile(
+                &out,
+                &key,
+                &packed_keymap,
+                &report.packed,
+                "test/model",
+                "nvfp4-calibrated",
+                None,
+                false
+            )
+            .is_err(),
+            "refuses an existing file"
+        );
 
         let snapshot = crate::model_collection::load_model_collection_local_latest(&out).unwrap();
         let back = crate::selection::load_keymap_from_graph(
             snapshot.facts(),
             snapshot.store(),
-            ModelSelector::Source { source: "test/model", quantization: "nvfp4-calibrated" },
+            ModelSelector::Source {
+                source: "test/model",
+                quantization: "nvfp4-calibrated",
+            },
         )
         .unwrap();
-        assert_eq!(back.len(), 3, "input_scale folded away, keys {:?}", back.keys().collect::<Vec<_>>());
+        assert_eq!(
+            back.len(),
+            3,
+            "input_scale folded away, keys {:?}",
+            back.keys().collect::<Vec<_>>()
+        );
         for (name, (values, shape)) in &packed_keymap {
             let (b, s) = &back[name];
             assert_eq!(s, shape, "{name}");
-            assert_eq!(b, values, "{name}: the loader decodes what the packer scored");
+            assert_eq!(
+                b, values,
+                "{name}: the loader decodes what the packer scored"
+            );
         }
         assert_eq!(
             crate::selection::load_keymap_from_graph(

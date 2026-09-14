@@ -145,13 +145,14 @@ fn named_collections_from_handles(
         // still current, including when this snapshot admits no writer.
         // Ordinary policy admission accepts supported alternatives; the scalar
         // descriptor inspector would incorrectly reject plural policy bindings.
-        let has_current_policies = [read_capability(), write_capability()]
-            .into_iter()
-            .all(|capability| {
-                descriptor::admission_policies(&facts, capability, Some(SimpleArchive::id()))
-                    .next()
-                    .is_some()
-            });
+        let has_current_policies =
+            [read_capability(), write_capability()]
+                .into_iter()
+                .all(|capability| {
+                    descriptor::admission_policies(&facts, capability, Some(SimpleArchive::id()))
+                        .next()
+                        .is_some()
+                });
         match (ModelCollection::open(store, handle), has_current_policies) {
             (Ok(collection), true) => collections.push(collection),
             _ => retired.push(handle),
@@ -1036,9 +1037,11 @@ mod tests {
             .unwrap();
         claim.verify_strict().unwrap();
         let snapshot = pile.snapshot().unwrap();
-        assert!(!collection
-            .writer_is_admitted(&snapshot, outsider.verifying_key())
-            .unwrap());
+        assert!(
+            !collection
+                .writer_is_admitted(&snapshot, outsider.verifying_key())
+                .unwrap()
+        );
         assert_eq!(
             model_bundle_collections_in(&snapshot).unwrap(),
             vec![collection],

@@ -365,7 +365,11 @@ impl SessionConfig {
     }
 }
 
-fn validate_weight_writers(storage: WeightStorage, distillation: bool, learner: bool) -> Result<()> {
+fn validate_weight_writers(
+    storage: WeightStorage,
+    distillation: bool,
+    learner: bool,
+) -> Result<()> {
     anyhow::ensure!(
         !storage.inference_only() || (!distillation && !learner),
         "{} weights require inference only: disable SDFT and the active INK_LEARN_LR learner",
@@ -388,9 +392,13 @@ fn require_weight_aliases(
     storage: WeightStorage,
 ) -> Result<super::fp4gemm::Aliases> {
     if storage.inference_only() {
-        anyhow::ensure!(registered.as_ref().is_some_and(|aliases| !aliases.is_empty()),
+        anyhow::ensure!(
+            registered
+                .as_ref()
+                .is_some_and(|aliases| !aliases.is_empty()),
             "{} weights require zero-copy host registration; refusing a second copied weight arena",
-            storage.as_str());
+            storage.as_str()
+        );
     }
     Ok(registered.unwrap_or_else(super::fp4gemm::Aliases::disabled))
 }
@@ -752,15 +760,23 @@ enum PassMode {
     /// Commit, and also score every row against the id that followed it:
     /// `ids[1..]` inside the pass and `next` after it, when the caller knows
     /// what came next. See [`Session::extend_scored`].
-    Scored { next: Option<usize> },
+    Scored {
+        next: Option<usize>,
+    },
     Target,
 }
 
 enum PassOutput {
     Committed(usize),
-    Observed { logits: T2, residual: T2 },
+    Observed {
+        logits: T2,
+        residual: T2,
+    },
     /// The committed token and the per-row negative log-likelihoods, in nats.
-    Scored { best: usize, nll: ScoredNll },
+    Scored {
+        best: usize,
+        nll: ScoredNll,
+    },
     Target(Vec<usize>),
 }
 
@@ -786,7 +802,9 @@ const SCORE_ROWS: usize = 64;
 /// `INK_LEARN_TRACE=1`: one line per learning pass.
 #[cfg(feature = "inkling-cuda")]
 fn learn_trace() -> bool {
-    std::env::var("INK_LEARN_TRACE").map(|v| v == "1").unwrap_or(false)
+    std::env::var("INK_LEARN_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// One device layer viewed through the backend-free target settlement trait.
@@ -903,18 +921,24 @@ impl Session {
             // would otherwise mark a supported fresh process as unsupported.
             cudarc::driver::result::init()
                 .context("initialize CUDA for the weight storage capability check")?;
-            anyhow::ensure!(cubecl::cuda::supports_zero_copy_host(0),
+            anyhow::ensure!(
+                cubecl::cuda::supports_zero_copy_host(0),
                 "{} weights require pageable host access through host page tables; refusing a copied weight arena",
-                cfg.weight_storage.as_str());
+                cfg.weight_storage.as_str()
+            );
         }
         super::fatal::arm();
 
         if cfg.preallocate_kv {
-            anyhow::ensure!(cfg.distillation.is_none() && cfg.sequence_context_budgets.is_empty(),
-                "explicit KV preallocation currently supports one inference sequence, not SDFT or extra sequences");
+            anyhow::ensure!(
+                cfg.distillation.is_none() && cfg.sequence_context_budgets.is_empty(),
+                "explicit KV preallocation currently supports one inference sequence, not SDFT or extra sequences"
+            );
             for name in ["INK_KV_PREALLOC", "INK_KV_EPOCH", "INK_LEARN_LR"] {
-                anyhow::ensure!(std::env::var_os(name).is_none(),
-                    "explicit KV preallocation refuses ambient {name}; use the admitted serving shape");
+                anyhow::ensure!(
+                    std::env::var_os(name).is_none(),
+                    "explicit KV preallocation refuses ambient {name}; use the admitted serving shape"
+                );
             }
         }
 
@@ -953,54 +977,81 @@ impl Session {
                 .to_string(),
         };
         let conf = InklingConfig::from_json(&text).context("parsing config.json")?;
-        let config_identity = *blake3::hash(&serde_json::to_vec(
-            &serde_json::from_str::<serde_json::Value>(&text)?,
-        )?).as_bytes();
+        let config_identity = *blake3::hash(&serde_json::to_vec(&serde_json::from_str::<
+            serde_json::Value,
+        >(&text)?)?)
+        .as_bytes();
         let t = &conf.text_config;
         let tp = group.as_ref().map(Group::tp);
-        let kv_plan = cfg.preallocate_kv.then(|| {
-            super::kvpages::KvPlan::for_session(
-                cfg.context_budget, t.sliding_window_size, cfg.prefill_budget,
-            )
-        }).transpose()?;
+        let kv_plan = cfg
+            .preallocate_kv
+            .then(|| {
+                super::kvpages::KvPlan::for_session(
+                    cfg.context_budget,
+                    t.sliding_window_size,
+                    cfg.prefill_budget,
+                )
+            })
+            .transpose()?;
 
         let (lo, hi) = (cfg.layers.start, cfg.layers.end);
         let partial = validate_layer_range(&cfg.layers, t.num_hidden_layers, tp)?;
         if let Some(distillation) = &cfg.distillation {
             distillation.validate()?;
-            anyhow::ensure!(!partial && !t.is_dense(hi - 1),
-                "SDFT requires a complete stack with a routed final layer");
-            anyhow::ensure!(distillation.sequences < cfg.prefill_budget.min(SCORE_ROWS),
-                "SDFT students plus foreground exceed the admitted independent batch width");
-            anyhow::ensure!(distillation.max_rollout <= cfg.prefill_budget.min(SCORE_ROWS),
-                "SDFT rollout exceeds the single soft-target pass admission");
+            anyhow::ensure!(
+                !partial && !t.is_dense(hi - 1),
+                "SDFT requires a complete stack with a routed final layer"
+            );
+            anyhow::ensure!(
+                distillation.sequences < cfg.prefill_budget.min(SCORE_ROWS),
+                "SDFT students plus foreground exceed the admitted independent batch width"
+            );
+            anyhow::ensure!(
+                distillation.max_rollout <= cfg.prefill_budget.min(SCORE_ROWS),
+                "SDFT rollout exceeds the single soft-target pass admission"
+            );
             let learning_rows = super::sdft_admission::captured_rows(
-                distillation.max_rollout, distillation.context_budget,
+                distillation.max_rollout,
+                distillation.context_budget,
                 if t.use_sconv { t.sconv_kernel_size } else { 1 },
             )?;
-            anyhow::ensure!(learning_rows <= cfg.prefill_budget,
+            anyhow::ensure!(
+                learning_rows <= cfg.prefill_budget,
                 "SDFT response plus convolution history needs {learning_rows} rows, prefill budget is {}",
-                cfg.prefill_budget);
-            anyhow::ensure!(cfg.sequence_context_budgets.is_empty(),
-                "typed SDFT supplies its own sequence admissions; do not also supply manual capsules");
-            anyhow::ensure!(src.is_nvfp4(&format!("model.llm.layers.{}.mlp.experts.w13_weight", hi - 1)),
-                "SDFT's final routed layer must use packed NVFP4 storage");
-            cfg.sequence_context_budgets.extend(distillation.sequence_budgets()?);
+                cfg.prefill_budget
+            );
+            anyhow::ensure!(
+                cfg.sequence_context_budgets.is_empty(),
+                "typed SDFT supplies its own sequence admissions; do not also supply manual capsules"
+            );
+            anyhow::ensure!(
+                src.is_nvfp4(&format!(
+                    "model.llm.layers.{}.mlp.experts.w13_weight",
+                    hi - 1
+                )),
+                "SDFT's final routed layer must use packed NVFP4 storage"
+            );
+            cfg.sequence_context_budgets
+                .extend(distillation.sequence_budgets()?);
             #[cfg(feature = "inkling-cuda")]
             {
                 let inter = match tp {
-                    Some(tp) => tp.share("intermediate_size", t.intermediate_size)
+                    Some(tp) => tp
+                        .share("intermediate_size", t.intermediate_size)
                         .map_err(|e| anyhow::anyhow!(e))?,
                     None => t.intermediate_size,
                 };
                 let workspace = super::sdft_admission::workspace_bytes(t, distillation, inter)?;
-                let ema = super::learn::ema::memory_bytes(t.n_routed_experts, t.hidden_size, inter)?;
+                let ema =
+                    super::learn::ema::memory_bytes(t.n_routed_experts, t.hidden_size, inter)?;
                 // The learner's transposed packed head is separate from the
                 // inference head. Its BF16 transpose exists during binding.
                 let head = (t.vocab_size as u128) * (t.hidden_size as u128);
                 let reserve = u64::try_from(ema.total as u128 + head * 5 + workspace.total as u128)
                     .context("SDFT learner admission overflow")?;
-                cfg.extra_reserved_bytes = cfg.extra_reserved_bytes.checked_add(reserve)
+                cfg.extra_reserved_bytes = cfg
+                    .extra_reserved_bytes
+                    .checked_add(reserve)
                     .context("SDFT resident reservation overflow")?;
             }
         }
@@ -1094,8 +1145,10 @@ impl Session {
             .context("extra resident admission overflow")?;
         if let Some(plan) = kv_plan {
             let bytes = super::budget::reserved_kv_bytes(t, lo..hi, plan, admission)?;
-            eprintln!("  KV plan            : explicit fixed capacity, {} bytes on this rank; context={}, global_rows={}, local_rows={}, epoch={}; allocated on first prefill, replaces growing KV charge",
-                bytes, plan.context, plan.global_rows, plan.local_rows, plan.epoch);
+            eprintln!(
+                "  KV plan            : explicit fixed capacity, {} bytes on this rank; context={}, global_rows={}, local_rows={}, epoch={}; allocated on first prefill, replaces growing KV charge",
+                bytes, plan.context, plan.global_rows, plan.local_rows, plan.epoch
+            );
         }
 
         // Move this rank's share into ONE anonymous allocation before any GPU
@@ -1108,7 +1161,14 @@ impl Session {
         // Always: a Session has to be able to answer, so it always binds the
         // unembedding.
         globals.push("model.llm.unembed.weight");
-        src.copy_share(lo..hi, &globals, attention_bytes, admission, tp, cfg.weight_storage)?;
+        src.copy_share(
+            lo..hi,
+            &globals,
+            attention_bytes,
+            admission,
+            tp,
+            cfg.weight_storage,
+        )?;
 
         // The compute client taken FROM a Burn tensor rather than constructed
         // beside it: `seam::handle_of` hands a Burn allocation to a raw kernel on
@@ -1134,8 +1194,13 @@ impl Session {
         // aliases it the same way.
         #[cfg(feature = "inkling-cuda")]
         {
-            let partial_ok = std::env::var("INK_LEARN_PARTIAL").map(|v| v == "1").unwrap_or(false);
-            if cfg.distillation.is_none() && super::learn::Learner::from_env().is_some() && (!partial || partial_ok) {
+            let partial_ok = std::env::var("INK_LEARN_PARTIAL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
+            if cfg.distillation.is_none()
+                && super::learn::Learner::from_env().is_some()
+                && (!partial || partial_ok)
+            {
                 let layer = hi - 1;
                 let (n, bytes) = src.freeze_experts(&format!("model.llm.layers.{layer}."))?;
                 println!(
@@ -1232,9 +1297,15 @@ impl Session {
             // `INK_LEARN_PARTIAL=1` arms it on a partial stack too, for the
             // mechanics only: the head then unembeds a hidden state the stack
             // did not finish, so the loss is diagnostic and so is the step.
-            let partial_ok = std::env::var("INK_LEARN_PARTIAL").map(|v| v == "1").unwrap_or(false);
+            let partial_ok = std::env::var("INK_LEARN_PARTIAL")
+                .map(|v| v == "1")
+                .unwrap_or(false);
             let (trainable, capture) = learning_layers(
-                hi - 1, learner.is_some(), partial, partial_ok, cfg.distillation.is_some(),
+                hi - 1,
+                learner.is_some(),
+                partial,
+                partial_ok,
+                cfg.distillation.is_some(),
             );
             moe.learn_layer = capture;
             trainable
@@ -1356,20 +1427,41 @@ impl Session {
     }
 
     fn ensure_cache_inference_only(&self) -> Result<()> {
-        anyhow::ensure!(!self.torn, "a torn Session cannot export or restore a cache");
-        anyhow::ensure!(!self.learning() && self.trainable_layer().is_none()
-            && !self.teacher_bank_available && self.sequence_teacher_version.is_none()
-            && self.moe.teacher.is_none(),
-            "portable caches are inference-only; learner and teacher state is not included");
+        anyhow::ensure!(
+            !self.torn,
+            "a torn Session cannot export or restore a cache"
+        );
+        anyhow::ensure!(
+            !self.learning()
+                && self.trainable_layer().is_none()
+                && !self.teacher_bank_available
+                && self.sequence_teacher_version.is_none()
+                && self.moe.teacher.is_none(),
+            "portable caches are inference-only; learner and teacher state is not included"
+        );
         #[cfg(feature = "inkling-cuda")]
-        anyhow::ensure!(self.anchor.is_empty() && self.moe.learn.is_none()
-            && self.moe.learn_layer.is_none(), "portable caches cannot omit pending learning state");
-        anyhow::ensure!(self.audio.as_ref().is_none_or(|a| a.queue.pending.is_empty())
-            && self.vision.as_ref().is_none_or(|v| v.queue.pending.is_empty()),
-            "portable caches cannot omit staged sensory input");
-        anyhow::ensure!(self.caches.iter().all(|cache| cache.attn.pending_rows().is_none()
-            && cache.attn_sconv_pending.is_none() && cache.mlp_sconv_pending.is_none()),
-            "portable caches require a settled target transaction");
+        anyhow::ensure!(
+            self.anchor.is_empty() && self.moe.learn.is_none() && self.moe.learn_layer.is_none(),
+            "portable caches cannot omit pending learning state"
+        );
+        anyhow::ensure!(
+            self.audio
+                .as_ref()
+                .is_none_or(|a| a.queue.pending.is_empty())
+                && self
+                    .vision
+                    .as_ref()
+                    .is_none_or(|v| v.queue.pending.is_empty()),
+            "portable caches cannot omit staged sensory input"
+        );
+        anyhow::ensure!(
+            self.caches
+                .iter()
+                .all(|cache| cache.attn.pending_rows().is_none()
+                    && cache.attn_sconv_pending.is_none()
+                    && cache.mlp_sconv_pending.is_none()),
+            "portable caches require a settled target transaction"
+        );
         Ok(())
     }
 
@@ -1377,16 +1469,21 @@ impl Session {
         use super::cache_state::{CacheGeometry, LayerGeometry};
         let t = &self.cfg.text_config;
         let tp = self.group.as_ref().map(Group::tp);
-        let layers = (self.lo..self.hi).map(|layer| {
-            let kind = t.attn_kind(layer);
-            let (_, heads, dim) = t.heads(kind);
-            let heads = match tp { Some(tp) => tp.share("kv_heads", heads)?, None => heads };
-            Ok(LayerGeometry {
-                layer,
-                kv_width: heads.checked_mul(dim).context("cache KV width overflow")?,
-                window: (kind == AttnKind::Local).then_some(t.sliding_window_size),
+        let layers = (self.lo..self.hi)
+            .map(|layer| {
+                let kind = t.attn_kind(layer);
+                let (_, heads, dim) = t.heads(kind);
+                let heads = match tp {
+                    Some(tp) => tp.share("kv_heads", heads)?,
+                    None => heads,
+                };
+                Ok(LayerGeometry {
+                    layer,
+                    kv_width: heads.checked_mul(dim).context("cache KV width overflow")?,
+                    window: (kind == AttnKind::Local).then_some(t.sliding_window_size),
+                })
             })
-        }).collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         Ok(CacheGeometry {
             model_identity: self.model_identity(),
             model_root: self.model_root().map(|id| id.raw()),
@@ -1402,13 +1499,20 @@ impl Session {
             prefill_budget: self.prefill_budget,
             forbidden: self.forbidden.clone(),
             router: match RouterArm::from_env() {
-                RouterArm::Transpose => "transpose", RouterArm::Pre => "pre", RouterArm::Bf16 => "bf16",
-            }.to_owned(),
+                RouterArm::Transpose => "transpose",
+                RouterArm::Pre => "pre",
+                RouterArm::Bf16 => "bf16",
+            }
+            .to_owned(),
             shared_halved: self.shared_halved,
-            kv_prealloc: self.kv_plan.or_else(|| super::kvpages::KvPlan::from_env(t.sliding_window_size))
+            kv_prealloc: self
+                .kv_plan
+                .or_else(|| super::kvpages::KvPlan::from_env(t.sliding_window_size))
                 .map(|p| p.context),
             kv_local_rows: self.kv_plan.map(|p| p.local_rows),
-            kv_epoch: self.kv_plan.map_or_else(super::kvpages::kv_epoch, |p| p.epoch),
+            kv_epoch: self
+                .kv_plan
+                .map_or_else(super::kvpages::kv_epoch, |p| p.epoch),
             fp4: super::kvpages::fp4_kv(),
             attn_bf16: dev_lane::attn_bf16(),
             act_bf16: dev_lane::act_bf16(),
@@ -1435,12 +1539,18 @@ impl Session {
     /// fetching any payload or allocating KV. A reset Session is fresh too.
     pub fn validate_cache(&self, state: &super::cache_state::SessionCacheState) -> Result<()> {
         self.ensure_cache_inference_only()?;
-        anyhow::ensure!(self.pos == 0 && self.last.is_none() && self.caches.is_empty(),
-            "restore requires a fresh Session; reset before replacing a live sequence");
-        anyhow::ensure!(state.audio_slot.is_none() || self.audio.is_some(),
-            "cache carries an audio slot but this Session has no audio input");
-        anyhow::ensure!(state.vision_slot.is_none() || self.vision.is_some(),
-            "cache carries a vision slot but this Session has no vision input");
+        anyhow::ensure!(
+            self.pos == 0 && self.last.is_none() && self.caches.is_empty(),
+            "restore requires a fresh Session; reset before replacing a live sequence"
+        );
+        anyhow::ensure!(
+            state.audio_slot.is_none() || self.audio.is_some(),
+            "cache carries an audio slot but this Session has no audio input"
+        );
+        anyhow::ensure!(
+            state.vision_slot.is_none() || self.vision.is_some(),
+            "cache carries a vision slot but this Session has no vision input"
+        );
         state.validate(&self.cache_geometry()?)
     }
 
@@ -1448,21 +1558,31 @@ impl Session {
     /// The sink must return BLAKE3(raw); publication/durability belongs to the
     /// caller. Failed export can leave unpublished blobs, never a valid image.
     /// Packed KV codes and scales are copied exactly, without requantization.
-    pub fn export_cache(&self, sink: &mut super::cache_state::BlobSink<'_>)
-        -> Result<super::cache_state::SessionCacheState>
-    {
+    pub fn export_cache(
+        &self,
+        sink: &mut super::cache_state::BlobSink<'_>,
+    ) -> Result<super::cache_state::SessionCacheState> {
         use super::cache_state::{self, LayerCacheState, SessionCacheState};
         self.trace_host_totals("before_cache_export");
         self.ensure_cache_inference_only()?;
-        anyhow::ensure!(self.pos > 0 && self.caches.len() == self.hi - self.lo,
-            "portable cache export requires a complete nonempty sequence");
+        anyhow::ensure!(
+            self.pos > 0 && self.caches.len() == self.hi - self.lo,
+            "portable cache export requires a complete nonempty sequence"
+        );
         let geometry = self.cache_geometry()?;
         let mut layers = Vec::with_capacity(self.caches.len());
         for cache in &self.caches {
-            let mlp = cache.mlp_sconv.as_ref().context("cache has no settled MLP convolution history")?;
+            let mlp = cache
+                .mlp_sconv
+                .as_ref()
+                .context("cache has no settled MLP convolution history")?;
             layers.push(LayerCacheState {
                 attn: cache.attn.export_cache(sink)?,
-                attn_sconv: cache_state::export_float(&cache.attn_sconv, 0..cache.attn_sconv.dims()[0], sink)?,
+                attn_sconv: cache_state::export_float(
+                    &cache.attn_sconv,
+                    0..cache.attn_sconv.dims()[0],
+                    sink,
+                )?,
                 mlp_sconv: cache_state::export_float(mlp, 0..mlp.dims()[0], sink)?,
             });
         }
@@ -1484,15 +1604,26 @@ impl Session {
     /// Observations only: no CUDA synchronization or allocator cleanup.
     fn trace_host_totals(&self, boundary: &str) {
         use std::io::Write;
-        let Some(snapshot) = cubecl::cuda::host_operation_snapshot() else { return };
+        let Some(snapshot) = cubecl::cuda::host_operation_snapshot() else {
+            return;
+        };
         let rank = self.group.as_ref().map_or(0, |group| group.tp().rank());
-        let unix_ms = snapshot.unix_ms.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
+        let unix_ms = snapshot
+            .unix_ms
+            .map_or_else(|| "unknown".to_owned(), |n| n.to_string());
         let mut stderr = std::io::stderr().lock();
         for op in snapshot.operations {
-            let _ = writeln!(stderr,
+            let _ = writeln!(
+                stderr,
                 "[inkling-host-totals] end_unix_ms={unix_ms} pid={} rank={rank} position={} boundary={boundary} op={} calls_total={} slow_calls_total={} host_micros_total={} requested_bytes_total={} snapshot=relaxed_completed_host_operations",
-                snapshot.pid, self.pos, op.operation, op.calls_total, op.slow_calls_total,
-                op.host_micros_total, op.requested_bytes_total);
+                snapshot.pid,
+                self.pos,
+                op.operation,
+                op.calls_total,
+                op.slow_calls_total,
+                op.host_micros_total,
+                op.requested_bytes_total
+            );
         }
     }
 
@@ -1501,9 +1632,11 @@ impl Session {
     /// and replacement caches are installed together only after the final sync.
     /// An upload/source failure poisons this Session until an explicit reset;
     /// no partially reconstructed layer can be used as a continuation.
-    pub fn restore_cache(&mut self, state: &super::cache_state::SessionCacheState,
-        source: &mut super::cache_state::BlobSource<'_>) -> Result<()>
-    {
+    pub fn restore_cache(
+        &mut self,
+        state: &super::cache_state::SessionCacheState,
+        source: &mut super::cache_state::BlobSource<'_>,
+    ) -> Result<()> {
         use super::cache_state;
         self.validate_cache(state)?;
         self.torn = true;
@@ -1511,9 +1644,24 @@ impl Session {
         for layer in &state.layers {
             caches.push(LayerCache {
                 attn: dev_lane::AttnCache::restore_cache(
-                    &layer.attn, &self.client, &self.dev, self.cached_attention, source)?,
-                attn_sconv: cache_state::restore_float(&layer.attn_sconv, &self.client, &self.dev, source)?,
-                mlp_sconv: Some(cache_state::restore_float(&layer.mlp_sconv, &self.client, &self.dev, source)?),
+                    &layer.attn,
+                    &self.client,
+                    &self.dev,
+                    self.cached_attention,
+                    source,
+                )?,
+                attn_sconv: cache_state::restore_float(
+                    &layer.attn_sconv,
+                    &self.client,
+                    &self.dev,
+                    source,
+                )?,
+                mlp_sconv: Some(cache_state::restore_float(
+                    &layer.mlp_sconv,
+                    &self.client,
+                    &self.dev,
+                    source,
+                )?),
                 attn_sconv_pending: None,
                 mlp_sconv_pending: None,
             });
@@ -1523,8 +1671,12 @@ impl Session {
         self.caches = caches;
         self.pos = state.position;
         self.last = state.last_prediction;
-        if let Some(audio) = self.audio.as_mut() { audio.queue.slot = state.audio_slot; }
-        if let Some(vision) = self.vision.as_mut() { vision.queue.slot = state.vision_slot; }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.queue.slot = state.audio_slot;
+        }
+        if let Some(vision) = self.vision.as_mut() {
+            vision.queue.slot = state.vision_slot;
+        }
         self.seq = next_seq();
         self.torn = false;
         Ok(())
@@ -1569,8 +1721,10 @@ impl Session {
         let mut local_layers = 0usize;
         for layer in self.lo..self.hi {
             let cache = &self.caches[layer - self.lo].attn;
-            anyhow::ensure!(cache.cached_attention() == self.cached_attention,
-                "layer {layer} cached-attention policy differs from its Session");
+            anyhow::ensure!(
+                cache.cached_attention() == self.cached_attention,
+                "layer {layer} cached-attention policy differs from its Session"
+            );
             let kind = t.attn_kind(layer);
             local_layers += usize::from(kind == AttnKind::Local);
             let (expected_base, mut expected_len) =
@@ -1639,9 +1793,13 @@ impl Session {
     /// does not say whether the current forward is being kept for backward.
     pub fn trainable_layer(&self) -> Option<usize> {
         #[cfg(feature = "inkling-cuda")]
-        { self.trainable_layer }
+        {
+            self.trainable_layer
+        }
         #[cfg(not(feature = "inkling-cuda"))]
-        { None }
+        {
+            None
+        }
     }
 
     /// The model root the weights were loaded from, if one was named or
@@ -1670,8 +1828,9 @@ impl Session {
             let Some(layer) = self.trainable_layer else {
                 return Ok(Vec::new());
             };
-            cubecl::future::block_on(self.client.sync())
-                .map_err(|e| anyhow::anyhow!("device sync before exporting the learned layer: {e:?}"))?;
+            cubecl::future::block_on(self.client.sync()).map_err(|e| {
+                anyhow::anyhow!("device sync before exporting the learned layer: {e:?}")
+            })?;
             let tp = self.group.as_ref().map(|g| g.tp());
             let n_routed = self.cfg.text_config.n_routed_experts;
             return super::learned::export_learned(&self.src, tp, layer, n_routed);
@@ -1755,7 +1914,9 @@ impl Session {
         let boundary = TargetBoundary::new(self.pos, self.last, width.rows())?;
         let predictions = match self.forward_pass(proposed, PassMode::Target) {
             Ok(PassOutput::Target(predictions)) => predictions,
-            Ok(PassOutput::Committed(_) | PassOutput::Scored { .. } | PassOutput::Observed { .. }) => {
+            Ok(
+                PassOutput::Committed(_) | PassOutput::Scored { .. } | PassOutput::Observed { .. },
+            ) => {
                 unreachable!("a target pass returned a committed prediction")
             }
             Err(source) => {
@@ -2168,7 +2329,11 @@ impl Session {
             out = best;
             start += chunk.len();
         }
-        debug_assert_eq!(nll.nll.len(), ids.len() - 1, "every id after the first is scored");
+        debug_assert_eq!(
+            nll.nll.len(),
+            ids.len() - 1,
+            "every id after the first is scored"
+        );
         Ok((out, nll))
     }
 
@@ -2305,7 +2470,10 @@ impl Session {
     /// [`Session::forward`] in either committing mode. `PassMode::Scored` also
     /// returns the per-row score; `PassMode::Commit` returns an empty one.
     fn forward_committed(&mut self, ids: &[usize], mode: PassMode) -> Result<(usize, ScoredNll)> {
-        debug_assert!(mode != PassMode::Target, "a target pass is a transaction, not a commit");
+        debug_assert!(
+            mode != PassMode::Target,
+            "a target pass is a transaction, not a commit"
+        );
         anyhow::ensure!(!ids.is_empty(), "a pass with no tokens would be vacuous");
         let end = self
             .pos
@@ -2354,8 +2522,11 @@ impl Session {
     /// any error, and it can only do that if the errors have somewhere to
     /// return to.
     fn forward_pass(&mut self, ids: &[usize], mode: PassMode) -> Result<PassOutput> {
-        let _trace_context = host_trace::pass(self.pos, ids.len(),
-            self.group.as_ref().map_or(0, |group| group.tp().rank()));
+        let _trace_context = host_trace::pass(
+            self.pos,
+            ids.len(),
+            self.group.as_ref().map_or(0, |group| group.tp().rank()),
+        );
         // Declared first so the inclusive span also sees end-of-pass tensor
         // drops. These guards hold only timestamps/context, never GPU handles.
         let _trace_forward = host_trace::span("forward_pass");
@@ -2519,7 +2690,14 @@ impl Session {
                 // builds from absolute positions is what makes the untrimmed
                 // rows harmless, and `commit` below is what makes the store
                 // bounded again.
-                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, true) => {
+                (
+                    true,
+                    PassMode::Commit
+                    | PassMode::Observe
+                    | PassMode::ObserveAll
+                    | PassMode::Scored { .. },
+                    true,
+                ) => {
                     let y = dev_lane::attention_steps(
                         hn,
                         &ld.attn,
@@ -2552,7 +2730,14 @@ impl Session {
                     self.caches[slot].attn_sconv = dev_lane::conv_history(all, t.sconv_kernel_size);
                     out
                 }
-                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, false) => {
+                (
+                    true,
+                    PassMode::Commit
+                    | PassMode::Observe
+                    | PassMode::ObserveAll
+                    | PassMode::Scored { .. },
+                    false,
+                ) => {
                     let y = dev_lane::attention_step(
                         hn,
                         &ld.attn,
@@ -2571,7 +2756,14 @@ impl Session {
                     self.caches[slot].attn_sconv = hist;
                     out
                 }
-                (false, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, _) => {
+                (
+                    false,
+                    PassMode::Commit
+                    | PassMode::Observe
+                    | PassMode::ObserveAll
+                    | PassMode::Scored { .. },
+                    _,
+                ) => {
                     let (y, attn) =
                         dev_lane::attention_prefill(hn, &ld.attn, &dims, Some(ls), window, window);
                     let mut attn = attn.with_cached_attention(self.cached_attention);
@@ -2675,7 +2867,14 @@ impl Session {
                 // need the batched form, and a widened pass that left one of
                 // them on the single-row kernel would convolve `n` positions
                 // out of one position's history with no error at all.
-                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, true) => {
+                (
+                    true,
+                    PassMode::Commit
+                    | PassMode::Observe
+                    | PassMode::ObserveAll
+                    | PassMode::Scored { .. },
+                    true,
+                ) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
@@ -2685,7 +2884,14 @@ impl Session {
                         Some(dev_lane::conv_history(all, t.sconv_kernel_size));
                     o
                 }
-                (true, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, false) => {
+                (
+                    true,
+                    PassMode::Commit
+                    | PassMode::Observe
+                    | PassMode::ObserveAll
+                    | PassMode::Scored { .. },
+                    false,
+                ) => {
                     let h0 = self.caches[slot]
                         .mlp_sconv
                         .clone()
@@ -2694,7 +2900,14 @@ impl Session {
                     self.caches[slot].mlp_sconv = Some(hi);
                     o
                 }
-                (false, PassMode::Commit | PassMode::Observe | PassMode::ObserveAll | PassMode::Scored { .. }, _) => {
+                (
+                    false,
+                    PassMode::Commit
+                    | PassMode::Observe
+                    | PassMode::ObserveAll
+                    | PassMode::Scored { .. },
+                    _,
+                ) => {
                     let hist = dev_lane::conv_history(y.clone(), t.sconv_kernel_size);
                     self.caches[slot].mlp_sconv = Some(hist);
                     dev_lane::short_conv(y, ld.mlp_sconv.clone())
@@ -2729,18 +2942,20 @@ impl Session {
             // global-cache size it has visited.
             let last_layer = layer + 1 == self.hi;
             let client = &self.client;
-            let want_cleanup = self.cleanup_gate.at_layer(last_layer, || host_trace::call("pool_poll", || {
-                client
-                    .memory_usage()
-                    .map(|usage| {
-                        super::pool::stranded_bytes(
-                            usage.bytes_reserved,
-                            usage.bytes_in_use,
-                            usage.bytes_padding,
-                        )
-                    })
-                    .unwrap_or(0)
-            }));
+            let want_cleanup = self.cleanup_gate.at_layer(last_layer, || {
+                host_trace::call("pool_poll", || {
+                    client
+                        .memory_usage()
+                        .map(|usage| {
+                            super::pool::stranded_bytes(
+                                usage.bytes_reserved,
+                                usage.bytes_in_use,
+                                usage.bytes_padding,
+                            )
+                        })
+                        .unwrap_or(0)
+                })
+            });
             if want_cleanup {
                 host_trace::call("pool_sync", || {
                     <Bk as burn::tensor::backend::Backend>::sync(&self.dev)
@@ -2783,17 +2998,24 @@ impl Session {
         };
         match mode {
             PassMode::Observe | PassMode::ObserveAll => {
-                let logits = head(if mode == PassMode::ObserveAll { xd.clone() }
-                    else { xd.clone().slice([n - 1..n, 0..h]) });
+                let logits = head(if mode == PassMode::ObserveAll {
+                    xd.clone()
+                } else {
+                    xd.clone().slice([n - 1..n, 0..h])
+                });
                 self.pos += n;
                 // A caller will sample these logits. There is no implicit
                 // argmax readback, and no claim that we know its chosen token.
                 self.last = None;
-                Ok(PassOutput::Observed { logits, residual: xd })
+                Ok(PassOutput::Observed {
+                    logits,
+                    residual: xd,
+                })
             }
             PassMode::Commit => {
                 let logits = head(xd.clone().slice([n - 1..n, 0..h]));
-                let best = host_trace::call("prediction_readback", || argmax_row_dev(logits.clone()));
+                let best =
+                    host_trace::call("prediction_readback", || argmax_row_dev(logits.clone()));
                 // A one-row commit is a token she generated: keep the row and
                 // the distribution it was drawn from, for the anchor at the
                 // next scored pass. Wider commits are context, not hers.
@@ -2802,10 +3024,8 @@ impl Session {
                     && self.learner.as_ref().is_some_and(|l| l.anchor.is_some())
                     && let Some(keep) = self.moe.learn.take()
                 {
-                    let dist = burn::tensor::activation::softmax(
-                        logits.cast(burn::tensor::DType::F32),
-                        1,
-                    );
+                    let dist =
+                        burn::tensor::activation::softmax(logits.cast(burn::tensor::DType::F32), 1);
                     self.anchor.push(super::learn::AnchorRow {
                         hn: keep.hn,
                         x_pre: keep
@@ -2848,15 +3068,18 @@ impl Session {
                     let logits = head(xd.clone().slice([lo..hi, 0..h]));
                     let scored = targets.len().min(hi) - lo;
                     if scored > 0 {
-                        nll.extend(host_trace::call("score_readback", || row_nll_dev(
-                            logits.clone().slice([0..scored, 0..vocab]),
-                            &targets[lo..lo + scored],
-                        )));
+                        nll.extend(host_trace::call("score_readback", || {
+                            row_nll_dev(
+                                logits.clone().slice([0..scored, 0..vocab]),
+                                &targets[lo..lo + scored],
+                            )
+                        }));
                     }
                     if hi == n {
                         let last = hi - lo - 1;
-                        best = Some(host_trace::call("prediction_readback", ||
-                            argmax_row_dev(logits.slice([last..last + 1, 0..vocab]))));
+                        best = Some(host_trace::call("prediction_readback", || {
+                            argmax_row_dev(logits.slice([last..last + 1, 0..vocab]))
+                        }));
                     }
                     lo = hi;
                 }
@@ -2875,63 +3098,66 @@ impl Session {
                 // rows, so both columns are prequential. The kept forward
                 // stays for the learner: this pass reads it and leaves it.
                 #[cfg(feature = "inkling-cuda")]
-                let mut frozen_nll: Vec<f32> = match (self.moe.learn.as_ref(), self.src.frozen_prefix()) {
-                    (Some(keep), Some(prefix)) if !targets.is_empty() => {
-                        let layer = keep.layer;
-                        let hn = keep.hn.clone();
-                        let x_pre = keep
-                            .x_pre
-                            .clone()
-                            .expect("the layer loop fills the learned layer's residual");
-                        let hist0 = keep.hist0.clone();
-                        let p = prefix.to_string();
-                        let ld = self
-                            .layers
-                            .get(&p)
-                            .expect("the frozen layer is resident on this rank");
-                        let r = ld.router.as_ref().expect("a MoE layer has a router");
-                        let y = moe_layer(
-                            &self.src,
-                            &self.client,
-                            self.aliases.as_ref(),
-                            &mut self.dense,
-                            &mut self.moe,
-                            &self.dev,
-                            &p,
-                            layer,
-                            t,
-                            r,
-                            hn,
-                            n,
-                            self.shared_halved,
-                            tp,
-                            true,
-                        )?;
-                        let mut extra_calls = 0usize;
-                        let y = tp_reduce(y, &mut extra_calls);
-                        let out = match hist0 {
-                            Some(h0) => dev_lane::short_conv_steps(h0, y, ld.mlp_sconv.clone()).0,
-                            None => dev_lane::short_conv(y, ld.mlp_sconv.clone()),
-                        };
-                        let xf = dev_lane_resid::add_resid(x_pre, out);
-                        let mut out = Vec::with_capacity(targets.len());
-                        let mut lo = 0;
-                        while lo < n {
-                            let hi = (lo + SCORE_ROWS).min(n);
-                            let scored = targets.len().min(hi) - lo;
-                            if scored > 0 {
-                                let logits = head(xf.clone().slice([lo..hi, 0..h]));
-                                out.extend(row_nll_dev(
-                                    logits.slice([0..scored, 0..vocab]),
-                                    &targets[lo..lo + scored],
-                                ));
+                let mut frozen_nll: Vec<f32> =
+                    match (self.moe.learn.as_ref(), self.src.frozen_prefix()) {
+                        (Some(keep), Some(prefix)) if !targets.is_empty() => {
+                            let layer = keep.layer;
+                            let hn = keep.hn.clone();
+                            let x_pre = keep
+                                .x_pre
+                                .clone()
+                                .expect("the layer loop fills the learned layer's residual");
+                            let hist0 = keep.hist0.clone();
+                            let p = prefix.to_string();
+                            let ld = self
+                                .layers
+                                .get(&p)
+                                .expect("the frozen layer is resident on this rank");
+                            let r = ld.router.as_ref().expect("a MoE layer has a router");
+                            let y = moe_layer(
+                                &self.src,
+                                &self.client,
+                                self.aliases.as_ref(),
+                                &mut self.dense,
+                                &mut self.moe,
+                                &self.dev,
+                                &p,
+                                layer,
+                                t,
+                                r,
+                                hn,
+                                n,
+                                self.shared_halved,
+                                tp,
+                                true,
+                            )?;
+                            let mut extra_calls = 0usize;
+                            let y = tp_reduce(y, &mut extra_calls);
+                            let out = match hist0 {
+                                Some(h0) => {
+                                    dev_lane::short_conv_steps(h0, y, ld.mlp_sconv.clone()).0
+                                }
+                                None => dev_lane::short_conv(y, ld.mlp_sconv.clone()),
+                            };
+                            let xf = dev_lane_resid::add_resid(x_pre, out);
+                            let mut out = Vec::with_capacity(targets.len());
+                            let mut lo = 0;
+                            while lo < n {
+                                let hi = (lo + SCORE_ROWS).min(n);
+                                let scored = targets.len().min(hi) - lo;
+                                if scored > 0 {
+                                    let logits = head(xf.clone().slice([lo..hi, 0..h]));
+                                    out.extend(row_nll_dev(
+                                        logits.slice([0..scored, 0..vocab]),
+                                        &targets[lo..lo + scored],
+                                    ));
+                                }
+                                lo = hi;
                             }
-                            lo = hi;
+                            out
                         }
-                        out
-                    }
-                    _ => Vec::new(),
-                };
+                        _ => Vec::new(),
+                    };
                 #[cfg(not(feature = "inkling-cuda"))]
                 let mut frozen_nll: Vec<f32> = Vec::new();
                 #[cfg(feature = "inkling-cuda")]
@@ -3099,7 +3325,10 @@ impl Session {
             }
             PassMode::Target => {
                 let logits = head(xd);
-                Ok(PassOutput::Target(host_trace::call("prediction_readback", || argmax_rows_dev(logits))))
+                Ok(PassOutput::Target(host_trace::call(
+                    "prediction_readback",
+                    || argmax_rows_dev(logits),
+                )))
             }
         }
     }
@@ -3114,7 +3343,10 @@ mod tests {
         let mut config = SessionConfig::new("not-opened.pile");
         assert_eq!(config.cached_attention, CachedAttentionPolicy::Legacy);
         config.cached_attention = CachedAttentionPolicy::PackedBatchedV1;
-        assert_eq!(config.clone().cached_attention, CachedAttentionPolicy::PackedBatchedV1);
+        assert_eq!(
+            config.clone().cached_attention,
+            CachedAttentionPolicy::PackedBatchedV1
+        );
     }
 
     #[test]
@@ -3123,19 +3355,31 @@ mod tests {
             assert!(validate_weight_writers(storage, false, false).is_ok());
             for (distillation, learner) in [(true, false), (false, true), (true, true)] {
                 assert!(validate_weight_writers(storage, distillation, learner).is_err());
-                assert!(validate_weight_writers(WeightStorage::Host, distillation, learner).is_ok());
+                assert!(
+                    validate_weight_writers(WeightStorage::Host, distillation, learner).is_ok()
+                );
             }
         }
-        assert_eq!(SessionConfig::new("not-opened.pile").weight_storage, WeightStorage::Host);
+        assert_eq!(
+            SessionConfig::new("not-opened.pile").weight_storage,
+            WeightStorage::Host
+        );
     }
 
     #[test]
     fn inference_weight_storage_never_selects_the_copying_alias_fallback() {
         for storage in [WeightStorage::HostReadOnly, WeightStorage::CudaManaged] {
             assert!(require_weight_aliases(None, storage).is_err());
-            assert!(require_weight_aliases(Some(super::super::fp4gemm::Aliases::disabled()), storage).is_err());
+            assert!(
+                require_weight_aliases(Some(super::super::fp4gemm::Aliases::disabled()), storage)
+                    .is_err()
+            );
         }
-        assert!(require_weight_aliases(None, WeightStorage::Host).unwrap().is_empty());
+        assert!(
+            require_weight_aliases(None, WeightStorage::Host)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     /// Explicit real weights, two diagnostic layers, synthetic input only.
@@ -3144,25 +3388,49 @@ mod tests {
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_session_roundtrip_after_local_window_rollover() -> Result<()> {
-        session_cache_roundtrip(false, WeightStorage::Host, CachedAttentionPolicy::Legacy, 128, 17)
+        session_cache_roundtrip(
+            false,
+            WeightStorage::Host,
+            CachedAttentionPolicy::Legacy,
+            128,
+            17,
+        )
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_preallocated_session_roundtrip_with_wide_append() -> Result<()> {
-        session_cache_roundtrip(true, WeightStorage::Host, CachedAttentionPolicy::Legacy, 1024, 777)
+        session_cache_roundtrip(
+            true,
+            WeightStorage::Host,
+            CachedAttentionPolicy::Legacy,
+            1024,
+            777,
+        )
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_read_only_weights_session_roundtrip() -> Result<()> {
-        session_cache_roundtrip(true, WeightStorage::HostReadOnly, CachedAttentionPolicy::Legacy, 1024, 777)
+        session_cache_roundtrip(
+            true,
+            WeightStorage::HostReadOnly,
+            CachedAttentionPolicy::Legacy,
+            1024,
+            777,
+        )
     }
 
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_cuda_managed_weights_session_roundtrip() -> Result<()> {
-        session_cache_roundtrip(true, WeightStorage::CudaManaged, CachedAttentionPolicy::Legacy, 1024, 777)
+        session_cache_roundtrip(
+            true,
+            WeightStorage::CudaManaged,
+            CachedAttentionPolicy::Legacy,
+            1024,
+            777,
+        )
     }
 
     /// Two local diagnostic layers test policy plumbing, not full-model quality
@@ -3170,13 +3438,22 @@ mod tests {
     #[test]
     #[ignore = "requires explicit INK_CACHE_TEST_MODEL and an exclusive CUDA reservation"]
     fn portable_cache_packed_batched_policy_survives_lifecycle() -> Result<()> {
-        session_cache_roundtrip(true, WeightStorage::Host,
-            CachedAttentionPolicy::PackedBatchedV1, 512, 90)
+        session_cache_roundtrip(
+            true,
+            WeightStorage::Host,
+            CachedAttentionPolicy::PackedBatchedV1,
+            512,
+            90,
+        )
     }
 
-    fn session_cache_roundtrip(preallocate_kv: bool, weight_storage: WeightStorage,
-        cached_attention: CachedAttentionPolicy, prefill: usize, tail_rows: usize) -> Result<()>
-    {
+    fn session_cache_roundtrip(
+        preallocate_kv: bool,
+        weight_storage: WeightStorage,
+        cached_attention: CachedAttentionPolicy,
+        prefill: usize,
+        tail_rows: usize,
+    ) -> Result<()> {
         use super::super::cache_state::{MAX_CHUNK_BYTES, SessionCacheState};
         const CONTEXT: usize = 2048;
         const HOST_LIMIT: usize = 64 * 1024 * 1024;
@@ -3185,18 +3462,24 @@ mod tests {
             .filter(|p| !p.is_empty())
             .context("set INK_CACHE_TEST_MODEL to an explicit existing real-model pile")?;
         let path = std::path::PathBuf::from(path);
-        anyhow::ensure!(path.is_absolute() && path.is_file(),
-            "INK_CACHE_TEST_MODEL must be an absolute path to an existing file");
+        anyhow::ensure!(
+            path.is_absolute() && path.is_file(),
+            "INK_CACHE_TEST_MODEL must be an absolute path to an existing file"
+        );
         for name in ["INK_TP", "INK_PIPE", "INK_CONFIG", "INK_LEARN_LR"] {
-            anyhow::ensure!(std::env::var_os(name).is_none(),
-                "unset {name}: this test is one inference-only diagnostic rank, with authoritative config");
+            anyhow::ensure!(
+                std::env::var_os(name).is_none(),
+                "unset {name}: this test is one inference-only diagnostic rank, with authoritative config"
+            );
         }
         // In particular, do not inherit a deployment's million-row reservation
         // into this tiny test. No process-global environment is changed here.
         if let Ok(raw) = std::env::var("INK_KV_PREALLOC") {
-            anyhow::ensure!(matches!(raw.as_str(), "" | "0" | "off")
-                || raw.parse::<usize>().is_ok_and(|n| n > 1 && n <= CONTEXT),
-                "INK_KV_PREALLOC must be off or an explicit count in 2..={CONTEXT} for this test");
+            anyhow::ensure!(
+                matches!(raw.as_str(), "" | "0" | "off")
+                    || raw.parse::<usize>().is_ok_and(|n| n > 1 && n <= CONTEXT),
+                "INK_KV_PREALLOC must be off or an explicit count in 2..={CONTEXT} for this test"
+            );
         }
         let mut config = SessionConfig::new(path).layers(0..2);
         config.config_override = None;
@@ -3210,28 +3493,48 @@ mod tests {
         let mut session = Session::load(config)?;
         let identity = session.cache_identity()?; // also refuses any armed learner/teacher
         let t = &session.config().text_config;
-        anyhow::ensure!((0..2).all(|layer| t.attn_kind(layer) == AttnKind::Local),
-            "the explicit test model must have local attention in diagnostic layers 0..2");
-        anyhow::ensure!(t.effective_vocab() > 256 && t.sliding_window_size > 0,
-            "the test needs nonempty local windows and at least 257 valid token IDs");
+        anyhow::ensure!(
+            (0..2).all(|layer| t.attn_kind(layer) == AttnKind::Local),
+            "the explicit test model must have local attention in diagnostic layers 0..2"
+        );
+        anyhow::ensure!(
+            t.effective_vocab() > 256 && t.sliding_window_size > 0,
+            "the test needs nonempty local windows and at least 257 valid token IDs"
+        );
         let window = t.sliding_window_size;
-        let prefix_rows = window.checked_add(129).context("test prefix overflow")?.max(641);
-        anyhow::ensure!(prefix_rows + tail_rows <= CONTEXT,
-            "the model's local window is too wide for this bounded diagnostic");
+        let prefix_rows = window
+            .checked_add(129)
+            .context("test prefix overflow")?
+            .max(641);
+        anyhow::ensure!(
+            prefix_rows + tail_rows <= CONTEXT,
+            "the model's local window is too wide for this bounded diagnostic"
+        );
         let synthetic = |i: usize| 32 + (i * 37 % 191);
         let prefix: Vec<usize> = (0..prefix_rows).map(synthetic).collect();
-        let tail: Vec<usize> = (prefix_rows..prefix_rows + tail_rows).map(synthetic).collect();
+        let tail: Vec<usize> = (prefix_rows..prefix_rows + tail_rows)
+            .map(synthetic)
+            .collect();
 
-        fn save(session: &Session, blobs: &mut BTreeMap<[u8; 32], Vec<u8>>,
-            held: &mut usize) -> Result<SessionCacheState>
-        {
+        fn save(
+            session: &Session,
+            blobs: &mut BTreeMap<[u8; 32], Vec<u8>>,
+            held: &mut usize,
+        ) -> Result<SessionCacheState> {
             session.export_cache(&mut |raw| {
-                anyhow::ensure!(!raw.is_empty() && raw.len() <= MAX_CHUNK_BYTES,
-                    "cache sink exceeded its per-transfer bound");
+                anyhow::ensure!(
+                    !raw.is_empty() && raw.len() <= MAX_CHUNK_BYTES,
+                    "cache sink exceeded its per-transfer bound"
+                );
                 let hash = *blake3::hash(raw).as_bytes();
                 if let std::collections::btree_map::Entry::Vacant(entry) = blobs.entry(hash) {
-                    let total = held.checked_add(raw.len()).context("test payload size overflow")?;
-                    anyhow::ensure!(total <= HOST_LIMIT, "test exceeded its bounded in-memory blob sink");
+                    let total = held
+                        .checked_add(raw.len())
+                        .context("test payload size overflow")?;
+                    anyhow::ensure!(
+                        total <= HOST_LIMIT,
+                        "test exceeded its bounded in-memory blob sink"
+                    );
                     entry.insert(raw.to_vec());
                     *held = total;
                 }
@@ -3243,8 +3546,12 @@ mod tests {
         session.prefill(&prefix)?;
         assert_eq!(session.position(), prefix_rows);
         assert_eq!(session.validate_cache_completeness()?, 2);
-        assert!(session.caches.iter().all(|cache|
-            cache.attn.clone().cached_attention() == cached_attention));
+        assert!(
+            session
+                .caches
+                .iter()
+                .all(|cache| cache.attn.clone().cached_attention() == cached_attention)
+        );
         let checkpoint = save(&session, &mut blobs, &mut held)?;
         assert_eq!(checkpoint.identity, identity);
         assert_eq!(checkpoint.geometry.cached_attention, cached_attention);
@@ -3255,8 +3562,14 @@ mod tests {
             assert_eq!(layer.attn.v.len, window);
             assert!(layer.attn.k.fp4 && layer.attn.v.fp4);
             if preallocate_kv {
-                assert_eq!(Some(layer.attn.k.reserved), checkpoint.geometry.kv_local_rows);
-                assert_eq!(Some(layer.attn.v.reserved), checkpoint.geometry.kv_local_rows);
+                assert_eq!(
+                    Some(layer.attn.k.reserved),
+                    checkpoint.geometry.kv_local_rows
+                );
+                assert_eq!(
+                    Some(layer.attn.v.reserved),
+                    checkpoint.geometry.kv_local_rows
+                );
             }
         }
         if !cached_attention.is_legacy() {
@@ -3285,51 +3598,87 @@ mod tests {
         incompatible.geometry.flash_fp4 = !incompatible.geometry.cached_attention.is_legacy();
         incompatible.identity = incompatible.geometry.identity()?;
         let mut source_called = false;
-        assert!(session.restore_cache(&incompatible, &mut |_, _| {
-            source_called = true;
-            anyhow::bail!("incompatible policy must be refused before requesting payload")
-        }).is_err());
+        assert!(
+            session
+                .restore_cache(&incompatible, &mut |_, _| {
+                    source_called = true;
+                    anyhow::bail!("incompatible policy must be refused before requesting payload")
+                })
+                .is_err()
+        );
         assert!(!source_called && !session.torn && session.caches.is_empty());
         session.validate_cache(&checkpoint)?;
-        let first = checkpoint.chunks().next().context("nonempty cache has no payload")?.handle;
-        let error = session.restore_cache(&checkpoint, &mut |hash, bytes| {
-            let mut raw = blobs.get(&hash).context("missing test blob")?.clone();
-            anyhow::ensure!(raw.len() == bytes && bytes <= MAX_CHUNK_BYTES, "invalid test blob size");
-            if hash == first { raw[0] ^= 1; }
-            Ok(raw)
-        }).expect_err("a corrupted raw cache chunk must not restore");
-        assert!(error.to_string().contains("content hash mismatch"), "{error:#}");
+        let first = checkpoint
+            .chunks()
+            .next()
+            .context("nonempty cache has no payload")?
+            .handle;
+        let error = session
+            .restore_cache(&checkpoint, &mut |hash, bytes| {
+                let mut raw = blobs.get(&hash).context("missing test blob")?.clone();
+                anyhow::ensure!(
+                    raw.len() == bytes && bytes <= MAX_CHUNK_BYTES,
+                    "invalid test blob size"
+                );
+                if hash == first {
+                    raw[0] ^= 1;
+                }
+                Ok(raw)
+            })
+            .expect_err("a corrupted raw cache chunk must not restore");
+        assert!(
+            error.to_string().contains("content hash mismatch"),
+            "{error:#}"
+        );
         assert!(session.torn && session.caches.is_empty());
         assert_eq!(session.position(), 0);
         assert_eq!(session.next_token(), None);
-        assert!(session.cache_identity().is_err(), "a failed restore remained usable");
+        assert!(
+            session.cache_identity().is_err(),
+            "a failed restore remained usable"
+        );
 
         session.reset();
         session.validate_cache(&checkpoint)?;
         session.restore_cache(&checkpoint, &mut |hash, bytes| {
             let raw = blobs.get(&hash).context("missing test blob")?;
-            anyhow::ensure!(raw.len() == bytes && bytes <= MAX_CHUNK_BYTES, "invalid test blob size");
+            anyhow::ensure!(
+                raw.len() == bytes && bytes <= MAX_CHUNK_BYTES,
+                "invalid test blob size"
+            );
             Ok(raw.clone())
         })?;
         assert_eq!(session.position(), prefix_rows);
         assert_eq!(session.next_token(), checkpoint.last_prediction);
         assert_eq!(session.validate_cache_completeness()?, 2);
-        assert_eq!(save(&session, &mut blobs, &mut held)?, checkpoint,
-            "restoring the prefix changed packed KV, histories, or page metadata");
+        assert_eq!(
+            save(&session, &mut blobs, &mut held)?,
+            checkpoint,
+            "restoring the prefix changed packed KV, histories, or page metadata"
+        );
         let actual_prediction = session.extend(&tail)?;
         assert_eq!(actual_prediction, expected_prediction);
         let actual = save(&session, &mut blobs, &mut held)?;
-        assert_eq!(actual, expected,
-            "identical explicit tail changed complete KV/history state after restore");
+        assert_eq!(
+            actual, expected,
+            "identical explicit tail changed complete KV/history state after restore"
+        );
         if !cached_attention.is_legacy() {
             session.reset();
             assert_eq!(session.cache_identity()?, identity);
             session.prefill(&prefix)?;
             assert_eq!(session.validate_cache_completeness()?, 2);
-            assert_eq!(save(&session, &mut blobs, &mut held)?, checkpoint,
-                "reset did not recreate the same policy-bearing prefix caches");
+            assert_eq!(
+                save(&session, &mut blobs, &mut held)?,
+                checkpoint,
+                "reset did not recreate the same policy-bearing prefix caches"
+            );
         }
-        eprintln!("portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} weight_storage={} cached_attention={} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}", weight_storage.as_str(), cached_attention.as_str());
+        eprintln!(
+            "portable Session cache: layers=0..2 preallocate_kv={preallocate_kv} weight_storage={} cached_attention={} prefix_rows={prefix_rows} local_window={window} tail_rows={tail_rows} prediction={actual_prediction} distinct_payload_bytes={held}",
+            weight_storage.as_str(),
+            cached_attention.as_str()
+        );
         Ok(())
     }
 
@@ -3344,22 +3693,34 @@ mod tests {
     #[test]
     #[cfg(feature = "inkling-cuda")]
     fn ordinary_learning_captures_and_exports_the_same_configured_layer() {
-        assert_eq!(learning_layers(41, true, false, false, false), (Some(41), Some(41)));
+        assert_eq!(
+            learning_layers(41, true, false, false, false),
+            (Some(41), Some(41))
+        );
     }
 
     #[test]
     #[cfg(feature = "inkling-cuda")]
     fn nonlearning_and_unapproved_partial_stacks_have_no_trainable_layer() {
         for distillation in [false, true] {
-            assert_eq!(learning_layers(41, false, false, false, distillation), (None, None));
-            assert_eq!(learning_layers(20, true, true, false, distillation), (None, None));
+            assert_eq!(
+                learning_layers(41, false, false, false, distillation),
+                (None, None)
+            );
+            assert_eq!(
+                learning_layers(20, true, true, false, distillation),
+                (None, None)
+            );
         }
     }
 
     #[test]
     #[cfg(feature = "inkling-cuda")]
     fn explicitly_allowed_partial_learning_retains_its_diagnostic_layer() {
-        assert_eq!(learning_layers(20, true, true, true, false), (Some(20), Some(20)));
+        assert_eq!(
+            learning_layers(20, true, true, true, false),
+            (Some(20), Some(20))
+        );
     }
 
     #[test]
@@ -3617,7 +3978,12 @@ impl AudioInput {
         let mut out = vec![0f32; hidden];
         let vocab = self.bins * self.levels;
         for (b, &lvl) in frame.iter().enumerate() {
-            let r = embed_row_bf16(&self.table, b * self.levels + usize::from(lvl), vocab, hidden);
+            let r = embed_row_bf16(
+                &self.table,
+                b * self.levels + usize::from(lvl),
+                vocab,
+                hidden,
+            );
             for (o, v) in out.iter_mut().zip(&r) {
                 *o += v;
             }
@@ -3627,7 +3993,12 @@ impl AudioInput {
 }
 
 /// Replace the row of every audio slot in `ids` with the next staged frame's.
-fn audio_rows(audio: &mut AudioInput, ids: &[usize], mut x: Vec<f32>, hidden: usize) -> Result<Vec<f32>> {
+fn audio_rows(
+    audio: &mut AudioInput,
+    ids: &[usize],
+    mut x: Vec<f32>,
+    hidden: usize,
+) -> Result<Vec<f32>> {
     let Some(slot) = audio.queue.slot else {
         return Ok(x);
     };
@@ -3677,7 +4048,11 @@ struct VisionInput {
 impl VisionInput {
     /// Absent, with a line to say so, when the pile carries no vision
     /// pyramid: a mind that cannot see still serves text.
-    fn load(src: &Weights, cfg: &InklingConfig, dev: &burn::backend::cuda::CudaDevice) -> Option<Self> {
+    fn load(
+        src: &Weights,
+        cfg: &InklingConfig,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Option<Self> {
         use super::patches::{CHANNELS, PATCH, PATCH_BYTES, TEMPORAL};
         use super::vision::{plan_out_scales, vision_stages};
         let vc = &cfg.vision_config;
@@ -3693,14 +4068,21 @@ impl VisionInput {
             );
             return None;
         }
-        let scales = plan_out_scales(vc.temporal_patch_size, vc.patch_size, vc.n_layers, vc.n_channels);
+        let scales = plan_out_scales(
+            vc.temporal_patch_size,
+            vc.patch_size,
+            vc.n_layers,
+            vc.n_channels,
+        );
         let plan = vision_stages(&scales, vc.n_layers, hidden);
         let mut stages = Vec::with_capacity(plan.len());
         for (i, st) in plan.iter().enumerate() {
             let w = match src.tensor(&format!("model.visual.layers.linear_{i}.weight")) {
                 Ok(w) => w,
                 Err(error) => {
-                    eprintln!("inkling: no vision projection {i} in this pile ({error:#}); no sight");
+                    eprintln!(
+                        "inkling: no vision projection {i} in this pile ({error:#}); no sight"
+                    );
                     return None;
                 }
             };
@@ -3716,9 +4098,15 @@ impl VisionInput {
             let w_t = up2::<Bk>(w.data, st.output_dim, st.input_dim, dev).transpose();
             let norm = if st.add_norm {
                 match src.held(&format!("model.visual.layers.norm_{i}.weight")) {
-                    Ok(g) if g.data.len() == st.output_dim => Some(up1r::<Bk>(&g.data, st.output_dim, dev)),
+                    Ok(g) if g.data.len() == st.output_dim => {
+                        Some(up1r::<Bk>(&g.data, st.output_dim, dev))
+                    }
                     Ok(g) => {
-                        eprintln!("inkling: vision norm {i} is {} wide, not {}; no sight", g.data.len(), st.output_dim);
+                        eprintln!(
+                            "inkling: vision norm {i} is {} wide, not {}; no sight",
+                            g.data.len(),
+                            st.output_dim
+                        );
                         return None;
                     }
                     Err(error) => {
@@ -3741,7 +4129,10 @@ impl VisionInput {
         let final_norm = match src.held("model.visual.final_norm.weight") {
             Ok(g) if g.data.len() == hidden => up1r::<Bk>(&g.data, hidden, dev),
             Ok(g) => {
-                eprintln!("inkling: the vision final norm is {} wide, not {hidden}; no sight", g.data.len());
+                eprintln!(
+                    "inkling: the vision final norm is {} wide, not {hidden}; no sight",
+                    g.data.len()
+                );
                 return None;
             }
             Err(error) => {
@@ -3752,7 +4143,12 @@ impl VisionInput {
         Some(Self {
             stages,
             final_norm,
-            grid: (vc.temporal_patch_size, vc.patch_size, vc.patch_size, vc.n_channels),
+            grid: (
+                vc.temporal_patch_size,
+                vc.patch_size,
+                vc.patch_size,
+                vc.n_channels,
+            ),
             // `InklingRMSNorm`'s default, which is what the pyramid constructs.
             eps: 1e-6,
             queue: SlotQueue::new("patches", PATCH_BYTES),
@@ -3762,7 +4158,13 @@ impl VisionInput {
     /// `n` patches' rows, `[n, hidden]` row-major, through the pyramid on the
     /// device and read back once: `patches` is `n * PATCH_VALUES` f32s in the
     /// front end's `[t][y][x][c]` order.
-    fn rows(&self, patches: Vec<f32>, n: usize, hidden: usize, dev: &burn::backend::cuda::CudaDevice) -> Vec<f32> {
+    fn rows(
+        &self,
+        patches: Vec<f32>,
+        n: usize,
+        hidden: usize,
+        dev: &burn::backend::cuda::CudaDevice,
+    ) -> Vec<f32> {
         let (t0, h0, w0, c0) = self.grid;
         assert_eq!(patches.len(), n * t0 * h0 * w0 * c0);
         let (mut t, mut hh, mut ww, mut c) = (t0, h0, w0, c0);
@@ -3784,16 +4186,28 @@ impl VisionInput {
                 x = burn::tensor::activation::gelu(rms_norm_dev(x, g, self.eps));
             }
         }
-        assert_eq!((t, hh, ww, c), (1, 1, 1, hidden), "the pyramid ends at one row per patch");
+        assert_eq!(
+            (t, hh, ww, c),
+            (1, 1, 1, hidden),
+            "the pyramid ends at one row per patch"
+        );
         let out = rms_norm_dev(x, &self.final_norm, self.eps);
-        out.into_data().to_vec::<f32>().expect("vision rows read back")
+        out.into_data()
+            .to_vec::<f32>()
+            .expect("vision rows read back")
     }
 }
 
 /// RMS norm over the last axis of `[rows, d]`, the reference's formula
 /// (`x * rsqrt(mean(x^2) + eps) * gain`), in f32 on the device.
 fn rms_norm_dev(x: BT<Bk, 2>, gain: &BT<Bk, 1>, eps: f64) -> BT<Bk, 2> {
-    let scale = x.clone().powf_scalar(2.0).mean_dim(1).add_scalar(eps as f32).sqrt().recip();
+    let scale = x
+        .clone()
+        .powf_scalar(2.0)
+        .mean_dim(1)
+        .add_scalar(eps as f32)
+        .sqrt()
+        .recip();
     x.mul(scale).mul(gain.clone().unsqueeze())
 }
 
@@ -3809,7 +4223,12 @@ fn vision_rows(
     let Some(slot) = vision.queue.slot else {
         return Ok(x);
     };
-    let at: Vec<usize> = ids.iter().enumerate().filter(|&(_, &id)| id == slot).map(|(i, _)| i).collect();
+    let at: Vec<usize> = ids
+        .iter()
+        .enumerate()
+        .filter(|&(_, &id)| id == slot)
+        .map(|(i, _)| i)
+        .collect();
     if at.is_empty() {
         return Ok(x);
     }
@@ -3851,9 +4270,10 @@ impl Session {
     /// is `PATCH_BYTES` per patch, the front end's wire form; everything
     /// [`Self::push_audio`] says about slots and ranks holds here too.
     pub fn push_vision(&mut self, slot: usize, patches: &[u8]) -> Result<()> {
-        let vision = self.vision.as_mut().context(
-            "this Session loaded no vision pyramid (model.visual.*), so it cannot see",
-        )?;
+        let vision = self
+            .vision
+            .as_mut()
+            .context("this Session loaded no vision pyramid (model.visual.*), so it cannot see")?;
         vision.queue.stage(slot, patches)
     }
 

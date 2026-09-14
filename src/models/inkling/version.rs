@@ -65,8 +65,6 @@ pub mod attrs {
     }
 }
 
-
-
 /// A version assembled from learned experts, before or after it is committed.
 pub struct LearnedVersion {
     /// The version root.
@@ -181,8 +179,9 @@ pub fn learned_version(
     use triblespace::prelude::*;
 
     let graph = crate::model_collection::mary_model_graph_name();
-    let snapshot = crate::model_collection::snapshot_model_collection_named_local_latest(pile, graph)
-        .with_context(|| format!("the model collection '{graph}'"))?;
+    let snapshot =
+        crate::model_collection::snapshot_model_collection_named_local_latest(pile, graph)
+            .with_context(|| format!("the model collection '{graph}'"))?;
     let facts = crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
     let (_, _, reader) = snapshot.into_parts();
     let mut added = TribleSet::new();
@@ -218,7 +217,11 @@ pub fn learned_version(
         None if heads.len() > 1 => anyhow::bail!(
             "the model graph has {} heads ({}); name the parent",
             heads.len(),
-            heads.iter().map(|i| format!("{i:X}")).collect::<Vec<_>>().join(", ")
+            heads
+                .iter()
+                .map(|i| format!("{i:X}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         ),
         None => {
             let leaves = all_leaves(&facts);
@@ -242,7 +245,10 @@ pub fn learned_version(
             .map(|(m,)| m)
             .collect(),
     };
-    anyhow::ensure!(!parent_members.is_empty(), "parent {parent:X} has no members");
+    anyhow::ensure!(
+        !parent_members.is_empty(),
+        "parent {parent:X} has no members"
+    );
     let parent_set: BTreeSet<Id> = parent_members.iter().copied().collect();
 
     // 2. New leaves, and the parent's leaves they replace.

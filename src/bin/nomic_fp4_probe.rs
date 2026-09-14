@@ -21,7 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use triblespace::prelude::*;
 
 // ── NVFP4 reference arithmetic ───────────────────────────────────────────
@@ -88,7 +88,11 @@ fn block_error(block: &[f32], unit: f32) -> f32 {
 /// to the top code.
 fn nvfp4_quantize_with(x: &[f32], search: bool) -> (Vec<f32>, Vec<(f32, f32)>) {
     let absmax = x.iter().fold(0f32, |m, v| m.max(v.abs()));
-    let tensor_scale = if absmax > 0.0 { absmax / (6.0 * E4M3_MAX) } else { 1.0 };
+    let tensor_scale = if absmax > 0.0 {
+        absmax / (6.0 * E4M3_MAX)
+    } else {
+        1.0
+    };
     let mut out = Vec::with_capacity(x.len());
     let mut neighbours = Vec::with_capacity(x.len());
     for block in x.chunks(BLOCK) {
@@ -170,7 +174,9 @@ fn int8(x: &[f32]) -> Vec<f32> {
 }
 
 fn binary(x: &[f32]) -> Vec<f32> {
-    x.iter().map(|v| if *v >= 0.0 { 1.0 } else { -1.0 }).collect()
+    x.iter()
+        .map(|v| if *v >= 0.0 { 1.0 } else { -1.0 })
+        .collect()
 }
 
 fn l2_normalize(x: &mut [f32]) {
@@ -254,25 +260,31 @@ fn read_corpus(path: &Path) -> Result<Vec<(String, String, String)>> {
             }
             Some(json_unescape(&rest[..end]))
         };
-        if let (Some(id), Some(source), Some(text)) = (field("id"), field("source"), field("text")) {
+        if let (Some(id), Some(source), Some(text)) = (field("id"), field("source"), field("text"))
+        {
             rows.push((id, source, text));
         }
     }
     Ok(rows)
 }
 
-fn extract(pile: &Path, sources: &[(String, [u8; 16], String)], out: &Path, max_chars: usize) -> Result<()> {
+fn extract(
+    pile: &Path,
+    sources: &[(String, [u8; 16], String)],
+    out: &Path,
+    max_chars: usize,
+) -> Result<()> {
     use anybytes::View;
     use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace::core::blob::encodings::utf8string::UTF8String;
     use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
     use triblespace::core::collection::records::CollectionHandle;
     use triblespace::core::collection::{Collection, CollectionSnapshotExt};
-    use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::inline::Inline;
+    use triblespace::core::inline::encodings::hash::Handle;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
-    use triblespace::core::trible::{TribleSet, TRIBLE_LEN};
+    use triblespace::core::trible::{TRIBLE_LEN, TribleSet};
 
     let mut pile = Pile::open(pile).map_err(|e| anyhow!("open pile: {e:?}"))?;
     let snapshot = pile.snapshot().map_err(|e| anyhow!("snapshot: {e:?}"))?;
@@ -302,10 +314,11 @@ fn extract(pile: &Path, sources: &[(String, [u8; 16], String)], out: &Path, max_
             if !seen.insert(value) {
                 continue;
             }
-            let text_blob: Blob<UTF8String> = match snapshot.get(Inline::<Handle<UTF8String>>::new(value)) {
-                Ok(blob) => blob,
-                Err(_) => continue,
-            };
+            let text_blob: Blob<UTF8String> =
+                match snapshot.get(Inline::<Handle<UTF8String>>::new(value)) {
+                    Ok(blob) => blob,
+                    Err(_) => continue,
+                };
             let text: View<str> = match View::try_from_blob(text_blob) {
                 Ok(view) => view,
                 Err(_) => continue,
@@ -338,7 +351,11 @@ fn extract(pile: &Path, sources: &[(String, [u8; 16], String)], out: &Path, max_
 fn hex_decode(hex: &str, out: &mut [u8]) -> Result<()> {
     let hex = hex.trim().trim_start_matches("blake3:");
     if hex.len() != out.len() * 2 {
-        return Err(anyhow!("expected {} hex digits, got {}", out.len() * 2, hex.len()));
+        return Err(anyhow!(
+            "expected {} hex digits, got {}",
+            out.len() * 2,
+            hex.len()
+        ));
     }
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&hex[2 * i..2 * i + 2], 16)?;
@@ -385,7 +402,11 @@ fn fake_nvfp4_weights(keymap: &mut Keymap, only: &[String], scale_search: bool) 
         if shape.len() != 2 || !lower.contains("weight") {
             continue;
         }
-        if !only.is_empty() && !only.iter().any(|pattern| lower.contains(&pattern.to_ascii_lowercase())) {
+        if !only.is_empty()
+            && !only
+                .iter()
+                .any(|pattern| lower.contains(&pattern.to_ascii_lowercase()))
+        {
             continue;
         }
         if lower.contains("embed") || lower.contains("norm") || lower.contains("ln") {
@@ -412,7 +433,10 @@ const AWQ_ALPHAS: [f32; 10] = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9]
 /// rows of |(W - Wq) x|^2, the quantity AWQ minimises.
 fn output_error(w: &[f32], wq: &[f32], cols: usize, rows: &[Vec<f32>]) -> f64 {
     let diff: Vec<f32> = w.iter().zip(wq).map(|(a, b)| a - b).collect();
-    let threads = std::thread::available_parallelism().map_or(8, |n| n.get()).min(32).max(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |n| n.get())
+        .min(32)
+        .max(1);
     let chunk = rows.len().div_ceil(threads).max(1);
     std::thread::scope(|scope| {
         let handles: Vec<_> = rows
@@ -431,7 +455,10 @@ fn output_error(w: &[f32], wq: &[f32], cols: usize, rows: &[Vec<f32>]) -> f64 {
                 })
             })
             .collect();
-        handles.into_iter().map(|h| h.join().expect("error worker")).sum()
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("error worker"))
+            .sum()
     })
 }
 
@@ -460,7 +487,10 @@ fn cholesky(a: &[f64], n: usize) -> Vec<f64> {
 /// Inverse of a symmetric positive definite matrix from its Cholesky factor,
 /// one column of the identity per solve, columns spread over threads.
 fn spd_inverse(l: &[f64], n: usize) -> Vec<f64> {
-    let threads = std::thread::available_parallelism().map_or(8, |v| v.get()).min(32).max(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |v| v.get())
+        .min(32)
+        .max(1);
     let chunk = n.div_ceil(threads).max(1);
     let mut inv = vec![0f64; n * n];
     std::thread::scope(|scope| {
@@ -555,10 +585,17 @@ fn gptq_quantize(w: &[f32], cols: usize, x: &[Vec<f32>]) -> Vec<f32> {
         .chunks(cols)
         .map(|row| {
             let absmax = row.iter().fold(0f32, |m, v| m.max(v.abs()));
-            if absmax > 0.0 { absmax / (6.0 * E4M3_MAX) } else { 1.0 }
+            if absmax > 0.0 {
+                absmax / (6.0 * E4M3_MAX)
+            } else {
+                1.0
+            }
         })
         .collect();
-    let threads = std::thread::available_parallelism().map_or(8, |v| v.get()).min(32).max(1);
+    let threads = std::thread::available_parallelism()
+        .map_or(8, |v| v.get())
+        .min(32)
+        .max(1);
     let chunk = rows.div_ceil(threads).max(1);
     let mut out = vec![0f32; w.len()];
     std::thread::scope(|scope| {
@@ -691,11 +728,22 @@ fn awq_quantize_tensor(
         if err < best.1 {
             best = (alpha, err, q);
         } else {
-            eprintln!("    (feedback rounding did not improve on nearest: x{:.3} vs x{:.3})", err / plain_err.max(1e-30), best.1 / plain_err.max(1e-30));
+            eprintln!(
+                "    (feedback rounding did not improve on nearest: x{:.3} vs x{:.3})",
+                err / plain_err.max(1e-30),
+                best.1 / plain_err.max(1e-30)
+            );
         }
     }
     data.copy_from_slice(&best.2);
-    (best.0, if plain_err > 0.0 { best.1 / plain_err } else { 1.0 })
+    (
+        best.0,
+        if plain_err > 0.0 {
+            best.1 / plain_err
+        } else {
+            1.0
+        },
+    )
 }
 
 /// Activation-aware fake NVFP4 over the keymap: every linear that has
@@ -710,16 +758,32 @@ fn fake_nvfp4_weights_awq(
     stats: &std::collections::HashMap<String, mary::embed::NomicActStats>,
 ) -> (usize, usize, HashMap<String, mary::calibrate::Calibrated>) {
     if scale_search {
-        eprintln!("  (block scale search is ignored under calibration: it lost to nearest rounding there)");
+        eprintln!(
+            "  (block scale search is ignored under calibration: it lost to nearest rounding there)"
+        );
     }
-    let opts = mary::calibrate::Options { alphas: &mary::calibrate::AWQ_ALPHAS, feedback: gptq, embeddings };
+    let opts = mary::calibrate::Options {
+        alphas: &mary::calibrate::AWQ_ALPHAS,
+        feedback: gptq,
+        embeddings,
+    };
     let inputs: HashMap<String, mary::calibrate::InputStats> = stats
         .iter()
-        .map(|(k, s)| (k.clone(), mary::calibrate::InputStats { rows: s.rows.clone(), mean_abs: s.mean_abs() }))
+        .map(|(k, s)| {
+            (
+                k.clone(),
+                mary::calibrate::InputStats {
+                    rows: s.rows.clone(),
+                    mean_abs: s.mean_abs(),
+                },
+            )
+        })
         .collect();
     let stats_for = |name: &str| inputs.get(&mary::calibrate::nomic_capture_key(name));
-    let report = mary::calibrate::pack_keymap(keymap, only, &stats_for, &opts, &mut |line| eprintln!("  {line}"))
-        .unwrap_or_else(|e| panic!("pack: {e}"));
+    let report = mary::calibrate::pack_keymap(keymap, only, &stats_for, &opts, &mut |line| {
+        eprintln!("  {line}")
+    })
+    .unwrap_or_else(|e| panic!("pack: {e}"));
     (report.tensors, report.elements, report.packed)
 }
 
@@ -733,9 +797,17 @@ fn vision_keymap(pile: &Path, quantization: &str) -> Result<Keymap> {
     mary::selection::load_keymap_from_graph(
         snapshot.facts(),
         snapshot.store(),
-        mary::selection::ModelSelector::Source { source: NOMIC_VISION_MODEL, quantization },
+        mary::selection::ModelSelector::Source {
+            source: NOMIC_VISION_MODEL,
+            quantization,
+        },
     )
-    .with_context(|| format!("select {quantization} nomic vision weights from {}", pile.display()))
+    .with_context(|| {
+        format!(
+            "select {quantization} nomic vision weights from {}",
+            pile.display()
+        )
+    })
 }
 
 fn image_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -774,31 +846,57 @@ fn embed_images(
 /// mean cosine between the two models' vectors of the same image, and
 /// image-to-image recall@k, each image a query against the rest, the f32
 /// model's top k as the baseline.
-fn vision(model: &Path, quantization: &str, packed: &Path, packed_quantization: &str, images: &Path) -> Result<()> {
+fn vision(
+    model: &Path,
+    quantization: &str,
+    packed: &Path,
+    packed_quantization: &str,
+    images: &Path,
+) -> Result<()> {
     let files = image_files(images)?;
     anyhow::ensure!(!files.is_empty(), "no images under {}", images.display());
     let device = mary::embed::default_device();
     let started = Instant::now();
     let base = {
-        let emb = mary::embed::load_nomic_vision_from_keymap(vision_keymap(model, quantization)?, device.clone())?;
+        let emb = mary::embed::load_nomic_vision_from_keymap(
+            vision_keymap(model, quantization)?,
+            device.clone(),
+        )?;
         embed_images(&emb, &files)?
     };
-    eprintln!("f32 model embedded {} of {} images in {:.1} s", base.len(), files.len(), started.elapsed().as_secs_f64());
+    eprintln!(
+        "f32 model embedded {} of {} images in {:.1} s",
+        base.len(),
+        files.len(),
+        started.elapsed().as_secs_f64()
+    );
     let started = Instant::now();
     let cand = {
-        let emb = mary::embed::load_nomic_vision_from_keymap(vision_keymap(packed, packed_quantization)?, device)?;
+        let emb = mary::embed::load_nomic_vision_from_keymap(
+            vision_keymap(packed, packed_quantization)?,
+            device,
+        )?;
         embed_images(&emb, &files)?
     };
-    eprintln!("packed model embedded {} of {} images in {:.1} s", cand.len(), files.len(), started.elapsed().as_secs_f64());
+    eprintln!(
+        "packed model embedded {} of {} images in {:.1} s",
+        cand.len(),
+        files.len(),
+        started.elapsed().as_secs_f64()
+    );
     anyhow::ensure!(
-        base.iter().map(|(i, _)| *i).eq(cand.iter().map(|(i, _)| *i)),
+        base.iter()
+            .map(|(i, _)| *i)
+            .eq(cand.iter().map(|(i, _)| *i)),
         "the two models did not embed the same images"
     );
     let a: Vec<Vec<f32>> = base.into_iter().map(|(_, v)| v).collect();
     let b: Vec<Vec<f32>> = cand.into_iter().map(|(_, v)| v).collect();
     let n = a.len();
     let mean_cos: f64 = a.iter().zip(&b).map(|(x, y)| dot(x, y) as f64).sum::<f64>() / n as f64;
-    println!("nomic-embed-vision-v1.5 over {n} images: packed ({packed_quantization}) against f32 ({quantization})");
+    println!(
+        "nomic-embed-vision-v1.5 over {n} images: packed ({packed_quantization}) against f32 ({quantization})"
+    );
     println!("mean cosine between the two models' vectors of the same image: {mean_cos:.5}");
     for k in [1usize, 5, 10] {
         if n <= k {
@@ -825,7 +923,14 @@ fn vision(model: &Path, quantization: &str, packed: &Path, packed_quantization: 
 
 /// Print mary's vectors for a few texts (query side) and image files as JSON,
 /// to set beside a reference implementation's vectors of the same inputs.
-fn dump(text_pile: &Path, text_quantization: &str, vision_pile: &Path, vision_quantization: &str, texts: &[String], images: &[PathBuf]) -> Result<()> {
+fn dump(
+    text_pile: &Path,
+    text_quantization: &str,
+    vision_pile: &Path,
+    vision_quantization: &str,
+    texts: &[String],
+    images: &[PathBuf],
+) -> Result<()> {
     use mary::embed::LocalEmbedder;
     let device = mary::embed::default_device();
     let mut out = serde_json::Map::new();
@@ -841,7 +946,10 @@ fn dump(text_pile: &Path, text_quantization: &str, vision_pile: &Path, vision_qu
         out.insert("texts".into(), serde_json::Value::Array(arr));
     }
     if !images.is_empty() {
-        let emb = mary::embed::load_nomic_vision_from_keymap(vision_keymap(vision_pile, vision_quantization)?, device)?;
+        let emb = mary::embed::load_nomic_vision_from_keymap(
+            vision_keymap(vision_pile, vision_quantization)?,
+            device,
+        )?;
         let mut arr = Vec::new();
         for p in images {
             let bytes = fs::read(p).with_context(|| format!("read {}", p.display()))?;
@@ -948,7 +1056,10 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
 
     let (keymap, tokenizer) = load_parts(model_pile, &options.quantization)?;
     if options.list_tensors {
-        let mut names: Vec<_> = keymap.iter().map(|(n, (_, s))| (n.clone(), s.clone())).collect();
+        let mut names: Vec<_> = keymap
+            .iter()
+            .map(|(n, (_, s))| (n.clone(), s.clone()))
+            .collect();
         names.sort();
         for (name, shape) in names {
             println!("{name} {shape:?}");
@@ -960,17 +1071,28 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
     let step = rows.len() / queries;
     let query_ids: Vec<usize> = (0..queries).map(|i| i * step).collect();
 
-    let cached = options.cache.as_ref().filter(|p| p.exists()).map(|p| load_vectors(p)).transpose()?;
+    let cached = options
+        .cache
+        .as_ref()
+        .filter(|p| p.exists())
+        .map(|p| load_vectors(p))
+        .transpose()?;
     let (docs, qvecs): (Vec<Vec<f32>>, Vec<Vec<f32>>) = if let Some((docs, qvecs)) = cached {
         if docs.len() != rows.len() || qvecs.len() != queries {
-            return Err(anyhow!("cached vectors do not match the corpus and query count"));
+            return Err(anyhow!(
+                "cached vectors do not match the corpus and query count"
+            ));
         }
         eprintln!("f32 vectors loaded from cache");
         (docs, qvecs)
     } else {
         let started = Instant::now();
-        let f32_model = mary::embed::nomic_text_from_parts(keymap.clone(), tokenizer.clone(), device.clone())?;
-        eprintln!("f32 model built in {:.1} s", started.elapsed().as_secs_f64());
+        let f32_model =
+            mary::embed::nomic_text_from_parts(keymap.clone(), tokenizer.clone(), device.clone())?;
+        eprintln!(
+            "f32 model built in {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
         let started = Instant::now();
         let mut docs: Vec<Vec<f32>> = Vec::with_capacity(rows.len());
         for (_, _, text) in &rows {
@@ -978,7 +1100,11 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             l2_normalize(&mut v);
             docs.push(v);
         }
-        eprintln!("embedded {} documents in {:.1} s", docs.len(), started.elapsed().as_secs_f64());
+        eprintln!(
+            "embedded {} documents in {:.1} s",
+            docs.len(),
+            started.elapsed().as_secs_f64()
+        );
         let mut qvecs: Vec<Vec<f32>> = Vec::with_capacity(queries);
         for &i in &query_ids {
             let mut v = f32_model.embed_query(&rows[i].2)?;
@@ -998,8 +1124,15 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
         .map(|(&i, q)| top_k(q, &docs, Some(i), 10))
         .collect();
 
-    println!("nomic-embed-text-v1.5 over {} texts, {} queries, {dim}-d, recall@10 against f32 model and f32 vectors", rows.len(), queries);
-    println!("{:<34} {:>10} {:>12} {:>14}", "variant", "bits/dim", "recall@10", "mean |dcos|");
+    println!(
+        "nomic-embed-text-v1.5 over {} texts, {} queries, {dim}-d, recall@10 against f32 model and f32 vectors",
+        rows.len(),
+        queries
+    );
+    println!(
+        "{:<34} {:>10} {:>12} {:>14}",
+        "variant", "bits/dim", "recall@10", "mean |dcos|"
+    );
 
     let report = |name: &str, bits: f32, stored: &[Vec<f32>], qs: &[Vec<f32>]| {
         let mut recall = 0f32;
@@ -1009,7 +1142,10 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             let got = top_k(q, stored, Some(i), 10);
             recall += recall_at_k(base, &got);
             for &j in base {
-                let exact = dot(&qvecs[query_ids.iter().position(|&x| x == i).unwrap()], &docs[j]);
+                let exact = dot(
+                    &qvecs[query_ids.iter().position(|&x| x == i).unwrap()],
+                    &docs[j],
+                );
                 let approx = dot(q, &stored[j]);
                 cos_err += (exact - approx).abs() as f64;
                 pairs += 1;
@@ -1026,21 +1162,77 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
 
     report("f32 vectors", 32.0, &docs, &qvecs);
     if !options.skip_output_variants {
-    let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = nvfp4_quantize(d).0; l2_normalize(&mut q); q }).collect();
-    report("NVFP4, one stage", 4.5, &v, &qvecs);
-    let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = nvfp4_two_stage(d); l2_normalize(&mut q); q }).collect();
-    report("NVFP4, two-stage residual", 9.0, &v, &qvecs);
-    let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = fp4_lanes16(d); l2_normalize(&mut q); q }).collect();
-    report("FP4, sixteen lanes (fractional)", 64.5, &v, &qvecs);
-    let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = int8(d); l2_normalize(&mut q); q }).collect();
-    report("int8, per-vector scale", 8.0, &v, &qvecs);
-    let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = binary(d); l2_normalize(&mut q); q }).collect();
-    let qb: Vec<Vec<f32>> = qvecs.iter().map(|q| { let mut b = binary(q); l2_normalize(&mut b); b }).collect();
-    report("binary, both sides", 1.0, &v, &qb);
-    // Query side quantized too, for the symmetric NVFP4 case an index would use.
-    let v: Vec<Vec<f32>> = docs.iter().map(|d| { let mut q = nvfp4_two_stage(d); l2_normalize(&mut q); q }).collect();
-    let q2: Vec<Vec<f32>> = qvecs.iter().map(|q| { let mut b = nvfp4_two_stage(q); l2_normalize(&mut b); b }).collect();
-    report("NVFP4 two-stage, both sides", 9.0, &v, &q2);
+        let v: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|d| {
+                let mut q = nvfp4_quantize(d).0;
+                l2_normalize(&mut q);
+                q
+            })
+            .collect();
+        report("NVFP4, one stage", 4.5, &v, &qvecs);
+        let v: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|d| {
+                let mut q = nvfp4_two_stage(d);
+                l2_normalize(&mut q);
+                q
+            })
+            .collect();
+        report("NVFP4, two-stage residual", 9.0, &v, &qvecs);
+        let v: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|d| {
+                let mut q = fp4_lanes16(d);
+                l2_normalize(&mut q);
+                q
+            })
+            .collect();
+        report("FP4, sixteen lanes (fractional)", 64.5, &v, &qvecs);
+        let v: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|d| {
+                let mut q = int8(d);
+                l2_normalize(&mut q);
+                q
+            })
+            .collect();
+        report("int8, per-vector scale", 8.0, &v, &qvecs);
+        let v: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|d| {
+                let mut q = binary(d);
+                l2_normalize(&mut q);
+                q
+            })
+            .collect();
+        let qb: Vec<Vec<f32>> = qvecs
+            .iter()
+            .map(|q| {
+                let mut b = binary(q);
+                l2_normalize(&mut b);
+                b
+            })
+            .collect();
+        report("binary, both sides", 1.0, &v, &qb);
+        // Query side quantized too, for the symmetric NVFP4 case an index would use.
+        let v: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|d| {
+                let mut q = nvfp4_two_stage(d);
+                l2_normalize(&mut q);
+                q
+            })
+            .collect();
+        let q2: Vec<Vec<f32>> = qvecs
+            .iter()
+            .map(|q| {
+                let mut b = nvfp4_two_stage(q);
+                l2_normalize(&mut b);
+                b
+            })
+            .collect();
+        report("NVFP4 two-stage, both sides", 9.0, &v, &q2);
     }
 
     // The model itself with NVFP4 weights, all of them or the named group.
@@ -1055,8 +1247,11 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
         let n = options.calibrate.min(rows.len());
         let stride = rows.len() / n;
         let started = Instant::now();
-        let f32_model =
-            mary::embed::nomic_text_from_parts(quantized.clone(), tokenizer.clone(), device.clone())?;
+        let f32_model = mary::embed::nomic_text_from_parts(
+            quantized.clone(),
+            tokenizer.clone(),
+            device.clone(),
+        )?;
         mary::embed::nomic_activation_capture_start(8);
         for i in 0..n {
             let _ = f32_model.embed_document(&rows[i * stride].2)?;
@@ -1070,9 +1265,18 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             started.elapsed().as_secs_f64()
         );
         let started = Instant::now();
-        let (t, e, packed) =
-            fake_nvfp4_weights_awq(&mut quantized, &options.only, options.scale_search, options.gptq, options.pack_embeddings, &stats);
-        eprintln!("activation-aware scale search took {:.1} s", started.elapsed().as_secs_f64());
+        let (t, e, packed) = fake_nvfp4_weights_awq(
+            &mut quantized,
+            &options.only,
+            options.scale_search,
+            options.gptq,
+            options.pack_embeddings,
+            &stats,
+        );
+        eprintln!(
+            "activation-aware scale search took {:.1} s",
+            started.elapsed().as_secs_f64()
+        );
         calibrated = packed;
         (t, e)
     } else {
@@ -1091,10 +1295,17 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
     };
     eprintln!(
         "fake-quantized {tensors} weight tensors, {elements} elements, to NVFP4 (group: {}; {rounding})",
-        if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
+        if options.only.is_empty() {
+            "all".to_string()
+        } else {
+            options.only.join(",")
+        }
     );
     if let Some(out) = &options.pack {
-        let key = options.key.as_ref().ok_or_else(|| anyhow!("--pack needs --key <signing key>"))?;
+        let key = options
+            .key
+            .as_ref()
+            .ok_or_else(|| anyhow!("--pack needs --key <signing key>"))?;
         anyhow::ensure!(
             options.calibrate > 0 && !options.keep_weights,
             "--pack writes the calibrated model; give --calibrate N"
@@ -1102,7 +1313,9 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
         let started = Instant::now();
         let key = triblespace::core::signing_key_file::load_existing(key)
             .with_context(|| format!("load signing key {}", key.display()))?;
-        let json = tokenizer.to_string(false).map_err(|e| anyhow!("serialise tokenizer: {e}"))?;
+        let json = tokenizer
+            .to_string(false)
+            .map_err(|e| anyhow!("serialise tokenizer: {e}"))?;
         let root = mary::calibrate::write_packed_pile(
             out,
             &key,
@@ -1134,16 +1347,42 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
         l2_normalize(&mut v);
         qqueries.push(v);
     }
-    eprintln!("NVFP4-weight model embedded everything in {:.1} s", started.elapsed().as_secs_f64());
-    let same_text_cos: f64 = docs.iter().zip(&qdocs).map(|(a, b)| dot(a, b) as f64).sum::<f64>() / docs.len() as f64;
+    eprintln!(
+        "NVFP4-weight model embedded everything in {:.1} s",
+        started.elapsed().as_secs_f64()
+    );
+    let same_text_cos: f64 = docs
+        .iter()
+        .zip(&qdocs)
+        .map(|(a, b)| dot(a, b) as f64)
+        .sum::<f64>()
+        / docs.len() as f64;
     println!();
     println!(
         "model with NVFP4 linear weights, group {} ({tensors} tensors, {elements} elements, {rounding}): mean cosine to the f32 model's vector of the same text {same_text_cos:.5}",
-        if options.only.is_empty() { "all".to_string() } else { options.only.join(",") }
+        if options.only.is_empty() {
+            "all".to_string()
+        } else {
+            options.only.join(",")
+        }
     );
     report("NVFP4 weights, f32 vectors", 32.0, &qdocs, &qqueries);
-    let v: Vec<Vec<f32>> = qdocs.iter().map(|d| { let mut q = nvfp4_two_stage(d); l2_normalize(&mut q); q }).collect();
-    let q2: Vec<Vec<f32>> = qqueries.iter().map(|q| { let mut b = nvfp4_two_stage(q); l2_normalize(&mut b); b }).collect();
+    let v: Vec<Vec<f32>> = qdocs
+        .iter()
+        .map(|d| {
+            let mut q = nvfp4_two_stage(d);
+            l2_normalize(&mut q);
+            q
+        })
+        .collect();
+    let q2: Vec<Vec<f32>> = qqueries
+        .iter()
+        .map(|q| {
+            let mut b = nvfp4_two_stage(q);
+            l2_normalize(&mut b);
+            b
+        })
+        .collect();
     report("NVFP4 weights + two-stage vectors", 9.0, &v, &q2);
     Ok(())
 }
@@ -1151,13 +1390,18 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let flag = |name: &str| -> Option<String> {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1).cloned())
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1).cloned())
     };
     match args.first().map(String::as_str) {
         Some("extract") => {
             let pile = PathBuf::from(flag("--pile").ok_or_else(|| anyhow!("--pile"))?);
             let out = PathBuf::from(flag("--out").unwrap_or_else(|| "corpus.jsonl".into()));
-            let max_chars: usize = flag("--max-chars").map(|s| s.parse()).transpose()?.unwrap_or(4000);
+            let max_chars: usize = flag("--max-chars")
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(4000);
             let mut sources = Vec::new();
             let mut attr = [0u8; 16];
             if let Some(h) = flag("--wiki") {
@@ -1171,28 +1415,52 @@ fn main() -> Result<()> {
             extract(&pile, &sources, &out, max_chars)
         }
         Some("dump") => {
-            let text_pile = PathBuf::from(flag("--text-model").ok_or_else(|| anyhow!("--text-model"))?);
-            let vision_pile = PathBuf::from(flag("--vision-model").ok_or_else(|| anyhow!("--vision-model"))?);
-            let tq = flag("--text-quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
-            let vq = flag("--vision-quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
-            let texts: Vec<String> = flag("--texts").map(|s| s.split('|').map(str::to_string).collect()).unwrap_or_default();
-            let images: Vec<PathBuf> = flag("--images").map(|s| s.split(',').map(PathBuf::from).collect()).unwrap_or_default();
+            let text_pile =
+                PathBuf::from(flag("--text-model").ok_or_else(|| anyhow!("--text-model"))?);
+            let vision_pile =
+                PathBuf::from(flag("--vision-model").ok_or_else(|| anyhow!("--vision-model"))?);
+            let tq = flag("--text-quantization")
+                .unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
+            let vq = flag("--vision-quantization")
+                .unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
+            let texts: Vec<String> = flag("--texts")
+                .map(|s| s.split('|').map(str::to_string).collect())
+                .unwrap_or_default();
+            let images: Vec<PathBuf> = flag("--images")
+                .map(|s| s.split(',').map(PathBuf::from).collect())
+                .unwrap_or_default();
             dump(&text_pile, &tq, &vision_pile, &vq, &texts, &images)
         }
         Some("vision") => {
             let model = PathBuf::from(flag("--model").ok_or_else(|| anyhow!("--model"))?);
             let packed = PathBuf::from(flag("--packed").ok_or_else(|| anyhow!("--packed"))?);
             let images = PathBuf::from(flag("--images").ok_or_else(|| anyhow!("--images"))?);
-            let quantization = flag("--quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
-            let packed_quantization = flag("--packed-quantization").unwrap_or_else(|| "nvfp4-calibrated".to_string());
-            vision(&model, &quantization, &packed, &packed_quantization, &images)
+            let quantization = flag("--quantization")
+                .unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
+            let packed_quantization =
+                flag("--packed-quantization").unwrap_or_else(|| "nvfp4-calibrated".to_string());
+            vision(
+                &model,
+                &quantization,
+                &packed,
+                &packed_quantization,
+                &images,
+            )
         }
         Some("probe") => {
             let model = PathBuf::from(flag("--model").ok_or_else(|| anyhow!("--model"))?);
             let corpus = PathBuf::from(flag("--corpus").unwrap_or_else(|| "corpus.jsonl".into()));
-            let queries: usize = flag("--queries").map(|s| s.parse()).transpose()?.unwrap_or(200);
+            let queries: usize = flag("--queries")
+                .map(|s| s.parse())
+                .transpose()?
+                .unwrap_or(200);
             let only: Vec<String> = flag("--only")
-                .map(|s| s.split(',').map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect())
+                .map(|s| {
+                    s.split(',')
+                        .map(|p| p.trim().to_string())
+                        .filter(|p| !p.is_empty())
+                        .collect()
+                })
                 .unwrap_or_default();
             probe(
                 &model,
@@ -1205,7 +1473,10 @@ fn main() -> Result<()> {
                     skip_output_variants: args.iter().any(|a| a == "--weights-only"),
                     scale_search: args.iter().any(|a| a == "--scale-search"),
                     keep_weights: args.iter().any(|a| a == "--keep-weights"),
-                    calibrate: flag("--calibrate").map(|s| s.parse()).transpose()?.unwrap_or(0),
+                    calibrate: flag("--calibrate")
+                        .map(|s| s.parse())
+                        .transpose()?
+                        .unwrap_or(0),
                     gptq: args.iter().any(|a| a == "--gptq"),
                     quantization: flag("--quantization")
                         .unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string()),
@@ -1215,6 +1486,8 @@ fn main() -> Result<()> {
                 },
             )
         }
-        _ => Err(anyhow!("usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--gptq] [--list-tensors] [--quantization TAG] [--pack OUT.pile --key KEY] [--pack-embeddings] | vision --model P --packed Q --images DIR [--quantization TAG] [--packed-quantization TAG]")),
+        _ => Err(anyhow!(
+            "usage: nomic_fp4_probe extract --pile P --wiki H --journal H --out F | probe --model P --corpus F [--queries N] [--cache F] [--only a,b] [--weights-only] [--scale-search] [--keep-weights] [--calibrate N] [--gptq] [--list-tensors] [--quantization TAG] [--pack OUT.pile --key KEY] [--pack-embeddings] | vision --model P --packed Q --images DIR [--quantization TAG] [--packed-quantization TAG]"
+        )),
     }
 }

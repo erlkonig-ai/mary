@@ -93,7 +93,10 @@ pub struct CacheStore {
 
 impl CacheStore {
     pub fn open(config: &CacheConfig) -> Result<Self> {
-        anyhow::ensure!(config.checkpoint_tokens > 0, "cache checkpoint interval must be positive");
+        anyhow::ensure!(
+            config.checkpoint_tokens > 0,
+            "cache checkpoint interval must be positive"
+        );
         // Resolve authority BEFORE creating any file. Never generate or replace
         // a signing key as a side effect of reading/restoring a cache.
         let key = triblespace::core::signing_key_file::load_existing(&config.signing_key)
@@ -104,14 +107,18 @@ impl CacheStore {
     fn open_with_key(config: &CacheConfig, key: SigningKey) -> Result<Self> {
         let mut create = std::fs::OpenOptions::new();
         create.write(true).create_new(true);
-        #[cfg(unix)] {
+        #[cfg(unix)]
+        {
             use std::os::unix::fs::OpenOptionsExt;
             create.mode(0o600);
         }
         match create.open(&config.pile) {
             Ok(file) => {
                 file.sync_all()?;
-                let parent = config.pile.parent().filter(|p| !p.as_os_str().is_empty())
+                let parent = config
+                    .pile
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or_else(|| std::path::Path::new("."));
                 std::fs::File::open(parent)?.sync_all()?;
             }
@@ -119,12 +126,22 @@ impl CacheStore {
             Err(error) => return Err(error).context("create private cache pile"),
         }
         let mut pile = Pile::open(&config.pile).context("open cache pile")?;
-        pile.refresh().context("read cache pile; corrupt tails require explicit operator repair")?;
-        let collection = crate::model_collection::collection_or_create(&mut pile, &key, COLLECTION)?;
+        pile.refresh()
+            .context("read cache pile; corrupt tails require explicit operator repair")?;
+        let collection =
+            crate::model_collection::collection_or_create(&mut pile, &key, COLLECTION)?;
         let snapshot = pile.snapshot()?;
-        anyhow::ensure!(collection.reader_is_admitted(&snapshot, key.verifying_key())?,
-            "cache signing identity is not admitted by the collection READ policy");
-        Ok(Self { pile, key, collection, staged: BTreeMap::new(), checkpoint_tokens: config.checkpoint_tokens })
+        anyhow::ensure!(
+            collection.reader_is_admitted(&snapshot, key.verifying_key())?,
+            "cache signing identity is not admitted by the collection READ policy"
+        );
+        Ok(Self {
+            pile,
+            key,
+            collection,
+            staged: BTreeMap::new(),
+            checkpoint_tokens: config.checkpoint_tokens,
+        })
     }
 
     pub fn begin(&mut self) {
@@ -138,22 +155,42 @@ impl CacheStore {
     }
 
     pub fn put_chunk(&mut self, bytes: &[u8]) -> Result<[u8; 32]> {
-        anyhow::ensure!(!bytes.is_empty() && bytes.len() <= MAX_CHUNK_BYTES,
-            "cache chunks must contain 1..={MAX_CHUNK_BYTES} bytes");
-        let handle = self.pile.put::<RawBytes, _>(bytes).context("append packed cache chunk")?;
+        anyhow::ensure!(
+            !bytes.is_empty() && bytes.len() <= MAX_CHUNK_BYTES,
+            "cache chunks must contain 1..={MAX_CHUNK_BYTES} bytes"
+        );
+        let handle = self
+            .pile
+            .put::<RawBytes, _>(bytes)
+            .context("append packed cache chunk")?;
         self.staged.insert(handle.raw, bytes.len());
         Ok(handle.raw)
     }
 
     pub fn publish(&mut self, key: CacheKey, state: serde_json::Value) -> Result<()> {
-        anyhow::ensure!(key.prefix.position > 0 && key.rank < key.world, "invalid cache coordinates");
-        let chunks = self.staged.iter().map(|(&hash, &bytes)| Chunk { hash, bytes }).collect();
-        let manifest = Manifest { version: 1, key: key.clone(), state, chunks };
+        anyhow::ensure!(
+            key.prefix.position > 0 && key.rank < key.world,
+            "invalid cache coordinates"
+        );
+        let chunks = self
+            .staged
+            .iter()
+            .map(|(&hash, &bytes)| Chunk { hash, bytes })
+            .collect();
+        let manifest = Manifest {
+            version: 1,
+            key: key.clone(),
+            state,
+            chunks,
+        };
         let json = serde_json::to_string(&manifest)?;
-        anyhow::ensure!(json.len() <= MAX_MANIFEST_BYTES, "cache metadata exceeds its byte budget");
+        anyhow::ensure!(
+            json.len() <= MAX_MANIFEST_BYTES,
+            "cache metadata exceeds its byte budget"
+        );
         let handle = self.pile.put::<UTF8String, _>(json)?;
-        let chunk_handles: Vec<Inline<Handle<RawBytes>>> = self.staged.keys()
-            .map(|&hash| Inline::new(hash)).collect();
+        let chunk_handles: Vec<Inline<Handle<RawBytes>>> =
+            self.staged.keys().map(|&hash| Inline::new(hash)).collect();
         let fragment = entity! { _ @
             metadata::tag: schema::KIND,
             super::telemetry::schema::model_identity: Inline::<Hash<Blake3>>::new(key.model),
@@ -167,9 +204,15 @@ impl CacheStore {
         };
         // A checkpoint is durable only after BOTH flushes, not merely after a
         // successful write or an in-memory collection update.
-        self.pile.flush().context("make cache payload durable before publication")?;
-        self.pile.commit(self.collection, &self.key, fragment).context("publish cache checkpoint")?;
-        self.pile.flush().context("make cache publication durable")?;
+        self.pile
+            .flush()
+            .context("make cache payload durable before publication")?;
+        self.pile
+            .commit(self.collection, &self.key, fragment)
+            .context("publish cache checkpoint")?;
+        self.pile
+            .flush()
+            .context("make cache publication durable")?;
         self.staged.clear();
         Ok(())
     }
@@ -190,10 +233,15 @@ impl CacheStore {
                 }]),
                 value_range(position, 1u128.to_inline(), (limit as u128).to_inline()),
             )
-        ).map(|(position, prefix, manifest)| Candidate {
-            prefix: Prefix { position: position as usize, hash: prefix.raw },
+        )
+        .map(|(position, prefix, manifest)| Candidate {
+            prefix: Prefix {
+                position: position as usize,
+                hash: prefix.raw,
+            },
             manifest: manifest.raw,
-        }).collect();
+        })
+        .collect();
         candidates.sort_by(|a, b| b.prefix.cmp(&a.prefix).then(a.manifest.cmp(&b.manifest)));
         candidates.dedup_by(|a, b| a.prefix == b.prefix && a.manifest == b.manifest);
         Ok(candidates)
@@ -202,18 +250,38 @@ impl CacheStore {
     pub fn read(&mut self, candidate: &Candidate, expected: &CacheKey) -> Result<CacheReader> {
         let snapshot = self.pile.snapshot()?;
         let blob: Blob<UTF8String> = snapshot.get(Inline::new(candidate.manifest))?;
-        anyhow::ensure!(blob.bytes.len() <= MAX_MANIFEST_BYTES, "cache metadata exceeds its byte budget");
-        anyhow::ensure!(*blake3::hash(&blob.bytes).as_bytes() == candidate.manifest,
-            "cache metadata content hash mismatch");
-        let manifest: Manifest = serde_json::from_slice(&blob.bytes).context("decode cache metadata")?;
-        anyhow::ensure!(manifest.version == 1 && manifest.key == *expected && candidate.prefix == expected.prefix,
-            "cache version, compatibility or prefix mismatch");
+        anyhow::ensure!(
+            blob.bytes.len() <= MAX_MANIFEST_BYTES,
+            "cache metadata exceeds its byte budget"
+        );
+        anyhow::ensure!(
+            *blake3::hash(&blob.bytes).as_bytes() == candidate.manifest,
+            "cache metadata content hash mismatch"
+        );
+        let manifest: Manifest =
+            serde_json::from_slice(&blob.bytes).context("decode cache metadata")?;
+        anyhow::ensure!(
+            manifest.version == 1
+                && manifest.key == *expected
+                && candidate.prefix == expected.prefix,
+            "cache version, compatibility or prefix mismatch"
+        );
         let mut chunks = BTreeMap::new();
         for chunk in manifest.chunks {
-            anyhow::ensure!(chunk.bytes > 0 && chunk.bytes <= MAX_CHUNK_BYTES, "invalid packed chunk length");
-            anyhow::ensure!(chunks.insert(chunk.hash, chunk.bytes).is_none(), "duplicate cache chunk metadata");
+            anyhow::ensure!(
+                chunk.bytes > 0 && chunk.bytes <= MAX_CHUNK_BYTES,
+                "invalid packed chunk length"
+            );
+            anyhow::ensure!(
+                chunks.insert(chunk.hash, chunk.bytes).is_none(),
+                "duplicate cache chunk metadata"
+            );
         }
-        Ok(CacheReader { snapshot, state: manifest.state, chunks })
+        Ok(CacheReader {
+            snapshot,
+            state: manifest.state,
+            chunks,
+        })
     }
 }
 
@@ -225,10 +293,18 @@ pub struct CacheReader {
 
 impl CacheReader {
     pub fn chunk(&self, hash: [u8; 32], expected: usize) -> Result<Vec<u8>> {
-        anyhow::ensure!(self.chunks.get(&hash) == Some(&expected), "cache state names an undeclared or wrong-sized chunk");
-        let blob: Blob<RawBytes> = self.snapshot.get(Inline::new(hash)).context("read packed cache chunk")?;
-        anyhow::ensure!(blob.bytes.len() == expected && *blake3::hash(&blob.bytes).as_bytes() == hash,
-            "packed cache chunk length or content hash mismatch");
+        anyhow::ensure!(
+            self.chunks.get(&hash) == Some(&expected),
+            "cache state names an undeclared or wrong-sized chunk"
+        );
+        let blob: Blob<RawBytes> = self
+            .snapshot
+            .get(Inline::new(hash))
+            .context("read packed cache chunk")?;
+        anyhow::ensure!(
+            blob.bytes.len() == expected && *blake3::hash(&blob.bytes).as_bytes() == hash,
+            "packed cache chunk length or content hash mismatch"
+        );
         Ok(blob.bytes.to_vec())
     }
 }
@@ -236,8 +312,11 @@ impl CacheReader {
 /// Compute only the requested prefix digests in one scan of the token stream.
 /// This includes arbitrary cancellation boundaries, not just regular intervals.
 pub fn matching_prefixes(ids: &[usize], offers: &[Prefix]) -> Result<Vec<Prefix>> {
-    let mut positions: Vec<usize> = offers.iter().map(|p| p.position)
-        .filter(|&p| p > 0 && p <= ids.len()).collect();
+    let mut positions: Vec<usize> = offers
+        .iter()
+        .map(|p| p.position)
+        .filter(|&p| p > 0 && p <= ids.len())
+        .collect();
     positions.sort_unstable();
     positions.dedup();
     let mut hasher = blake3::Hasher::new();
@@ -249,8 +328,13 @@ pub fn matching_prefixes(ids: &[usize], offers: &[Prefix]) -> Result<Vec<Prefix>
             hasher.update(&id.to_le_bytes());
         }
         cursor = position;
-        let prefix = Prefix { position, hash: *hasher.clone().finalize().as_bytes() };
-        if offers.contains(&prefix) { matched.push(prefix); }
+        let prefix = Prefix {
+            position,
+            hash: *hasher.clone().finalize().as_bytes(),
+        };
+        if offers.contains(&prefix) {
+            matched.push(prefix);
+        }
     }
     matched.reverse();
     Ok(matched)
@@ -258,15 +342,23 @@ pub fn matching_prefixes(ids: &[usize], offers: &[Prefix]) -> Result<Vec<Prefix>
 
 pub fn token_prefix(ids: &[usize]) -> Result<Prefix> {
     let mut hash = blake3::Hasher::new();
-    for &id in ids { hash.update(&u32::try_from(id)?.to_le_bytes()); }
-    Ok(Prefix { position: ids.len(), hash: *hash.finalize().as_bytes() })
+    for &id in ids {
+        hash.update(&u32::try_from(id)?.to_le_bytes());
+    }
+    Ok(Prefix {
+        position: ids.len(),
+        hash: *hash.finalize().as_bytes(),
+    })
 }
 
 /// Newest exact prefix available on every rank. A save that reached only one
 /// pile is useful data, but never authority to combine different TP states.
 pub fn common_prefix(ids: &[usize], offers: &[Vec<Prefix>]) -> Result<Option<Prefix>> {
-    let first = offers.first().context("cache selection requires at least one rank")?;
-    Ok(matching_prefixes(ids, first)?.into_iter()
+    let first = offers
+        .first()
+        .context("cache selection requires at least one rank")?;
+    Ok(matching_prefixes(ids, first)?
+        .into_iter()
         .find(|prefix| offers.iter().all(|rank| rank.contains(prefix))))
 }
 
@@ -287,8 +379,14 @@ pub struct CacheReply {
 impl CacheReply {
     pub fn from_result(result: Result<Vec<Prefix>>) -> Self {
         match result {
-            Ok(prefixes) => Self { error: None, prefixes },
-            Err(error) => Self { error: Some(format!("{error:#}")), prefixes: Vec::new() },
+            Ok(prefixes) => Self {
+                error: None,
+                prefixes,
+            },
+            Err(error) => Self {
+                error: Some(format!("{error:#}")),
+                prefixes: Vec::new(),
+            },
         }
     }
 }
@@ -299,12 +397,24 @@ mod tests {
 
     fn fixture() -> (CacheConfig, SigningKey) {
         let pile = std::env::temp_dir().join(format!("inkling-cache-{}.pile", genid()));
-        (CacheConfig { pile, signing_key: PathBuf::from("unused-existing-key"), checkpoint_tokens: 32 },
-            SigningKey::generate(&mut rand::rngs::OsRng))
+        (
+            CacheConfig {
+                pile,
+                signing_key: PathBuf::from("unused-existing-key"),
+                checkpoint_tokens: 32,
+            },
+            SigningKey::generate(&mut rand::rngs::OsRng),
+        )
     }
 
     fn key(prefix: Prefix) -> CacheKey {
-        CacheKey { model: [1; 32], compatibility: [2; 32], rank: 0, world: 2, prefix }
+        CacheKey {
+            model: [1; 32],
+            compatibility: [2; 32],
+            rank: 0,
+            world: 2,
+            prefix,
+        }
     }
 
     #[test]
@@ -323,9 +433,15 @@ mod tests {
         let ids = [9, 8, 7, 6, 5];
         let old = token_prefix(&ids[..2])?;
         let new = token_prefix(&ids)?;
-        assert_eq!(common_prefix(&ids, &[vec![new, old], vec![old]])?, Some(old));
+        assert_eq!(
+            common_prefix(&ids, &[vec![new, old], vec![old]])?,
+            Some(old)
+        );
         assert_eq!(common_prefix(&ids, &[vec![new, old], vec![]])?, None);
-        assert_eq!(common_prefix(&[9, 8, 0], &[vec![new, old], vec![new, old]])?, Some(old));
+        assert_eq!(
+            common_prefix(&[9, 8, 0], &[vec![new, old], vec![new, old]])?,
+            Some(old)
+        );
         assert_eq!(common_prefix(&[], &[vec![old], vec![old]])?, None);
         assert!(common_prefix(&ids, &[]).is_err());
         Ok(())

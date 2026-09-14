@@ -279,10 +279,7 @@ pub fn context_preflight_fragment(evidence: &ContextPreflighted) -> Fragment {
 
 /// A learned version written back into the model graph, at the end of
 /// `epoch`: which root, how many experts moved.
-pub fn persisted_fragment(
-    epoch: u64,
-    persisted: &super::resident::Persisted,
-) -> Fragment {
+pub fn persisted_fragment(epoch: u64, persisted: &super::resident::Persisted) -> Fragment {
     entity! { _ @
         metadata::tag: schema::kind_persisted,
         schema::context_epoch: epoch as u128,

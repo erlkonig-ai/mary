@@ -273,7 +273,10 @@ impl Group {
     /// loading. Sequence digests cannot detect a hybrid policy: all-reduced
     /// logits can agree even when the ranks computed different attention arms.
     /// This uses only the existing host link and leaves pass framing untouched.
-    pub fn agree_cached_attention(&mut self, policy: super::flash::CachedAttentionPolicy) -> Result<()> {
+    pub fn agree_cached_attention(
+        &mut self,
+        policy: super::flash::CachedAttentionPolicy,
+    ) -> Result<()> {
         agree_cached_attention_on_link(self.tp, &mut self.socks, policy)
     }
 
@@ -542,13 +545,21 @@ impl Group {
         }
         let count = u32::from_be_bytes([header[1], header[2], header[3], header[4]]) as usize;
         if header[0] == Pass::CACHE {
-            anyhow::ensure!(count <= Pass::MAX_DISTILL_BYTES, "rank-link cache frame exceeds its byte budget");
+            anyhow::ensure!(
+                count <= Pass::MAX_DISTILL_BYTES,
+                "rank-link cache frame exceeds its byte budget"
+            );
             let mut bytes = vec![0; count];
             peer.read_exact(&mut bytes).context("read cache control")?;
-            return Ok(Pass::Cache(serde_json::from_slice(&bytes).context("decode cache control")?));
+            return Ok(Pass::Cache(
+                serde_json::from_slice(&bytes).context("decode cache control")?,
+            ));
         }
         if header[0] == Pass::DISTILL {
-            anyhow::ensure!(count <= Pass::MAX_DISTILL_BYTES, "rank-link SDFT frame exceeds its byte budget");
+            anyhow::ensure!(
+                count <= Pass::MAX_DISTILL_BYTES,
+                "rank-link SDFT frame exceeds its byte budget"
+            );
             let mut bytes = vec![0; count];
             peer.read_exact(&mut bytes).context("read SDFT work")?;
             return Pass::decode_distillation(&bytes);
@@ -562,9 +573,15 @@ impl Group {
                 .context("read a sense frame's payload")?;
             let slot = u32::from_be_bytes(slot) as usize;
             return Ok(if header[0] == Pass::AUDIO {
-                Pass::Audio { slot, levels: bytes }
+                Pass::Audio {
+                    slot,
+                    levels: bytes,
+                }
             } else {
-                Pass::Vision { slot, patches: bytes }
+                Pass::Vision {
+                    slot,
+                    patches: bytes,
+                }
             });
         }
         let mut ids = Vec::with_capacity(count);
@@ -586,8 +603,14 @@ impl Group {
     ) -> Result<Vec<super::cache_pile::CacheReply>> {
         if self.tp.rank() != 0 {
             let bytes = serde_json::to_vec(&local)?;
-            anyhow::ensure!(bytes.len() <= Pass::MAX_DISTILL_BYTES, "cache reply exceeds byte budget");
-            let peer = self.socks.first_mut().context("cache reply has no leader")?;
+            anyhow::ensure!(
+                bytes.len() <= Pass::MAX_DISTILL_BYTES,
+                "cache reply exceeds byte budget"
+            );
+            let peer = self
+                .socks
+                .first_mut()
+                .context("cache reply has no leader")?;
             peer.write_all(&(bytes.len() as u32).to_be_bytes())?;
             peer.write_all(&bytes)?;
             peer.flush()?;
@@ -596,11 +619,16 @@ impl Group {
         let mut replies = vec![local];
         for peer in &mut self.socks {
             let mut header = [0; 4];
-            peer.read_exact(&mut header).context("read cache acknowledgement length")?;
+            peer.read_exact(&mut header)
+                .context("read cache acknowledgement length")?;
             let count = u32::from_be_bytes(header) as usize;
-            anyhow::ensure!(count <= Pass::MAX_DISTILL_BYTES, "cache reply exceeds byte budget");
+            anyhow::ensure!(
+                count <= Pass::MAX_DISTILL_BYTES,
+                "cache reply exceeds byte budget"
+            );
             let mut bytes = vec![0; count];
-            peer.read_exact(&mut bytes).context("read cache acknowledgement")?;
+            peer.read_exact(&mut bytes)
+                .context("read cache acknowledgement")?;
             replies.push(serde_json::from_slice(&bytes).context("decode cache acknowledgement")?);
         }
         Ok(replies)
@@ -656,7 +684,11 @@ impl Group {
     /// layer's worth on this model is under two gibibytes, and the write
     /// blocks against rank 0's read of it, which rank 0 makes after its own
     /// export -- so the socket buffer, not a second thread, absorbs the skew.
-    pub fn send_cuts(&mut self, cuts: &[super::learned::LearnedCut], model_identity: [u8; 32]) -> Result<()> {
+    pub fn send_cuts(
+        &mut self,
+        cuts: &[super::learned::LearnedCut],
+        model_identity: [u8; 32],
+    ) -> Result<()> {
         anyhow::ensure!(
             self.tp.rank() != 0,
             "rank 0 collects learned cuts; it has nobody to send them to"
@@ -667,7 +699,8 @@ impl Group {
             .context("this rank has no rendezvous socket to rank 0")?;
         peer.write_all(&(self.tp.rank() as u32).to_be_bytes())
             .context("send the exporting rank")?;
-        peer.write_all(&model_identity).context("send the export's model identity")?;
+        peer.write_all(&model_identity)
+            .context("send the export's model identity")?;
         peer.write_all(&(cuts.len() as u32).to_be_bytes())
             .context("send the learned-cut count")?;
         let mut frame = Vec::new();
@@ -693,10 +726,15 @@ impl Group {
         for (index, peer) in self.socks.iter_mut().enumerate() {
             let mut rank = [0u8; 4];
             let mut model_identity = [0u8; 32];
-            peer.read_exact(&mut rank).context("receive the exporting rank")?;
+            peer.read_exact(&mut rank)
+                .context("receive the exporting rank")?;
             let rank = u32::from_be_bytes(rank);
-            anyhow::ensure!(rank > 0 && (rank as usize) < self.tp.world(), "invalid exporting peer rank {rank}");
-            peer.read_exact(&mut model_identity).context("receive the export's model identity")?;
+            anyhow::ensure!(
+                rank > 0 && (rank as usize) < self.tp.world(),
+                "invalid exporting peer rank {rank}"
+            );
+            peer.read_exact(&mut model_identity)
+                .context("receive the export's model identity")?;
             let mut count = [0u8; 4];
             peer.read_exact(&mut count)
                 .with_context(|| format!("receive peer {index}'s learned-cut count"))?;
@@ -704,12 +742,16 @@ impl Group {
             let mut cuts = Vec::new();
             for i in 0..count {
                 cuts.push(
-                    super::learned::LearnedCut::decode(peer)
-                        .with_context(|| format!("receive peer {index}'s learned cut {i}/{count}"))?,
+                    super::learned::LearnedCut::decode(peer).with_context(|| {
+                        format!("receive peer {index}'s learned cut {i}/{count}")
+                    })?,
                 );
             }
             exports.push(super::learned::RankExport {
-                rank, world: self.tp.world() as u32, model_identity, cuts,
+                rank,
+                world: self.tp.world() as u32,
+                model_identity,
+                cuts,
             });
         }
         Ok(exports)
@@ -758,16 +800,21 @@ fn agree_cached_attention_on_link(
     policy: super::flash::CachedAttentionPolicy,
 ) -> Result<()> {
     let expected = if tp.rank() == 0 { tp.world() - 1 } else { 1 };
-    anyhow::ensure!(tp.is_split() && peers.len() == expected,
+    anyhow::ensure!(
+        tp.is_split() && peers.len() == expected,
         "cached-attention policy agreement has {} links for rank {} of {}",
-        peers.len(), tp.rank(), tp.world());
+        peers.len(),
+        tp.rank(),
+        tp.world()
+    );
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"inkling cached-attention startup policy\0");
     hasher.update(policy.as_str().as_bytes());
     let digest = *hasher.finalize().as_bytes();
-    let timeouts = peers.iter().map(|peer| {
-        Ok((peer.read_timeout()?, peer.write_timeout()?))
-    }).collect::<std::io::Result<Vec<_>>>()
+    let timeouts = peers
+        .iter()
+        .map(|peer| Ok((peer.read_timeout()?, peer.write_timeout()?)))
+        .collect::<std::io::Result<Vec<_>>>()
         .context("read cached-attention policy link timeouts")?;
 
     // All ranks have formed their sockets but have not entered NCCL. Bound an
@@ -791,25 +838,40 @@ fn agree_cached_attention_on_link(
             reply[0] = u8::from(first_mismatch.is_none());
             reply[1..].copy_from_slice(&digest);
             for peer in peers.iter_mut() {
-                peer.write_all(&reply).context("send cached-attention whole-group verdict")?;
+                peer.write_all(&reply)
+                    .context("send cached-attention whole-group verdict")?;
             }
             if let Some((index, theirs)) = first_mismatch {
                 anyhow::bail!(
                     "cached-attention policy disagreement before loading weights: rank 0 chose {} \
                      ({}), peer link {index} sent {}. The whole group must use the same policy",
-                    policy.as_str(), hex32(&digest), hex32(&theirs));
+                    policy.as_str(),
+                    hex32(&digest),
+                    hex32(&theirs)
+                );
             }
         } else {
             let peer = &mut peers[0];
-            peer.write_all(&digest).context("send startup cached-attention policy digest")?;
+            peer.write_all(&digest)
+                .context("send startup cached-attention policy digest")?;
             let mut reply = [0u8; 33];
-            peer.read_exact(&mut reply).context("receive cached-attention whole-group verdict")?;
-            anyhow::ensure!(reply[0] <= 1, "invalid cached-attention policy verdict {}", reply[0]);
+            peer.read_exact(&mut reply)
+                .context("receive cached-attention whole-group verdict")?;
+            anyhow::ensure!(
+                reply[0] <= 1,
+                "invalid cached-attention policy verdict {}",
+                reply[0]
+            );
             let theirs: [u8; 32] = reply[1..].try_into().expect("fixed-size policy digest");
-            anyhow::ensure!(reply[0] == 1 && theirs == digest,
+            anyhow::ensure!(
+                reply[0] == 1 && theirs == digest,
                 "cached-attention policy disagreement before loading weights: group rejected \
                  rank {} policy {} ({}); rank 0 digest {}. The whole group must use the same policy",
-                tp.rank(), policy.as_str(), hex32(&digest), hex32(&theirs));
+                tp.rank(),
+                policy.as_str(),
+                hex32(&digest),
+                hex32(&theirs)
+            );
         }
         Ok(())
     })();
@@ -818,7 +880,9 @@ fn agree_cached_attention_on_link(
     let mut restore_error = None;
     for (peer, (read, write)) in peers.iter().zip(timeouts) {
         for restored in [peer.set_read_timeout(read), peer.set_write_timeout(write)] {
-            if let Err(error) = restored { restore_error.get_or_insert(error); }
+            if let Err(error) = restored {
+                restore_error.get_or_insert(error);
+            }
         }
     }
     result?;
@@ -833,8 +897,7 @@ fn agree_cached_attention_on_link(
 /// A one-byte non-blocking peek: data or would-block means alive; zero means
 /// the peer closed; anything else is the link failing.
 fn assert_alive(peer: &TcpStream, rank: usize) -> Result<()> {
-    peer.set_nonblocking(true)
-        .context("probe the rank link")?;
+    peer.set_nonblocking(true).context("probe the rank link")?;
     let mut byte = [0u8; 1];
     let probe = peer.peek(&mut byte);
     peer.set_nonblocking(false)
@@ -962,8 +1025,12 @@ impl Pass {
     /// u32be count, one u32be id.
     fn encode(&self) -> Vec<u8> {
         if let Pass::Cache(command) = self {
-            let bytes = serde_json::to_vec(command).expect("integer-valued cache control serializes");
-            assert!(bytes.len() <= Self::MAX_DISTILL_BYTES, "cache command exceeds frame budget");
+            let bytes =
+                serde_json::to_vec(command).expect("integer-valued cache control serializes");
+            assert!(
+                bytes.len() <= Self::MAX_DISTILL_BYTES,
+                "cache command exceeds frame budget"
+            );
             let mut frame = Vec::with_capacity(5 + bytes.len());
             frame.push(Self::CACHE);
             frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -975,7 +1042,10 @@ impl Pass {
             // ordinary one-token serving frame remains nine bytes. One bulk
             // read also avoids a socket read per token in a long prompt.
             let bytes = serde_json::to_vec(work).expect("integer-valued SDFT work serializes");
-            assert!(bytes.len() <= Self::MAX_DISTILL_BYTES, "SDFT work exceeds its frame budget");
+            assert!(
+                bytes.len() <= Self::MAX_DISTILL_BYTES,
+                "SDFT work exceeds its frame budget"
+            );
             let mut frame = Vec::with_capacity(5 + bytes.len());
             frame.push(Self::DISTILL);
             frame.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
@@ -1023,7 +1093,9 @@ impl Pass {
                 one_id = [*index];
                 (Self::REWIND, &one_id[..])
             }
-            Pass::Audio { .. } | Pass::Vision { .. } | Pass::Distill(_) | Pass::Cache(_) => unreachable!("encoded above"),
+            Pass::Audio { .. } | Pass::Vision { .. } | Pass::Distill(_) | Pass::Cache(_) => {
+                unreachable!("encoded above")
+            }
         };
         let mut frame = Vec::with_capacity(5 + 4 * ids.len());
         frame.push(tag);
@@ -1035,8 +1107,13 @@ impl Pass {
     }
 
     fn decode_distillation(bytes: &[u8]) -> Result<Self> {
-        anyhow::ensure!(bytes.len() <= Self::MAX_DISTILL_BYTES, "SDFT work exceeds its frame budget");
-        Ok(Pass::Distill(serde_json::from_slice(bytes).context("decode SDFT work")?))
+        anyhow::ensure!(
+            bytes.len() <= Self::MAX_DISTILL_BYTES,
+            "SDFT work exceeds its frame budget"
+        );
+        Ok(Pass::Distill(
+            serde_json::from_slice(bytes).context("decode SDFT work")?,
+        ))
     }
 
     fn decode(tag: u8, ids: Vec<usize>) -> Result<Self> {
@@ -1354,7 +1431,9 @@ mod tests {
     use super::Pass;
 
     /// The production socket-only helper, never a Group or CUDA client.
-    fn policy_loopback(policies: &[super::super::flash::CachedAttentionPolicy]) -> Vec<anyhow::Result<()>> {
+    fn policy_loopback(
+        policies: &[super::super::flash::CachedAttentionPolicy],
+    ) -> Vec<anyhow::Result<()>> {
         use std::net::{TcpListener, TcpStream};
         use std::time::Duration;
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1388,13 +1467,19 @@ mod tests {
             Ok(())
         };
         std::thread::scope(|scope| {
-            let threads: Vec<_> = followers.into_iter().enumerate().map(|(index, peer)| {
-                let policy = policies[index + 1];
-                let run = &run;
-                scope.spawn(move || run(index + 1, vec![peer], policy))
-            }).collect();
+            let threads: Vec<_> = followers
+                .into_iter()
+                .enumerate()
+                .map(|(index, peer)| {
+                    let policy = policies[index + 1];
+                    let run = &run;
+                    scope.spawn(move || run(index + 1, vec![peer], policy))
+                })
+                .collect();
             let mut results = vec![run(0, leader, policies[0])];
-            for thread in threads { results.push(thread.join().expect("loopback peer panicked")); }
+            for thread in threads {
+                results.push(thread.join().expect("loopback peer panicked"));
+            }
             results
         })
     }
@@ -1403,7 +1488,9 @@ mod tests {
     fn cached_attention_policy_agreement_accepts_both_matching_policies() {
         use super::super::flash::CachedAttentionPolicy::{Legacy, PackedBatchedV1};
         for policy in [Legacy, PackedBatchedV1] {
-            for result in policy_loopback(&[policy, policy]) { result.unwrap(); }
+            for result in policy_loopback(&[policy, policy]) {
+                result.unwrap();
+            }
         }
     }
 
@@ -1413,7 +1500,12 @@ mod tests {
         for policies in [[Legacy, PackedBatchedV1], [PackedBatchedV1, Legacy]] {
             for result in policy_loopback(&policies) {
                 let error = result.expect_err("hybrid policies must not reach collective warmup");
-                assert!(error.to_string().contains("cached-attention policy disagreement"), "{error:#}");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("cached-attention policy disagreement"),
+                    "{error:#}"
+                );
             }
         }
     }
@@ -1425,7 +1517,12 @@ mod tests {
         assert_eq!(results.len(), 3);
         for result in results {
             let error = result.expect_err("every rank must receive the same rejecting verdict");
-            assert!(error.to_string().contains("cached-attention policy disagreement"), "{error:#}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("cached-attention policy disagreement"),
+                "{error:#}"
+            );
         }
     }
 
@@ -1433,12 +1530,37 @@ mod tests {
     fn distillation_work_round_trips_without_becoming_foreground_tokens() {
         use crate::models::inkling::sdft::{PreparedExample, Work};
         for work in [
-            Work::Prepare { slot: 2, example: PreparedExample { student: vec![1, 2], teacher: vec![3, 4, 5] } },
-            Work::Decode { active: Some(7), slots: vec![2, 0], tokens: vec![10, 11] },
-            Work::Decode { active: None, slots: vec![0], tokens: vec![5] },
-            Work::Score { slot: 2, continuation: vec![10, 11], student_version: u32::MAX as u64 + 9 },
-            Work::Learn { slot: 2, student_version: 7, teacher_version: 3 },
-            Work::UpdateTeacher { student_version: 9, teacher_version: 3 },
+            Work::Prepare {
+                slot: 2,
+                example: PreparedExample {
+                    student: vec![1, 2],
+                    teacher: vec![3, 4, 5],
+                },
+            },
+            Work::Decode {
+                active: Some(7),
+                slots: vec![2, 0],
+                tokens: vec![10, 11],
+            },
+            Work::Decode {
+                active: None,
+                slots: vec![0],
+                tokens: vec![5],
+            },
+            Work::Score {
+                slot: 2,
+                continuation: vec![10, 11],
+                student_version: u32::MAX as u64 + 9,
+            },
+            Work::Learn {
+                slot: 2,
+                student_version: 7,
+                teacher_version: 3,
+            },
+            Work::UpdateTeacher {
+                student_version: 9,
+                teacher_version: 3,
+            },
         ] {
             let pass = Pass::Distill(work);
             let frame = pass.encode();
@@ -1448,7 +1570,12 @@ mod tests {
             assert_eq!(Pass::decode_distillation(&frame[5..]).unwrap(), pass);
             assert!(Pass::decode_distillation(&frame[5..frame.len() - 1]).is_err());
         }
-        assert!(Pass::decode_distillation(br#"{"op":"decode","active":null,"slots":[],"tokens":[],"surprise":1}"#).is_err());
+        assert!(
+            Pass::decode_distillation(
+                br#"{"op":"decode","active":null,"slots":[],"tokens":[],"surprise":1}"#
+            )
+            .is_err()
+        );
     }
 
     /// The rank link's framing, which is the ONLY thing the two boxes now say
