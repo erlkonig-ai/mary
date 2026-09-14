@@ -23,9 +23,9 @@ use triblespace::core::blob::{Blob, IntoBlob, TryFromBlob};
 use triblespace::core::collection::descriptor;
 use triblespace::core::collection::simplearchive_union::PreparedCollectionCommit;
 use triblespace::core::collection::{
-    AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
-    CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt, Support,
-    read_capability, write_capability,
+    ACTION_READ, ACTION_WRITE, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle,
+    CollectionPolicy, CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStoreExt,
+    Support,
 };
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
@@ -145,14 +145,11 @@ fn named_collections_from_handles(
         // still current, including when this snapshot admits no writer.
         // Ordinary policy admission accepts supported alternatives; the scalar
         // descriptor inspector would incorrectly reject plural policy bindings.
-        let has_current_policies =
-            [read_capability(), write_capability()]
-                .into_iter()
-                .all(|capability| {
-                    descriptor::admission_policies(&facts, capability, Some(SimpleArchive::id()))
-                        .next()
-                        .is_some()
-                });
+        let has_current_policies = [ACTION_READ, ACTION_WRITE].into_iter().all(|action| {
+            descriptor::admission_policies(store, &facts, action, Some(SimpleArchive::id()))
+                .next()
+                .is_some()
+        });
         match (ModelCollection::open(store, handle), has_current_policies) {
             (Ok(collection), true) => collections.push(collection),
             _ => retired.push(handle),
@@ -914,10 +911,12 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use triblespace::core::capability::capability_action;
     use triblespace::core::capability::policy::resource_policy;
     use triblespace::core::collection::records::{
         KIND_COLLECTION_DESCRIPTOR, collection_name, collection_representation,
     };
+    use triblespace::core::collection::{read_capability, write_capability};
     use triblespace::core::repo::pile::Pile;
 
     use super::*;
@@ -1021,11 +1020,18 @@ mod tests {
         // The scalar inspector is deliberately stricter than ordinary
         // admission. Discovery must not substitute it for supported rows.
         assert!(descriptor::policy(descriptor.facts()).is_err());
-        for capability in [read_capability(), write_capability()] {
+        for action in [ACTION_READ, ACTION_WRITE] {
+            let definition = entity! { capability_action: action };
+            pile.put::<SimpleArchive, _>(definition.facts().clone())
+                .unwrap();
+        }
+        let policy_snapshot = pile.snapshot().unwrap();
+        for action in [ACTION_READ, ACTION_WRITE] {
             assert_eq!(
                 descriptor::admission_policies(
+                    &policy_snapshot,
                     descriptor.facts(),
-                    capability,
+                    action,
                     Some(SimpleArchive::id()),
                 )
                 .count(),
