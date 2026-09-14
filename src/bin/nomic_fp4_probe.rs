@@ -369,26 +369,29 @@ const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 
 type Keymap = HashMap<String, (Vec<f32>, Vec<usize>)>;
 
-fn load_parts(model_pile: &Path, quantization: &str) -> Result<(Keymap, tokenizers::Tokenizer)> {
+fn load_parts(
+    model_pile: &Path,
+    quantization: &str,
+) -> Result<(Keymap, tokenizers::Tokenizer, Vec<Id>)> {
     use mary::selection::{ModelSelector, TokenizerSelector};
     let snapshot = mary::model_collection::load_model_collection_local_latest(model_pile)
         .with_context(|| format!("open model pile {}", model_pile.display()))?;
-    let keymap = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        ModelSelector::Source {
-            source: NOMIC_TEXT_MODEL,
-            quantization,
-        },
-    )
-    .context("select native nomic text weights")?;
+    let selector = ModelSelector::Source {
+        source: NOMIC_TEXT_MODEL,
+        quantization,
+    };
+    let roots = mary::selection::select_model_roots(snapshot.facts(), snapshot.store(), selector)
+        .context("select nomic text source roots")?;
+    let keymap =
+        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.store(), selector)
+            .context("select native nomic text weights")?;
     let tokenizer = mary::selection::load_tokenizer_from_graph(
         snapshot.facts(),
         snapshot.store(),
         TokenizerSelector::Name(NOMIC_TEXT_MODEL),
     )
     .context("select nomic tokenizer")?;
-    Ok((keymap, tokenizer))
+    Ok((keymap, tokenizer, roots))
 }
 
 /// Fake-quantize every two-dimensional weight that is not an embedding table
@@ -935,7 +938,7 @@ fn dump(
     let device = mary::embed::default_device();
     let mut out = serde_json::Map::new();
     if !texts.is_empty() {
-        let (keymap, tokenizer) = load_parts(text_pile, text_quantization)?;
+        let (keymap, tokenizer, _) = load_parts(text_pile, text_quantization)?;
         let emb = mary::embed::nomic_text_from_parts(keymap, tokenizer, device.clone())?;
         let mut arr = Vec::new();
         for t in texts {
@@ -1054,7 +1057,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
     }
     eprintln!("corpus: {} texts", rows.len());
 
-    let (keymap, tokenizer) = load_parts(model_pile, &options.quantization)?;
+    let (keymap, tokenizer, parents) = load_parts(model_pile, &options.quantization)?;
     if options.list_tensors {
         let mut names: Vec<_> = keymap
             .iter()
@@ -1323,6 +1326,7 @@ fn probe(model_pile: &Path, corpus: &Path, options: ProbeOptions) -> Result<()> 
             &calibrated,
             NOMIC_TEXT_MODEL,
             "nvfp4-calibrated",
+            &parents,
             Some(json.as_bytes()),
             false,
         )?;

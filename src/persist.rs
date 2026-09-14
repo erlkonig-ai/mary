@@ -153,8 +153,8 @@ pub fn ingest_model_fragment(
 
     // Ingest EVERY shard's weight blobs straight into the pile storage (no
     // in-memory carryover), gathering ALL shards' tensor members under ONE root
-    // whose id is content-derived from (model_id, quantization, members). Each
-    // shard's file name becomes non-core provenance on that root.
+    // whose id is content-derived from members alone. Model/format labels and
+    // each shard's file name become non-core provenance on that root.
     let mut members: Vec<Id> = Vec::new();
     let mut facts = TribleSet::new();
     let mut provenance: Vec<String> = Vec::new();
@@ -245,7 +245,9 @@ pub fn import_model_to_collection(
 /// in deterministic name order and each f32 payload is materialized, converted,
 /// and persisted before the next is read, so peak host weight memory is one
 /// tensor rather than the model. The caller supplies both the target coordinate
-/// and signing identity and retains the pile/durability boundary.
+/// and signing identity and retains the pile/durability boundary. Every actual
+/// selected source root is retained as a non-core `format::attrs::parent`
+/// annotation; a source label is never used to reconstruct ancestry.
 #[cfg(feature = "import")]
 pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
     pile: &mut Pile,
@@ -254,7 +256,7 @@ pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
     source: &str,
     quantization: &str,
 ) -> anyhow::Result<(Id, CollectionCommit, usize, usize)> {
-    let (_, mut index, reader) = selected.into_parts();
+    let (parents, mut index, reader) = selected.into_parts();
     let _ = &reader;
     anyhow::ensure!(!index.is_empty(), "cannot derive an empty f16 model root");
     for (name, leaf) in &index {
@@ -289,9 +291,12 @@ pub fn derive_selected_f16_to_collection<R: BlobStoreGet>(
         }
     }
     let tensor_count = members.len();
-    let root = crate::ingest::build_model_root(pile, source, quantization, members, facts, &[])
+    let mut root = crate::ingest::build_model_root(pile, source, quantization, members, facts, &[])
         .map_err(|error| anyhow::anyhow!("build derived f16 model root: {error}"))?;
     let root_id = root.root().expect("derived f16 model root");
+    root += entity! { ExclusiveId::force_ref(&root_id) @
+        crate::format::attrs::parent*: parents.iter().filter(|parent| **parent != root_id),
+    };
     let commit = crate::model_collection::publish_model_fragment(pile, signing_key, root)
         .map_err(|error| anyhow::anyhow!("publish derived f16 model root: {error}"))?;
     Ok((root_id, commit, tensor_count, elements))
@@ -615,6 +620,112 @@ mod filtered_native_import_tests {
     }
 
     #[test]
+    fn legacy_split_selection_retains_actual_roots_for_derivation() {
+        use crate::format::attrs;
+
+        let fixture = TempFixture::new();
+        let path = fixture.dir.join("rooted-split.pile");
+        std::fs::File::create(&path).unwrap();
+        let key = SigningKey::from_bytes(&[0x59; 32]);
+        let mut pile = Pile::open(&path).unwrap();
+        let half = fucid();
+        let exact = fucid();
+        let exact_head = fucid();
+        let annotation_only = fucid();
+        let mut graph = Fragment::empty();
+        for (root, label, tensor, is_half) in [
+            (&half, "talker_f16", "talker.layer.weight", true),
+            (&exact, "exact-weights", "talker.layer.weight", false),
+            (&exact_head, "exact-head", "talker.codec_head.weight", false),
+        ] {
+            let leaf = if is_half {
+                crate::format::put_raw_f16(&mut pile, &[1.0, 2.0], &[1, 2]).unwrap()
+            } else {
+                crate::format::put_raw(&mut pile, &[1.0, 2.0], &[1, 2]).unwrap()
+            };
+            let leaf_id = leaf.root().unwrap();
+            graph += leaf;
+            let tensor_name = graph.put::<blobencodings::UTF8String, _>(tensor.to_owned());
+            let member =
+                entity! { _ @ attrs::safetensor_path: tensor_name, attrs::weight: leaf_id };
+            let member_id = member.root().unwrap();
+            graph += member;
+            let name = graph.put::<blobencodings::UTF8String, _>(label.to_owned());
+            graph += entity! { root @ attrs::member: member_id, attrs::model_name: name };
+        }
+        let alias = graph.put::<blobencodings::UTF8String, _>("also-exact".to_owned());
+        graph += entity! { &exact @ attrs::model_name: alias };
+        let label = graph.put::<blobencodings::UTF8String, _>("not-a-model".to_owned());
+        graph += entity! { &annotation_only @ attrs::model_name: label };
+        crate::model_collection::publish_model_fragment(&mut pile, &key, graph).unwrap();
+        pile.close().unwrap();
+
+        let (half_index, exact_index, _, roots) =
+            load_split_index_and_roots_from_pile(&path, "talker_f16").unwrap();
+        assert_eq!(half_index.len(), 1);
+        assert_eq!(exact_index.len(), 2);
+        let mut exact_roots = vec![exact.id, exact_head.id];
+        exact_roots.sort_unstable();
+        assert_eq!(roots, [vec![half.id], exact_roots.clone()]);
+
+        #[cfg(feature = "qwen3tts")]
+        {
+            let (loader, parents) =
+                load_aliased_loader_and_roots_from_pile(&path, "talker_f16").unwrap();
+            match loader {
+                crate::nn::weight_loader::WeightLoader::Pile(_) => {
+                    assert_eq!(
+                        parents, exact_roots,
+                        "materialized loading excludes the half roots"
+                    );
+                }
+                #[cfg(target_os = "macos")]
+                crate::nn::weight_loader::WeightLoader::Aliased(_) => {
+                    let mut expected = vec![half.id, exact.id, exact_head.id];
+                    expected.sort_unstable();
+                    assert_eq!(
+                        parents, expected,
+                        "alias loading retains both source families"
+                    );
+                }
+                _ => panic!("unexpected legacy weight loader"),
+            }
+            assert!(!parents.contains(&annotation_only.id));
+        }
+
+        // A second root containing the same named tensor is not silently
+        // substituted into the derived model's input or its ancestry.
+        let mut pile = Pile::open(&path).unwrap();
+        let snapshot =
+            crate::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
+        let member = find!(
+            member: Id,
+            pattern!(snapshot.facts(), [{ &exact @ attrs::member: ?member }])
+        )
+        .next()
+        .unwrap();
+        drop(snapshot);
+        let conflict = fucid();
+        let name = pile
+            .put::<blobencodings::UTF8String, _>("conflicting-exact-root".to_owned())
+            .unwrap();
+        crate::model_collection::publish_model_fragment(
+            &mut pile,
+            &key,
+            entity! { &conflict @ attrs::model_name: name, attrs::member: member },
+        )
+        .unwrap();
+        pile.close().unwrap();
+        let error = load_split_index_and_roots_from_pile(&path, "talker_f16")
+            .err()
+            .expect("conflicting roots must not produce an arbitrary input map");
+        assert!(
+            error.to_string().contains("not shards of one component"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn safetensors_append_rejects_an_unadmitted_writer_before_reading_payload() {
         let fixture = TempFixture::new();
         let pile_path = fixture.dir.join("authority.pile");
@@ -675,7 +786,7 @@ mod filtered_native_import_tests {
         std::fs::File::create(&pile_path).unwrap();
         let signing_key = SigningKey::from_bytes(&[0x59; 32]);
         let mut pile = Pile::open(&pile_path).unwrap();
-        let (root, commit) = import_safetensors_file_filtered_to_collection(
+        let (root, _commit) = import_safetensors_file_filtered_to_collection(
             &mut pile,
             &signing_key,
             &weights_file,
@@ -1003,25 +1114,62 @@ pub fn load_split_index_from_pile(
     HashMap<String, crate::leaf::Leaf>,
     triblespace::core::repo::pile::PileSnapshot,
 )> {
+    let (f16, exact, reader, _) = load_split_index_and_roots_from_pile(pile_path, f16_prefix)?;
+    Ok((f16, exact, reader))
+}
+
+// Keep the actual model roots beside the numerical indexes at the point where
+// the legacy name-prefix selection happens. Derivation consumes these IDs;
+// it never tries to recover a base from a filename after loading the weights.
+fn load_split_index_and_roots_from_pile(
+    pile_path: &Path,
+    f16_prefix: &str,
+) -> anyhow::Result<(
+    HashMap<String, crate::leaf::Leaf>,
+    HashMap<String, crate::leaf::Leaf>,
+    triblespace::core::repo::pile::PileSnapshot,
+    [Vec<Id>; 2],
+)> {
     let source = read_model_pile(pile_path)?;
     let (tribles, reader) = (source.facts, source.store);
 
-    let mut f16 = HashMap::new();
-    let mut f32_ = HashMap::new();
+    let mut roots = [
+        std::collections::BTreeSet::new(),
+        std::collections::BTreeSet::new(),
+    ];
     for (m, n) in find!(
         (m: Id, n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
         pattern!(&tribles, [{ ?m @ crate::format::attrs::model_name: ?n }])
     ) {
+        if !exists!(
+            (),
+            pattern!(&tribles, [{ m @ crate::format::attrs::member: _?member }])
+        ) {
+            continue;
+        }
         let name: anybytes::View<str> = reader
             .get(n)
             .map_err(|e| anyhow::anyhow!("model name blob: {e:?}"))?;
         if !f16_prefix.is_empty() && name.starts_with(f16_prefix) {
-            f16.extend(crate::ingest::index_keymap(&tribles, &reader, m));
+            roots[0].insert(m);
         } else {
-            f32_.extend(crate::ingest::index_keymap(&tribles, &reader, m));
+            roots[1].insert(m);
         }
     }
-    Ok((f16, f32_, reader))
+    let roots = roots.map(|roots| roots.into_iter().collect::<Vec<_>>());
+    // A conflicting pair of roots cannot become ancestry for an accidental
+    // last-wins tensor map. Use the shared explicit-root index for each group.
+    let f16 = if roots[0].is_empty() {
+        HashMap::new()
+    } else {
+        crate::selection::index_keymap_for_roots(&tribles, &reader, &roots[0])?
+    };
+    let exact = if roots[1].is_empty() {
+        HashMap::new()
+    } else {
+        crate::selection::index_keymap_for_roots(&tribles, &reader, &roots[1])?
+    };
+    Ok((f16, exact, reader, roots))
 }
 
 /// The runtime weight loader for a pile that carries a half-width alias entity
@@ -1037,8 +1185,17 @@ pub fn load_aliased_loader_from_pile(
     pile_path: &Path,
     f16_prefix: &str,
 ) -> anyhow::Result<crate::nn::weight_loader::WeightLoader> {
+    load_aliased_loader_and_roots_from_pile(pile_path, f16_prefix).map(|(loader, _)| loader)
+}
+
+#[cfg(feature = "qwen3tts")]
+fn load_aliased_loader_and_roots_from_pile(
+    pile_path: &Path,
+    f16_prefix: &str,
+) -> anyhow::Result<(crate::nn::weight_loader::WeightLoader, Vec<Id>)> {
     use crate::nn::weight_loader::WeightLoader;
-    let (f16, f32_, _reader) = load_split_index_from_pile(pile_path, f16_prefix)?;
+    let (f16, f32_, _reader, [f16_roots, exact_roots]) =
+        load_split_index_and_roots_from_pile(pile_path, f16_prefix)?;
     anyhow::ensure!(
         !f32_.is_empty(),
         "no exact (f32) model entities in pile {pile_path:?}"
@@ -1052,23 +1209,29 @@ pub fn load_aliased_loader_from_pile(
                  materialize+cast (append it with: qwen3tts_persist <model-dir> <pile> --f16-talker-only)"
             );
         }
-        return Ok(WeightLoader::Aliased(
-            crate::nn::weight_loader::AliasedPile::new(
+        let mut parents = exact_roots;
+        parents.extend(f16_roots);
+        parents.sort_unstable();
+        parents.dedup();
+        return Ok((
+            WeightLoader::Aliased(crate::nn::weight_loader::AliasedPile::new(
                 f16,
                 f32_,
                 crate::nn::backend::WgpuDevice::default(),
-            ),
+            )),
+            parents,
         ));
     }
     if materialize {
         eprintln!("[mary] MARY_SPEAK_MATERIALIZE set — using the fully materialized load");
     }
     let _ = f16; // half-width leaves are only for aliasing; exact leaves feed the keymap
+    let _ = f16_roots;
     let keymap = f32_
         .into_iter()
         .map(|(k, leaf)| (k, leaf.to_f32_shape()))
         .collect();
-    Ok(WeightLoader::Pile(keymap))
+    Ok((WeightLoader::Pile(keymap), exact_roots))
 }
 
 /// Load the canonical PersonaPlex bundle from its exact admitted cover.
@@ -1236,6 +1399,10 @@ pub fn qwen3tts_folded_readback<B: burn::prelude::Backend>(
 /// is opened read-only through the ordinary load path and its byte length is
 /// verified unchanged afterwards. The caller's durable signing key becomes the
 /// new sibling collection's authority.
+///
+/// The actual roots observed by the legacy prefix selection travel alongside
+/// the loader. The folded root records those bases directly: both families on
+/// the aliased path, or just the exact family when materialization is selected.
 #[cfg(all(feature = "qwen3tts", target_os = "macos"))]
 pub fn derive_qwen3tts_folded_pile(
     src_pile: &Path,
@@ -1254,7 +1421,7 @@ pub fn derive_qwen3tts_folded_pile(
     let src_len_before = std::fs::metadata(src_pile)?.len();
 
     eprintln!("[fold-derive] loading production talker (BFusedHalf) from {src_pile:?} ...");
-    let loader = load_aliased_loader_from_pile(src_pile, "talker_f16")?;
+    let (loader, parents) = load_aliased_loader_and_roots_from_pile(src_pile, "talker_f16")?;
     let dev = Default::default();
     let talker = Talker::<BFusedHalf>::load(&loader, &dev);
     drop(loader);
@@ -1296,8 +1463,13 @@ pub fn derive_qwen3tts_folded_pile(
     let mn = pile
         .put::<blobencodings::UTF8String, _>("talker_folded_f16".to_string())
         .map_err(|e| anyhow::anyhow!("put entity name blob: {e:?}"))?;
-    let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
+    let model = entity! { _ @ attrs::member*: members.iter() };
+    let root = model.root().expect("folded model root");
     graph += model;
+    graph += entity! { ExclusiveId::force_ref(&root) @
+        attrs::model_name: mn,
+        attrs::parent*: parents.iter().filter(|parent| **parent != root),
+    };
     crate::model_collection::publish_model_fragment(&mut pile, signing_key, graph)
         .map_err(|e| anyhow::anyhow!("publish folded model fragment: {e}"))?;
     pile.close()

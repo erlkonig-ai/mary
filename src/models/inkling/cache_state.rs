@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 use super::flash::CachedAttentionPolicy;
 use super::seam::{self, Bk};
 
-pub const CACHE_FORMAT_VERSION: u32 = 1;
+// Version 2 names the ordinary model collection plus the selected opaque root.
+// Version 1's whole-collection fingerprint is not a compatible model reference.
+pub const CACHE_FORMAT_VERSION: u32 = 2;
 pub const MAX_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 pub type BlobSink<'a> = dyn FnMut(&[u8]) -> Result<[u8; 32]> + 'a;
@@ -276,8 +278,8 @@ pub struct LayerGeometry {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheGeometry {
-    pub model_identity: [u8; 32],
-    pub model_root: Option<[u8; 16]>,
+    pub model_collection: [u8; 32],
+    pub model_root: [u8; 16],
     pub config_identity: [u8; 32],
     pub rank: usize,
     pub world: usize,
@@ -839,8 +841,8 @@ mod tests {
 
     fn fixture() -> SessionCacheState {
         let geometry = CacheGeometry {
-            model_identity: [1; 32],
-            model_root: Some([2; 16]),
+            model_collection: [1; 32],
+            model_root: [2; 16],
             config_identity: [3; 32],
             rank: 0,
             world: 2,
@@ -922,13 +924,26 @@ mod tests {
     }
 
     #[test]
-    fn cached_attention_legacy_preserves_serialized_geometry_and_identity() {
+    fn collection_fingerprint_cache_v1_is_not_a_model_reference() {
+        let state = fixture();
+        let mut old_version = state.clone();
+        old_version.version = 1;
+        assert!(old_version.validate(&state.geometry).is_err());
+        let mut old_geometry = serde_json::to_value(&state.geometry).unwrap();
+        let fields = old_geometry.as_object_mut().unwrap();
+        let fingerprint = fields.remove("model_collection").unwrap();
+        fields.insert("model_identity".to_string(), fingerprint);
+        assert!(serde_json::from_value::<CacheGeometry>(old_geometry).is_err());
+    }
+
+    #[test]
+    fn model_reference_cache_v2_preserves_explicit_geometry_and_attention_policy() {
         let geometry = fixture().geometry;
-        // The old field order and values, before cached_attention existed.
-        // Array encoding is independent of CacheGeometry's derived serializer.
+        // Array encoding is independent of CacheGeometry's derived serializer;
+        // the default numerical lane still omits the optional policy field.
         let legacy_json = format!(
             concat!(
-                "{{\"model_identity\":{},\"model_root\":{},\"config_identity\":{},",
+                "{{\"model_collection\":{},\"model_root\":{},\"config_identity\":{},",
                 "\"rank\":0,\"world\":2,\"hidden\":128,\"kernel\":4,\"sliding_window\":4,\"vocab\":32,",
                 "\"context_budget\":1024,\"extend_batch\":16,\"prefill_budget\":16,\"forbidden\":[0,1],",
                 "\"router\":\"bf16\",\"shared_halved\":true,\"kv_prealloc\":null,\"kv_epoch\":512,",
@@ -945,7 +960,7 @@ mod tests {
         assert_eq!(serde_json::to_string(&geometry).unwrap(), legacy_json);
         assert_eq!(
             geometry.identity().unwrap(),
-            *blake3::hash(format!("[1,{legacy_json}]").as_bytes()).as_bytes()
+            *blake3::hash(format!("[2,{legacy_json}]").as_bytes()).as_bytes()
         );
         let restored: CacheGeometry = serde_json::from_str(&legacy_json).unwrap();
         assert_eq!(restored.cached_attention, CachedAttentionPolicy::Legacy);
@@ -984,8 +999,9 @@ mod tests {
             identity,
             *blake3::hash(&serde_json::to_vec(&state.geometry).unwrap()).as_bytes()
         );
-        let changes: [fn(&mut CacheGeometry); 9] = [
-            |g| g.model_identity[0] ^= 1,
+        let changes: [fn(&mut CacheGeometry); 10] = [
+            |g| g.model_collection[0] ^= 1,
+            |g| g.model_root[0] ^= 1,
             |g| g.config_identity[0] ^= 1,
             |g| g.rank = 1,
             |g| g.forbidden.push(2),

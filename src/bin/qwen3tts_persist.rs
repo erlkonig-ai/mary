@@ -33,6 +33,7 @@ mod imp {
     use std::time::Instant;
     use triblespace::core::repo::pile::Pile;
     use triblespace::core::signing_key_file;
+    use triblespace::prelude::{ExclusiveId, entity};
 
     /// Everything the GPU talker loads, excluding the code predictor and
     /// codec-head CPU stages which deliberately remain exact f32.
@@ -93,6 +94,14 @@ mod imp {
                 QUANTIZATION_F16,
                 is_gpu_talker_tensor,
             )?;
+        mary::model_collection::publish_model_fragment(
+            pile,
+            signing_key,
+            entity! { ExclusiveId::force_ref(&talker_root) @
+                mary::format::attrs::parent: base_root,
+            },
+        )
+        .map_err(|error| anyhow::anyhow!("publish filtered talker ancestry: {error}"))?;
 
         // Freeze one admitted collection cover, then bind the fold to the two
         // exact content roots returned by this invocation. Other collection
@@ -125,7 +134,7 @@ mod imp {
             LeafDtype::F16,
         )
         .map_err(|error| anyhow::anyhow!("ingest folded talker: {error}"))?;
-        let folded = mary::ingest::build_model_root(
+        let mut folded = mary::ingest::build_model_root(
             pile,
             &folded_source,
             QUANTIZATION_F16,
@@ -135,6 +144,9 @@ mod imp {
         )
         .map_err(|error| anyhow::anyhow!("build folded model root: {error}"))?;
         let folded_root = folded.root().expect("folded model root");
+        folded += entity! { ExclusiveId::force_ref(&folded_root) @
+            mary::format::attrs::parent*: [base_root, talker_root],
+        };
         let _folded_commit =
             mary::model_collection::publish_model_fragment(pile, signing_key, folded)
                 .map_err(|error| anyhow::anyhow!("publish folded model root: {error}"))?;

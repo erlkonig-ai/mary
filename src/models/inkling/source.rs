@@ -66,8 +66,15 @@ impl Weights {
     /// node reading the SSD in the middle of a decode step, which is the one
     /// thing this runtime must never do.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        Self::open_root(path, None)
+    }
+
+    pub fn open_root(
+        path: impl AsRef<std::path::Path>,
+        root: Option<triblespace::prelude::Id>,
+    ) -> Result<Self> {
         Ok(Weights {
-            src: PileSource::open(path.as_ref())?,
+            src: PileSource::open_root(path.as_ref(), root)?,
             resident: Mutex::new(HashMap::new()),
             io: Mutex::new(BTreeMap::new()),
         })
@@ -95,9 +102,9 @@ impl Weights {
         )
     }
 
-    /// Canonical content identity of every model fact this loader resolved.
-    pub fn model_identity(&self) -> [u8; 32] {
-        self.src.model_identity()
+    /// The ordinary collection descriptor containing the selected model root.
+    pub fn model_collection(&self) -> triblespace::core::collection::CollectionHandle {
+        self.src.model_collection()
     }
 
     // ---- reading ---------------------------------------------------------
@@ -224,9 +231,8 @@ impl Weights {
         self.src.frozen_prefix()
     }
 
-    /// The model root this source loaded from, if one was named or chosen;
-    /// a learned version written back is its child.
-    pub fn model_root(&self) -> Option<triblespace::prelude::Id> {
+    /// The existing root this source loaded from; a learned version is its child.
+    pub fn model_root(&self) -> triblespace::prelude::Id {
         self.src.model_root()
     }
 

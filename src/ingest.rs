@@ -48,11 +48,10 @@ pub fn save_safetensors(
 /// model entity (e.g. the qwen3tts talker as a half-width `talker_f16` variant
 /// next to the exact f32 leaves).
 ///
-/// This is the LEGACY, `main`-branch shape: ONE model entity per file, its id
-/// derived from `{model_name, member*}` (name-keyed provenance IS the core here).
-/// The content-addressed model-ROOT path — where the id is derived from the model
-/// IDENTITY `{model_id, quantization, weights}` and `model_name` is demoted to
-/// non-core provenance — is [`ingest_members`] + [`build_model_root`].
+/// The root's identity core is its member links, just as in
+/// [`build_model_root`]. `model_name` is a non-core label. This affects new
+/// imports only: readers keep addressing previously stored per-file roots by
+/// their opaque IDs, including roots whose old writer included the name.
 #[cfg(feature = "import")]
 pub fn save_safetensors_filtered(
     bytes: &[u8],
@@ -63,15 +62,16 @@ pub fn save_safetensors_filtered(
 ) -> Result<Fragment, Err> {
     let (members, mut facts) = ingest_members(bytes, blobs, dtype, keep)?;
     let mn = blobs.put::<UTF8String, _>(model_name.to_string())?;
-    let model = entity! { _ @ attrs::model_name: mn, attrs::member*: members.iter() };
+    let model = entity! { _ @ attrs::member*: members.iter() };
     let model_root_id = model.root().expect("model root");
     facts += model.into_facts();
+    facts += entity! { ExclusiveId::force_ref(&model_root_id) @ attrs::model_name: mn };
     Ok(Fragment::rooted(model_root_id, facts))
 }
 
 /// Ingest one safetensors blob's float tensors (those whose name passes `keep`)
 /// into content-addressed member MODULES, returning `(member module ids, facts)`
-/// — the shared front half of both the legacy per-file model entity
+/// — the shared front half of both the per-file model entity
 /// ([`save_safetensors_filtered`]) and the content-addressed model ROOT
 /// ([`build_model_root`]). No model/root entity is created here: the caller
 /// decides how the members are grouped (per-file, or ONE root composing every

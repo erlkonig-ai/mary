@@ -135,10 +135,54 @@ use cubecl::server::{Handle, ReduceOperation};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
+use triblespace::core::collection::CollectionHandle;
+use triblespace::prelude::Id;
 
 use burn::tensor::Tensor;
 
 use super::tp::Tp;
+
+// Export replies now name a collection descriptor and root, not a facts digest.
+// Minted with `trible genid` on 2026-09-14: 49E93BFB17D471D8B8D9CC80A3026994.
+const EXPORT_FRAME_ID: Id = triblespace::macros::id_hex!("49E93BFB17D471D8B8D9CC80A3026994");
+
+fn write_export_header(
+    writer: &mut impl Write,
+    rank: u32,
+    collection: CollectionHandle,
+    root: Id,
+    count: u32,
+) -> Result<()> {
+    writer.write_all(&EXPORT_FRAME_ID.raw())?;
+    writer.write_all(&rank.to_be_bytes())?;
+    writer.write_all(&collection.raw)?;
+    writer.write_all(&root.raw())?;
+    writer.write_all(&count.to_be_bytes())?;
+    Ok(())
+}
+
+fn read_export_header(reader: &mut impl Read) -> Result<(u32, CollectionHandle, Id, u32)> {
+    let mut magic = [0; 16];
+    reader.read_exact(&mut magic)?;
+    anyhow::ensure!(
+        magic == EXPORT_FRAME_ID.raw(),
+        "unsupported learned-export model-reference frame"
+    );
+    let mut rank = [0; 4];
+    let mut collection = [0; 32];
+    let mut root = [0; 16];
+    let mut count = [0; 4];
+    reader.read_exact(&mut rank)?;
+    reader.read_exact(&mut collection)?;
+    reader.read_exact(&mut root)?;
+    reader.read_exact(&mut count)?;
+    Ok((
+        u32::from_be_bytes(rank),
+        CollectionHandle::new(collection),
+        Id::new(root).context("export names a nil model root")?,
+        u32::from_be_bytes(count),
+    ))
+}
 
 /// How long a rank waits for its peer at the rendezvous before giving up.
 ///
@@ -678,7 +722,7 @@ impl Group {
     /// Send rank 0 this rank's learned cuts, in answer to [`Pass::Export`].
     /// Only a non-zero rank may call it.
     ///
-    /// `[rank u32be][model identity 32][count u32be][count x LearnedCut]`
+    /// `[format 16][rank u32be][collection 32][root 16][count u32be][cuts]`
     /// on the socket to rank 0. Even count zero is an explicit successful
     /// response; socket accept order is NOT tensor-parallel rank order. A whole
     /// layer's worth on this model is under two gibibytes, and the write
@@ -687,7 +731,8 @@ impl Group {
     pub fn send_cuts(
         &mut self,
         cuts: &[super::learned::LearnedCut],
-        model_identity: [u8; 32],
+        model_collection: CollectionHandle,
+        model_root: Id,
     ) -> Result<()> {
         anyhow::ensure!(
             self.tp.rank() != 0,
@@ -697,12 +742,14 @@ impl Group {
             .socks
             .first_mut()
             .context("this rank has no rendezvous socket to rank 0")?;
-        peer.write_all(&(self.tp.rank() as u32).to_be_bytes())
-            .context("send the exporting rank")?;
-        peer.write_all(&model_identity)
-            .context("send the export's model identity")?;
-        peer.write_all(&(cuts.len() as u32).to_be_bytes())
-            .context("send the learned-cut count")?;
+        write_export_header(
+            peer,
+            self.tp.rank() as u32,
+            model_collection,
+            model_root,
+            u32::try_from(cuts.len()).context("learned-cut count exceeds wire width")?,
+        )
+        .context("send the exporting rank and model reference")?;
         let mut frame = Vec::new();
         for cut in cuts {
             frame.clear();
@@ -724,21 +771,13 @@ impl Group {
         );
         let mut exports = Vec::new();
         for (index, peer) in self.socks.iter_mut().enumerate() {
-            let mut rank = [0u8; 4];
-            let mut model_identity = [0u8; 32];
-            peer.read_exact(&mut rank)
-                .context("receive the exporting rank")?;
-            let rank = u32::from_be_bytes(rank);
+            let (rank, model_collection, model_root, count) = read_export_header(peer)
+                .context("receive the exporting rank and model reference")?;
             anyhow::ensure!(
                 rank > 0 && (rank as usize) < self.tp.world(),
                 "invalid exporting peer rank {rank}"
             );
-            peer.read_exact(&mut model_identity)
-                .context("receive the export's model identity")?;
-            let mut count = [0u8; 4];
-            peer.read_exact(&mut count)
-                .with_context(|| format!("receive peer {index}'s learned-cut count"))?;
-            let count = u32::from_be_bytes(count) as usize;
+            let count = count as usize;
             let mut cuts = Vec::new();
             for i in 0..count {
                 cuts.push(
@@ -750,7 +789,8 @@ impl Group {
             exports.push(super::learned::RankExport {
                 rank,
                 world: self.tp.world() as u32,
-                model_identity,
+                model_collection,
+                model_root,
                 cuts,
             });
         }
@@ -1429,6 +1469,34 @@ pub fn reduce_activation(
 #[cfg(test)]
 mod tests {
     use super::Pass;
+
+    #[test]
+    fn learned_export_header_preserves_collection_and_opaque_root() {
+        let collection = super::CollectionHandle::new([42; 32]);
+        let root = triblespace::prelude::genid().id;
+        let mut bytes = Vec::new();
+        super::write_export_header(&mut bytes, 1, collection, root, 3).unwrap();
+        assert_eq!(bytes.len(), 72);
+        assert_eq!(&bytes[..16], &super::EXPORT_FRAME_ID.raw());
+        let mut input = bytes.as_slice();
+        assert_eq!(
+            super::read_export_header(&mut input).unwrap(),
+            (1, collection, root, 3)
+        );
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn learned_export_header_rejects_the_old_fingerprint_frame_before_its_payload() {
+        let mut old = Vec::new();
+        old.extend_from_slice(&1u32.to_be_bytes());
+        old.extend_from_slice(&[42; 32]);
+        old.extend_from_slice(&0u32.to_be_bytes());
+        let mut input = old.as_slice();
+        let error = super::read_export_header(&mut input).unwrap_err();
+        assert!(error.to_string().contains("model-reference frame"));
+        assert_eq!(input.len(), old.len() - 16);
+    }
 
     /// The production socket-only helper, never a Group or CUDA client.
     fn policy_loopback(

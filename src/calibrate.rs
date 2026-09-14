@@ -626,16 +626,18 @@ pub fn pack_keymap<'s>(
 /// `Tensor<NVFP4, 2>` leaf plus its `<name>.input_scale` F32 vector, every
 /// other tensor as an F32 leaf, under one root labelled `quantization` and
 /// named `source`, and, when given, the tokenizer JSON beside it so the pile
-/// loads on its own.
+/// loads on its own. `parents` are the actual roots selected for the source
+/// weights, not IDs inferred from `source`. Their facts need not have arrived
+/// in this pile yet. All labels and parent links annotate the member-only root.
 ///
 /// A new file unless `append`: a pile is append-only and a second root in it
 /// is a choice the caller makes by name. With `append`, the root joins an
 /// existing model pile's collection (which the key must be allowed to write),
 /// so one pile carries the native root and the packed one and every reader,
-/// old or new, finds the root it asks for; the tokenizer is left out when the
-/// pile already has one, and a root already labelled `quantization` for
-/// `source` refuses the write, because two of them would be selected together
-/// and their tensor names would collide.
+/// old or new, can address the root it asks for. Several roots may share a
+/// label; that is a choice for the reader, not a publication constraint. Any
+/// explicitly supplied tokenizer is published alongside it. Unrelated
+/// tokenizers in the collection do not suppress that publication.
 pub fn write_packed_pile(
     out: &Path,
     key: &SigningKey,
@@ -643,45 +645,19 @@ pub fn write_packed_pile(
     packed: &HashMap<String, Calibrated>,
     source: &str,
     quantization: &str,
+    parents: &[Id],
     tokenizer_json: Option<&[u8]>,
     append: bool,
 ) -> Result<Id> {
     use crate::format::attrs;
     use crate::leaf::{Elem, put_leaf};
 
-    let mut tokenizer_json = tokenizer_json;
     if append {
         ensure!(
             out.exists(),
             "--append needs an existing pile, {} is not one",
             out.display()
         );
-        // A pile that has no model collection yet (a self pile taking its first
-        // model, JP's "just put it into self.pile and let replication take care
-        // of the rest") gets one below; a pile that has one must not already
-        // carry this root or a tokenizer.
-        match crate::model_collection::load_model_collection_local_latest(out) {
-            Ok(snapshot) => {
-                ensure!(
-                    crate::selection::select_model_roots(
-                        snapshot.facts(),
-                        snapshot.store(),
-                        crate::selection::ModelSelector::Source {
-                            source,
-                            quantization
-                        },
-                    )
-                    .is_err(),
-                    "{} already carries a {source} root labelled {quantization}",
-                    out.display()
-                );
-                if crate::tokenizer::find_tokenizer(snapshot.facts()).is_some() {
-                    tokenizer_json = None;
-                }
-            }
-            Err(e) if e.to_string().contains("no collection named") => {}
-            Err(e) => return Err(anyhow::anyhow!("open {} to append: {e}", out.display())),
-        }
     } else {
         ensure!(
             !out.exists(),
@@ -771,16 +747,17 @@ pub fn write_packed_pile(
     let source_h = pile
         .put::<blobencodings::UTF8String, _>(source.to_string())
         .map_err(|e| anyhow::anyhow!("store source: {e:?}"))?;
-    let model = entity! { _ @
-        attrs::model_name: name_h,
-        attrs::source: source_h,
-        attrs::quantization: quantization,
-        attrs::member*: members.iter(),
-    };
+    let model = entity! { _ @ attrs::member*: members.iter() };
     let root = model
         .root()
         .ok_or_else(|| anyhow::anyhow!("model has no root"))?;
     graph += model;
+    graph += entity! { ExclusiveId::force_ref(&root) @
+        attrs::model_name: name_h,
+        attrs::source: source_h,
+        attrs::quantization: quantization,
+        attrs::parent*: parents.iter().filter(|parent| **parent != root),
+    };
     crate::model_collection::publish_model_fragment(&mut pile, key, graph)
         .map_err(|e| anyhow::anyhow!("publish the packed model: {e}"))?;
 
@@ -817,6 +794,145 @@ mod pile_tests {
                     .collect()
             })
             .collect()
+    }
+
+    #[test]
+    fn appending_a_model_preserves_its_explicit_tokenizer() {
+        let dir = std::env::temp_dir().join(format!("mary-packed-tokenizers-{}", fucid().id));
+        std::fs::create_dir(&dir).unwrap();
+        let out = dir.join("models.pile");
+        let key = SigningKey::from_bytes(&[0x4C; 32]);
+        let keymap = HashMap::from([("norm.weight".to_owned(), (vec![1.0], vec![1]))]);
+        let packed = HashMap::new();
+        let first = r#"{"model":{"type":"WordPiece","vocab":{"[UNK]":0,"hello":1},"unk_token":"[UNK]"},"added_tokens":[]}"#;
+        let second = first.replace("hello", "world");
+        write_packed_pile(
+            &out,
+            &key,
+            &keymap,
+            &packed,
+            "first",
+            "native",
+            &[],
+            Some(first.as_bytes()),
+            false,
+        )
+        .unwrap();
+        write_packed_pile(
+            &out,
+            &key,
+            &keymap,
+            &packed,
+            "second",
+            "native",
+            &[],
+            Some(second.as_bytes()),
+            true,
+        )
+        .unwrap();
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&out).unwrap();
+        let first_root = crate::selection::select_tokenizer_root(
+            snapshot.facts(),
+            snapshot.store(),
+            crate::selection::TokenizerSelector::Name("first"),
+        )
+        .unwrap();
+        let second_root = crate::selection::select_tokenizer_root(
+            snapshot.facts(),
+            snapshot.store(),
+            crate::selection::TokenizerSelector::Name("second"),
+        )
+        .unwrap();
+        assert_ne!(first_root, second_root);
+        drop(snapshot);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn packed_root_labels_and_bases_do_not_change_member_identity() {
+        let dir = std::env::temp_dir().join(format!(
+            "mary-packed-root-{}-{}",
+            std::process::id(),
+            fucid().id,
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let out = dir.join("models.pile");
+        let key = SigningKey::from_bytes(&[0x4D; 32]);
+        let base = fucid().id;
+        let other_base = fucid().id;
+        let mut keymap = HashMap::from([("norm.weight".to_owned(), (vec![1.0], vec![1]))]);
+        let packed = HashMap::new();
+        let first = write_packed_pile(
+            &out,
+            &key,
+            &keymap,
+            &packed,
+            "fixture/model",
+            "first",
+            &[base],
+            None,
+            false,
+        )
+        .unwrap();
+        let relabelled = write_packed_pile(
+            &out,
+            &key,
+            &keymap,
+            &packed,
+            "fixture/alias",
+            "second",
+            &[other_base],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            first, relabelled,
+            "annotations are not the root's identity core"
+        );
+
+        keymap.get_mut("norm.weight").unwrap().0[0] = 2.0;
+        let second = write_packed_pile(
+            &out,
+            &key,
+            &keymap,
+            &packed,
+            "fixture/model",
+            "first",
+            &[base],
+            None,
+            true,
+        )
+        .unwrap();
+        assert_ne!(first, second, "a changed member produces a new root");
+        let snapshot = crate::model_collection::load_model_collection_local_latest(&out).unwrap();
+        let facts = snapshot.facts();
+        use crate::format::attrs;
+        for root in [first, second] {
+            assert!(exists!(
+                (),
+                pattern!(facts, [{ root @ attrs::parent: base }])
+            ));
+        }
+        assert!(exists!(
+            (),
+            pattern!(facts, [{ first @ attrs::parent: other_base }])
+        ));
+        assert!(!exists!(
+            (),
+            pattern!(facts, [{ second @ attrs::parent: first }])
+        ));
+        for (root, value) in [(first, 1.0), (second, 2.0)] {
+            let read = crate::selection::load_keymap_from_graph(
+                facts,
+                snapshot.store(),
+                ModelSelector::Root(root),
+            )
+            .unwrap();
+            assert_eq!(read["norm.weight"].0, vec![value]);
+        }
+        drop(snapshot);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// The whole seam in one test: pack a tiny model, write it as a pile, read
@@ -885,6 +1001,7 @@ mod pile_tests {
             keymap["encoder.layers.0.norm1.weight"]
         );
 
+        let parent = fucid().id;
         let root = write_packed_pile(
             &out,
             &key,
@@ -892,6 +1009,7 @@ mod pile_tests {
             &report.packed,
             "test/model",
             "nvfp4-calibrated",
+            &[parent],
             None,
             false,
         )
@@ -904,6 +1022,7 @@ mod pile_tests {
                 &report.packed,
                 "test/model",
                 "nvfp4-calibrated",
+                &[parent],
                 None,
                 false
             )
@@ -912,6 +1031,12 @@ mod pile_tests {
         );
 
         let snapshot = crate::model_collection::load_model_collection_local_latest(&out).unwrap();
+        assert!(exists!(
+            (),
+            pattern!(snapshot.facts(), [{
+                root @ crate::format::attrs::parent: parent,
+            }])
+        ));
         let back = crate::selection::load_keymap_from_graph(
             snapshot.facts(),
             snapshot.store(),

@@ -88,6 +88,8 @@ pub struct EngineConfig {
     pub cache: Option<CacheConfig>,
     /// The model collection: weights, config.json AND the tokenizer graph.
     pub pile: std::path::PathBuf,
+    /// Explicit model selection, including under the sealed execution profile.
+    pub model_root: Option<triblespace::prelude::Id>,
     /// Layers this rank runs. A tensor-parallel rank must run all of them.
     pub layers: Option<std::ops::Range<usize>>,
     /// Maximum token rows one prefill pass processes at once.
@@ -240,6 +242,7 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     }
 
     let mut session_config = SessionConfig::new(&config.pile);
+    session_config.model_root = config.model_root;
     session_config.preallocate_kv = config.preallocate_kv;
     session_config.weight_storage = config.weight_storage;
     session_config.cached_attention = config.cached_attention;
@@ -349,9 +352,11 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
     let runtime_facts = RuntimeFacts::observe();
 
     let range = session.layer_range();
-    let model_identity = hex_identity(session.model_identity());
+    let model_collection = hex_identity(session.model_collection().raw);
+    let model_root = format!("{:X}", session.model_root());
     for (name, value) in [
-        ("model-identity", model_identity.as_str()),
+        ("model-collection", model_collection.as_str()),
+        ("model-root", model_root.as_str()),
         ("tokenizer-identity", tokenizer_identity.as_str()),
         ("tp-role-schema", "rank-normalized-v1"),
         ("allocator", allocator.env_value()),
@@ -399,7 +404,8 @@ pub fn load(config: EngineConfig) -> Result<Loaded> {
 
     let ready = Ready {
         pile: config.pile.display().to_string(),
-        model_identity,
+        model_collection,
+        model_root,
         tokenizer_identity,
         special_ids: codec.special_ids().clone(),
         execution_profile: execution_profile.to_string(),
@@ -690,7 +696,8 @@ impl Follower {
                     group.agree(digest)?;
                 }
                 Pass::Export => {
-                    let identity = self.session.model_identity();
+                    let collection = self.session.model_collection();
+                    let root = self.session.model_root();
                     let cuts = self
                         .session
                         .export_learned()
@@ -699,7 +706,7 @@ impl Follower {
                         .session
                         .group_mut()
                         .context("a follower with no Group cannot export")?;
-                    group.send_cuts(&cuts, identity)?;
+                    group.send_cuts(&cuts, collection, root)?;
                 }
                 Pass::Finish => {
                     if let Some(cache) = self.cache.take() {
@@ -772,7 +779,8 @@ fn rank_cache(
         CacheCommand::Candidates { .. } => unreachable!(),
     };
     let key = CacheKey {
-        model: session.model_identity(),
+        model_collection: session.model_collection().raw,
+        model_root: session.model_root().raw(),
         compatibility,
         rank: ready.tp_rank.unwrap_or(0),
         world: ready.tp_world,
@@ -1352,7 +1360,8 @@ impl Engine {
         let mut exports = vec![super::learned::RankExport {
             rank: 0,
             world: world as u32,
-            model_identity: self.session.model_identity(),
+            model_collection: self.session.model_collection(),
+            model_root: self.session.model_root(),
             cuts,
         }];
         if let Some(group) = self.session.group_mut() {
@@ -2005,13 +2014,19 @@ impl Model for Engine {
         store
             .refresh()
             .map_err(|e| anyhow::anyhow!("refresh {}: {e:?}", self.ready.pile))?;
-        let version = super::version::learned_version(&mut store, &learned, parent, &recipe)?;
+        let version = super::version::learned_version(
+            &mut store,
+            self.session.model_collection(),
+            &learned,
+            parent,
+            &recipe,
+        )?;
         let persisted = super::resident::Persisted {
+            collection: version.collection,
             root: version.root,
             parent: version.parent,
             name: version.name.clone(),
             replaced: version.replaced,
-            genesis: version.genesis,
         };
         if version.root != version.parent {
             super::version::publish_version(&mut store, &key, version)?;
@@ -2452,6 +2467,7 @@ mod tests {
                     checkpoint_tokens: 32768,
                 }),
                 pile: "/must-not-open/model.pile".into(),
+                model_root: None,
                 layers: None,
                 prefill_budget: None,
                 context_budget: None,

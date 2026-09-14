@@ -423,7 +423,6 @@ pub fn save_tokenizer_json(
 
     let tok = entity! { _ @
         metadata::tag*: model_tags.iter(),
-        attrs::model_name: name_h,
         attrs::normalizer?: norm_id,
         attrs::pre_tokenizer?: pretok_id,
         attrs::decoder?: dec_id,
@@ -437,6 +436,7 @@ pub fn save_tokenizer_json(
     };
     let tok_id = tok.root().expect("tokenizer root");
     facts += tok.into_facts();
+    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h }.into_facts();
     Ok(Fragment::rooted(tok_id, facts))
 }
 
@@ -521,7 +521,6 @@ pub fn save_tiktoken(
     let name_h = blobs.put::<blobencodings::UTF8String, _>(source_name.to_string())?;
     let tok = entity! { _ @
         metadata::tag: ty::TIKTOKEN,
-        attrs::model_name: name_h,
         attrs::pre_tokenizer: pretok_id,
         attrs::unk_token?: cfg["unk_token"].as_str(),
         attrs::vocab*: vocab_ids.iter(),
@@ -529,6 +528,7 @@ pub fn save_tiktoken(
     };
     let tok_id = tok.root().expect("tokenizer root");
     facts += tok.into_facts();
+    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h }.into_facts();
     Ok(Fragment::rooted(tok_id, facts))
 }
 
@@ -763,18 +763,15 @@ pub fn load_pre_tokenizer_pattern(
     .map(|(ph,)| read_piece(blobs, ph))
 }
 
-/// The tokenizer ROOT entity in a fact set, if any — the entity carrying BOTH
-/// a model-kind discriminant tag and a `model_name`. The tag alone is NOT
-/// enough: a WordPiece DECODER config node is also tagged `ty::WORD_PIECE`
-/// (the type ids are role-agnostic — the edge gives the role), and picking it
-/// up here builds a tokenizer with an empty vocab. Only the tokenizer root
-/// carries both; weight entities have `model_name` but no kind tag, config
-/// nodes have kind tags but no name. A multi-tokenizer pile would need
-/// disambiguation BY the name; every current model pile holds one tokenizer.
+/// Tokenizer roots carry a supported model-kind tag and a vocabulary.
+/// A decoder may share the same kind tag, but has no vocabulary. Names are
+/// optional annotations, so adding aliases or omitting a label cannot change
+/// whether the tokenizer is readable. Select a root explicitly when several
+/// tokenizers coexist.
 pub fn find_tokenizers(tribles: &TribleSet) -> impl Iterator<Item = Id> + '_ {
     find!(
-        (e: Id, t: Id, n: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-        pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::model_name: ?n }])
+        (e: Id, t: Id),
+        pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::vocab: _?entry }])
     )
     // The model-type tags, and ONLY those: a tokenizer node also carries flag
     // tags (ADD_PREFIX_SPACE, ...), and `find!` yields one row per tag, so this
@@ -784,10 +781,8 @@ pub fn find_tokenizers(tribles: &TribleSet) -> impl Iterator<Item = Id> + '_ {
     // no merges list; UNIGRAM because omitting it made
     // `load_spm_tokenizer_from_pile` report "no tokenizer graph" on a pile that
     // had just been written.
-    .filter(|&(_, t, _)| {
-        t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN || t == ty::UNIGRAM
-    })
-    .map(|(e, _, _)| e)
+    .filter(|&(_, t)| t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN || t == ty::UNIGRAM)
+    .map(|(e, _)| e)
 }
 
 /// The first tokenizer root in a fact set, retained for legacy callers.
@@ -1091,15 +1086,6 @@ pub fn build_tokenizer_with_added(
     use tokenizers::models::wordpiece::WordPiece;
 
     let tags = node_tags(tribles, tok_id);
-    required_one(
-        find!(
-            (name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-            pattern!(tribles, [{ tok_id @ attrs::model_name: ?name }])
-        ),
-        tok_id,
-        "model_name",
-    )?;
-
     let vocab: tokenizers::models::bpe::Vocab = load_vocab_strict(tribles, blobs, tok_id)?
         .into_iter()
         .map(|(t, i)| (t, i as u32))
@@ -1559,7 +1545,7 @@ mod tests {
     // find_tokenizer once matched it by tag alone — query iteration order
     // decided whether callers got the root or a config node whose empty
     // vocab broke [CLS] resolution downstream. The root is the only entity
-    // carrying tag + model_name.
+    // carrying tag + vocabulary.
     #[test]
     fn find_tokenizer_skips_the_wordpiece_decoder_node() {
         let mut blobs = MemoryBlobStore::new();
@@ -1868,12 +1854,12 @@ pub fn save_spm_unigram(
     }
     let tok = entity! { _ @
         metadata::tag*: tags.iter(),
-        attrs::model_name: name_h,
         attrs::byte_fallback: byte_fallback,
         attrs::vocab*: vocab_ids.iter(),
     };
     let tok_id = tok.root().expect("tokenizer root");
     facts += tok.into_facts();
+    facts += entity! { ExclusiveId::force_ref(&tok_id) @ attrs::model_name: name_h }.into_facts();
     Ok(Fragment::rooted(tok_id, facts))
 }
 

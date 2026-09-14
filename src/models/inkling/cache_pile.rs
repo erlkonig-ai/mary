@@ -13,13 +13,15 @@ use anyhow::{Context, Result};
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use triblespace::core::metadata;
-use triblespace::prelude::blobencodings::{RawBytes, UTF8String};
+use triblespace::prelude::blobencodings::{RawBytes, SimpleArchive, UTF8String};
 use triblespace::prelude::inlineencodings::{Blake3, Handle, Hash, U256BE};
 use triblespace::prelude::*;
 
 pub const MAX_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MANIFEST_BYTES: usize = 16 * 1024 * 1024;
 const COLLECTION: &str = "inkling-inference-cache";
+// Version 2 replaces the collection-facts fingerprint with a descriptor and root.
+const MANIFEST_VERSION: u32 = 2;
 
 /// Each rank uses an explicitly named local pile and an existing durable key.
 /// Nothing implicitly copies caches into the model or the shared home pile.
@@ -50,7 +52,8 @@ mod schema {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheKey {
-    pub model: [u8; 32],
+    pub model_collection: [u8; 32],
+    pub model_root: [u8; 16],
     pub compatibility: [u8; 32],
     pub rank: usize,
     pub world: usize,
@@ -178,7 +181,7 @@ impl CacheStore {
             .map(|(&hash, &bytes)| Chunk { hash, bytes })
             .collect();
         let manifest = Manifest {
-            version: 1,
+            version: MANIFEST_VERSION,
             key: key.clone(),
             state,
             chunks,
@@ -193,7 +196,8 @@ impl CacheStore {
             self.staged.keys().map(|&hash| Inline::new(hash)).collect();
         let fragment = entity! { _ @
             metadata::tag: schema::KIND,
-            super::telemetry::schema::model_identity: Inline::<Hash<Blake3>>::new(key.model),
+            super::telemetry::schema::model_collection: Inline::<Handle<SimpleArchive>>::new(key.model_collection),
+            super::telemetry::schema::model_root: Id::new(key.model_root).context("cache model root is nil")?,
             schema::compatibility: Inline::<Hash<Blake3>>::new(key.compatibility),
             schema::rank: key.rank as u128,
             super::telemetry::schema::tp_world: key.world as u128,
@@ -261,7 +265,7 @@ impl CacheStore {
         let manifest: Manifest =
             serde_json::from_slice(&blob.bytes).context("decode cache metadata")?;
         anyhow::ensure!(
-            manifest.version == 1
+            manifest.version == MANIFEST_VERSION
                 && manifest.key == *expected
                 && candidate.prefix == expected.prefix,
             "cache version, compatibility or prefix mismatch"
@@ -409,12 +413,28 @@ mod tests {
 
     fn key(prefix: Prefix) -> CacheKey {
         CacheKey {
-            model: [1; 32],
+            model_collection: [1; 32],
+            model_root: [3; 16],
             compatibility: [2; 32],
             rank: 0,
             world: 2,
             prefix,
         }
+    }
+
+    #[test]
+    fn cache_manifest_version_and_reference_shape_are_explicit() {
+        assert_eq!(MANIFEST_VERSION, 2);
+        let prefix = token_prefix(&[3, 4, 5]).unwrap();
+        let model = [1u8; 32];
+        let compatibility = [2u8; 32];
+        let legacy = serde_json::json!({
+            "version": 1,
+            "key": { "model": model, "compatibility": compatibility,
+                "rank": 0, "world": 2, "prefix": prefix },
+            "state": {}, "chunks": []
+        });
+        assert!(serde_json::from_value::<Manifest>(legacy).is_err());
     }
 
     #[test]
@@ -474,6 +494,12 @@ mod tests {
             assert!(reader.chunk([0; 32], 1).is_err());
             let mut wrong = key(prefix);
             wrong.rank = 1;
+            assert!(store.read(&found[0], &wrong).is_err());
+            let mut wrong = key(prefix);
+            wrong.model_collection[0] ^= 1;
+            assert!(store.read(&found[0], &wrong).is_err());
+            let mut wrong = key(prefix);
+            wrong.model_root[0] ^= 1;
             assert!(store.read(&found[0], &wrong).is_err());
             store.close()?;
         }

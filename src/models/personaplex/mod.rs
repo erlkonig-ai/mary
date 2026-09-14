@@ -220,24 +220,11 @@ impl<R: BlobStoreGet> PersonaPlexWeights<R> {
                 continue;
             }
 
-            // Root selection binds admission to the identity in the signed
-            // token. Preserve the model schema's functional-field invariant
-            // explicitly: the asserted root must carry exactly one source and
-            // one quantization, with the PersonaPlex/native values.
-            crate::selection::validate_model_source_coordinates(
-                &facts,
-                &reader,
-                root,
-                SOURCE,
-                crate::persist::QUANTIZATION_NATIVE,
-            )
-            .with_context(|| {
-                format!("validate PersonaPlex coordinates in bundle {token_handle:?}")
-            })?;
-
             // The signed token already names the exact root. Bind selection to
             // that identity rather than rediscovering it from an ambient
-            // source coordinate and comparing only afterwards.
+            // source coordinate and comparing only afterwards. The matching
+            // labels above are annotations: another source/format label does
+            // not invalidate the same weights or their signed root identity.
             let weights = Self::admit(SelectedModelIndex::from_graph(
                 &facts,
                 reader.clone(),
@@ -597,7 +584,7 @@ mod native_authority_tests {
     }
 
     #[test]
-    fn bundle_root_with_nonfunctional_coordinates_fails_closed() {
+    fn bundle_root_accepts_an_additional_source_annotation() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let mut fragment = model_fragment(
@@ -614,22 +601,18 @@ mod native_authority_tests {
             root,
             fragment,
         )
-        .expect("publish malformed PersonaPlex root");
+        .expect("publish multiply labelled PersonaPlex root");
         let snapshot =
             crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
-                .expect("freeze malformed PersonaPlex prefix");
-        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
-            .err()
-            .expect("nonfunctional source coordinate must fail");
-        assert!(
-            format!("{error:#}").contains("ambiguous source field"),
-            "{error:#}"
-        );
+                .expect("freeze multiply labelled PersonaPlex prefix");
+        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
+            .expect("an additional source label must not invalidate a matching root");
+        assert_eq!(bundle.authority().model_root(), root);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 
     #[test]
-    fn bundle_root_with_nonfunctional_quantization_fails_closed() {
+    fn bundle_root_accepts_an_additional_quantization_annotation() {
         let file = TestPile::new();
         let mut pile = Pile::open(file.path()).expect("open synthetic PersonaPlex pile");
         let mut fragment = model_fragment(
@@ -645,17 +628,13 @@ mod native_authority_tests {
             root,
             fragment,
         )
-        .expect("publish malformed PersonaPlex root");
+        .expect("publish multiply labelled PersonaPlex root");
         let snapshot =
             crate::model_collection::snapshot_model_bundle_collection_local_latest(&mut pile)
-                .expect("freeze malformed PersonaPlex prefix");
-        let error = PersonaPlexWeights::from_bundle_snapshot(snapshot)
-            .err()
-            .expect("nonfunctional quantization coordinate must fail");
-        assert!(
-            format!("{error:#}").contains("ambiguous quantization field"),
-            "{error:#}"
-        );
+                .expect("freeze multiply labelled PersonaPlex prefix");
+        let bundle = PersonaPlexWeights::from_bundle_snapshot(snapshot)
+            .expect("an additional format label must not invalidate a matching root");
+        assert_eq!(bundle.authority().model_root(), root);
         pile.close().expect("close synthetic PersonaPlex pile");
     }
 

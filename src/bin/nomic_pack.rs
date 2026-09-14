@@ -2,7 +2,7 @@
 //! NVFP4 leaves.
 //!
 //! Text: `nomic_pack text --model P --corpus F --out O --key K [--calibrate N]
-//! [--quantization TAG]`. Vision: `nomic_pack vision --model P --images DIR
+//! [--quantization TAG] [--root ID]`. Vision: `nomic_pack vision --model P --images DIR
 //! --out O --key K [--calibrate N] [--quantization TAG] [--source ID]`.
 //!
 //! Both do the same thing with a different sense: read the f32 model from its
@@ -13,6 +13,8 @@
 //! is measured here: `nomic_fp4_probe --model O --quantization
 //! nvfp4-calibrated --keep-weights` scores the text artifact against cached
 //! f32 vectors, and the vision artifact is validated by its consumer.
+//! The packed root records the actual selected input roots as shared model
+//! parents. `--root` addresses one existing root without resolving a label.
 //!
 //! Recipe and numbers: wiki 88b76d5f, goal dcf9dbaf.
 
@@ -24,6 +26,7 @@ use anyhow::{Context, Result, anyhow};
 use mary::calibrate::{self, InputStats, Options};
 use mary::embed::LocalEmbedder;
 use mary::selection::{ModelSelector, TokenizerSelector};
+use triblespace::prelude::Id;
 
 const NOMIC_TEXT_MODEL: &str = "nomic-ai/nomic-embed-text-v1.5";
 const NOMIC_VISION_MODEL: &str = "nomic-ai/nomic-embed-vision-v1.5";
@@ -99,6 +102,7 @@ fn pack_and_write(
     key: &Path,
     source: &str,
     quantization: &str,
+    parents: &[Id],
     tokenizer_json: Option<&[u8]>,
     embeddings: bool,
     append: bool,
@@ -128,6 +132,7 @@ fn pack_and_write(
         &report.packed,
         source,
         quantization,
+        parents,
         tokenizer_json,
         append,
     )?;
@@ -143,6 +148,7 @@ fn pack_and_write(
 
 fn text(
     model: &Path,
+    source_root: Option<Id>,
     quantization: &str,
     corpus: &Path,
     calibrate: usize,
@@ -153,15 +159,17 @@ fn text(
 ) -> Result<()> {
     let snapshot = mary::model_collection::load_model_collection_local_latest(model)
         .with_context(|| format!("open model pile {}", model.display()))?;
-    let keymap = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        ModelSelector::Source {
+    let selector = source_root
+        .map(ModelSelector::Root)
+        .unwrap_or(ModelSelector::Source {
             source: NOMIC_TEXT_MODEL,
             quantization,
-        },
-    )
-    .context("select nomic text weights")?;
+        });
+    let parents = mary::selection::select_model_roots(snapshot.facts(), snapshot.store(), selector)
+        .context("select nomic text source roots")?;
+    let keymap =
+        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.store(), selector)
+            .context("select nomic text weights")?;
     let tokenizer = mary::selection::load_tokenizer_from_graph(
         snapshot.facts(),
         snapshot.store(),
@@ -197,6 +205,7 @@ fn text(
         key,
         NOMIC_TEXT_MODEL,
         PACKED,
+        &parents,
         Some(json.as_bytes()),
         embeddings,
         append,
@@ -205,6 +214,7 @@ fn text(
 
 fn vision(
     model: &Path,
+    source_root: Option<Id>,
     source: &str,
     quantization: &str,
     images: &Path,
@@ -216,15 +226,17 @@ fn vision(
 ) -> Result<()> {
     let snapshot = mary::model_collection::load_model_collection_local_latest(model)
         .with_context(|| format!("open model pile {}", model.display()))?;
-    let keymap = mary::selection::load_keymap_from_graph(
-        snapshot.facts(),
-        snapshot.store(),
-        ModelSelector::Source {
+    let selector = source_root
+        .map(ModelSelector::Root)
+        .unwrap_or(ModelSelector::Source {
             source,
             quantization,
-        },
-    )
-    .context("select nomic vision weights")?;
+        });
+    let parents = mary::selection::select_model_roots(snapshot.facts(), snapshot.store(), selector)
+        .context("select nomic vision source roots")?;
+    let keymap =
+        mary::selection::load_keymap_from_graph(snapshot.facts(), snapshot.store(), selector)
+            .context("select nomic vision weights")?;
     let files = image_files(images)?;
     anyhow::ensure!(!files.is_empty(), "no images under {}", images.display());
     let device = mary::embed::default_device();
@@ -257,6 +269,7 @@ fn vision(
         key,
         source,
         PACKED,
+        &parents,
         None,
         embeddings,
         append,
@@ -270,8 +283,8 @@ fn main() -> Result<()> {
             .position(|a| a == name)
             .and_then(|i| args.get(i + 1).cloned())
     };
-    let usage = "usage: nomic_pack text --model P --corpus F --out O --key K [--calibrate N] [--quantization TAG] [--embeddings] [--append]
-       nomic_pack vision --model P --images DIR --out O --key K [--calibrate N] [--quantization TAG] [--source ID] [--embeddings] [--append]";
+    let usage = "usage: nomic_pack text --model P --corpus F --out O --key K [--root ID] [--calibrate N] [--quantization TAG] [--embeddings] [--append]
+       nomic_pack vision --model P --images DIR --out O --key K [--root ID] [--calibrate N] [--quantization TAG] [--source ID] [--embeddings] [--append]";
     let model = || {
         flag("--model")
             .map(PathBuf::from)
@@ -295,6 +308,12 @@ fn main() -> Result<()> {
         flag("--quantization").unwrap_or_else(|| mary::persist::QUANTIZATION_NATIVE.to_string());
     let embeddings = args.iter().any(|a| a == "--embeddings");
     let append = args.iter().any(|a| a == "--append");
+    let source_root = flag("--root")
+        .map(|value| {
+            Id::from_hex(&value)
+                .ok_or_else(|| anyhow!("--root requires a non-nil 32-hex entity ID"))
+        })
+        .transpose()?;
     match args.first().map(String::as_str) {
         Some("text") => {
             let corpus = flag("--corpus")
@@ -302,6 +321,7 @@ fn main() -> Result<()> {
                 .ok_or_else(|| anyhow!("--corpus\n{usage}"))?;
             text(
                 &model()?,
+                source_root,
                 &quantization,
                 &corpus,
                 calibrate,
@@ -318,6 +338,7 @@ fn main() -> Result<()> {
             let source = flag("--source").unwrap_or_else(|| NOMIC_VISION_MODEL.to_string());
             vision(
                 &model()?,
+                source_root,
                 &source,
                 &quantization,
                 &images,

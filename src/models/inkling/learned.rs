@@ -31,6 +31,8 @@
 
 use anyhow::{Context, Result};
 use std::io::Read;
+use triblespace::core::collection::CollectionHandle;
+use triblespace::prelude::Id;
 
 use super::fp4gemm::{unswizzle_b_codes_into, unswizzle_b_scales_into};
 use super::load::PackedExpert;
@@ -71,13 +73,14 @@ pub use super::version::LearnedExpert;
 /// differed from its immutable source. A failed, missing, or unread response
 /// must NEVER be represented by an empty envelope. The collector attributes
 /// rank/world to the admitted peer socket, not to a cut's self-reported fields.
-/// `model_identity` is the identity already agreed for that socket's startup
-/// cohort (or explicitly returned by it), never a substitute for agreement.
+/// The collection descriptor and opaque model root name the agreed startup
+/// training base, never a replacement inferred from the pile's current facts.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RankExport {
     pub rank: u32,
     pub world: u32,
-    pub model_identity: [u8; 32],
+    pub model_collection: CollectionHandle,
+    pub model_root: Id,
     pub cuts: Vec<LearnedCut>,
 }
 
@@ -186,7 +189,8 @@ pub fn assemble_completed_exports(
     exports: Vec<RankExport>,
 ) -> Result<Vec<LearnedExpert>> {
     assemble_completed_with(
-        src.model_identity(),
+        src.model_collection(),
+        src.model_root(),
         world,
         layer,
         n_routed,
@@ -205,7 +209,8 @@ pub fn assemble_completed_exports(
 }
 
 fn assemble_completed_with(
-    identity: [u8; 32],
+    model_collection: CollectionHandle,
+    model_root: Id,
     world: usize,
     layer: usize,
     n_routed: usize,
@@ -234,7 +239,7 @@ fn assemble_completed_with(
         );
         anyhow::ensure!(!seen[rank], "export received rank {rank} twice");
         anyhow::ensure!(
-            export.model_identity == identity,
+            export.model_collection == model_collection && export.model_root == model_root,
             "export rank {rank} did not use the agreed immutable checkpoint"
         );
         seen[rank] = true;
@@ -583,7 +588,10 @@ impl LearnedCut {
 mod tests {
     use super::*;
 
-    const CHECKPOINT: [u8; 32] = [0x42; 32];
+    fn collection() -> CollectionHandle {
+        CollectionHandle::new([0x42; 32])
+    }
+    const CHECKPOINT_ROOT: Id = Id::new([0x24; 16]).unwrap();
 
     fn checkpoint(rows: usize, logical: usize) -> PackedExpert {
         PackedExpert {
@@ -603,7 +611,8 @@ mod tests {
         RankExport {
             rank,
             world: 2,
-            model_identity: CHECKPOINT,
+            model_collection: collection(),
+            model_root: CHECKPOINT_ROOT,
             cuts,
         }
     }
@@ -654,13 +663,21 @@ mod tests {
         stored: &PackedExpert,
         responses: Vec<RankExport>,
     ) -> Result<Vec<LearnedExpert>> {
-        assemble_completed_with(CHECKPOINT, 2, 41, 8, responses, |requested, expert| {
-            anyhow::ensure!(
-                requested == name && expert == 7,
-                "unexpected checkpoint request"
-            );
-            Ok(stored.clone())
-        })
+        assemble_completed_with(
+            collection(),
+            CHECKPOINT_ROOT,
+            2,
+            41,
+            8,
+            responses,
+            |requested, expert| {
+                anyhow::ensure!(
+                    requested == name && expert == 7,
+                    "unexpected checkpoint request"
+                );
+                Ok(stored.clone())
+            },
+        )
     }
 
     #[test]
@@ -707,7 +724,8 @@ mod tests {
     #[test]
     fn completed_empty_exports_do_not_load_or_transfer_untouched_experts() {
         let output = assemble_completed_with(
-            CHECKPOINT,
+            collection(),
+            CHECKPOINT_ROOT,
             2,
             41,
             8,
@@ -722,20 +740,31 @@ mod tests {
     fn completed_export_requires_every_successful_rank_and_the_same_checkpoint() {
         let mut wrong_world = response(1, vec![]);
         wrong_world.world = 3;
-        let mut wrong_identity = response(1, vec![]);
-        wrong_identity.model_identity[0] ^= 1;
+        let mut wrong_collection = response(1, vec![]);
+        wrong_collection.model_collection.raw[0] ^= 1;
+        let mut wrong_root = response(1, vec![]);
+        wrong_root.model_root = triblespace::prelude::genid().id;
         for responses in [
             vec![response(0, vec![])],
             vec![response(0, vec![]), response(0, vec![])],
             vec![response(0, vec![]), response(2, vec![])],
             vec![response(0, vec![]), wrong_world],
-            vec![response(0, vec![]), wrong_identity],
+            vec![response(0, vec![]), wrong_collection],
+            vec![response(0, vec![]), wrong_root],
         ] {
             let reads = std::cell::Cell::new(0);
-            let result = assemble_completed_with(CHECKPOINT, 2, 41, 8, responses, |_, _| {
-                reads.set(reads.get() + 1);
-                Ok(checkpoint(64, 64))
-            });
+            let result = assemble_completed_with(
+                collection(),
+                CHECKPOINT_ROOT,
+                2,
+                41,
+                8,
+                responses,
+                |_, _| {
+                    reads.set(reads.get() + 1);
+                    Ok(checkpoint(64, 64))
+                },
+            );
             assert!(result.is_err());
             assert_eq!(
                 reads.get(),
@@ -812,12 +841,19 @@ mod tests {
         let response = RankExport {
             rank: 0,
             world: 1,
-            model_identity: CHECKPOINT,
+            model_collection: collection(),
+            model_root: CHECKPOINT_ROOT,
             cuts: vec![cut],
         };
-        let output = assemble_completed_with(CHECKPOINT, 1, 41, 8, vec![response], |_, _| {
-            Ok(stored.clone())
-        })
+        let output = assemble_completed_with(
+            collection(),
+            CHECKPOINT_ROOT,
+            1,
+            41,
+            8,
+            vec![response],
+            |_, _| Ok(stored.clone()),
+        )
         .unwrap();
         assert_eq!(output[0].packed.codes, codes);
         assert_eq!(output[0].packed.scales, stored.scales);

@@ -30,7 +30,7 @@ use triblespace::core::collection::{
 use triblespace::core::inline::encodings::UnknownInline;
 use triblespace::core::metadata;
 use triblespace::core::repo::pile::PileSnapshot;
-use triblespace::core::repo::{BlobStoreGet, SnapshotSource};
+use triblespace::core::repo::{BlobStoreGet, SnapshotSource, StoreRead};
 use triblespace::core::trible::TribleSet;
 use triblespace::prelude::inlineencodings::{F64, U256BE};
 use triblespace::prelude::*;
@@ -345,10 +345,10 @@ pub fn publish_model_bundle_fragment(
         .map_err(|error| anyhow!("publish model bundle: {error}"))
 }
 
-pub fn snapshot_model_collection_exact(
-    store: &PileSnapshot,
+pub fn snapshot_model_collection_exact<R: StoreRead>(
+    store: &R,
     support: &Support,
-) -> anyhow::Result<ModelPileSnapshot> {
+) -> anyhow::Result<ModelSnapshot<R>> {
     let facts = store
         .collection_exact(support.collection(), support)
         .context("attach exact model support")?
@@ -357,15 +357,15 @@ pub fn snapshot_model_collection_exact(
     Ok(ModelSnapshot::new(facts, support.clone(), store.clone()))
 }
 
-pub fn snapshot_model_bundle_collection_exact(
-    store: &PileSnapshot,
+pub fn snapshot_model_bundle_collection_exact<R: StoreRead>(
+    store: &R,
     support: &Support,
-) -> anyhow::Result<ModelPileSnapshot> {
+) -> anyhow::Result<ModelSnapshot<R>> {
     snapshot_model_collection_exact(store, support)
 }
 
-pub fn local_model_support(
-    store: &PileSnapshot,
+pub fn local_model_support<R: StoreRead>(
+    store: &R,
     collection: ModelCollection,
 ) -> anyhow::Result<Support> {
     collection
@@ -414,11 +414,10 @@ pub fn snapshot_model_collection_in(store: &PileSnapshot) -> anyhow::Result<Mode
     snapshot_model_collection_named_in(store, mary_model_graph_name())
 }
 
-/// The sole model collection of this NAME, frozen from the latest local
-/// observation. A learned snapshot lives in a collection named after its
-/// parent (`crate::models::inkling::learned`), and a reader that wants it
-/// asks for it by that name; nothing reads a collection it was not pointed
-/// at, so the parent stays exactly what it was for every other reader.
+/// The sole model collection of this name, frozen from the local observation.
+/// Model versions are roots inside that collection, not separately named
+/// collections. Callers holding a descriptor use [`snapshot_model_collection_for`]
+/// directly and select the actual model root from its facts.
 pub fn snapshot_model_collection_named_local_latest(
     pile: &mut Pile,
     name: &'static str,
@@ -435,13 +434,24 @@ pub fn snapshot_model_collection_named_in(
     snapshot_model_collection_for(store, collection)
 }
 
-/// Materialize one explicit policy collection from a frozen observation.
-pub fn snapshot_model_collection_for(
-    store: &PileSnapshot,
+/// Read the resident part of one explicit model collection from a frozen store.
+///
+/// The collection handle names where to query; root entity IDs name the models.
+/// Physical member archives and unrelated observations are not model identity.
+/// The reader may be a pile snapshot, an in-memory store, or the bounded store
+/// observation supplied to a collection mapping.
+pub fn snapshot_model_collection_for<R: StoreRead>(
+    store: &R,
     collection: ModelCollection,
-) -> anyhow::Result<ModelPileSnapshot> {
-    let support = local_model_support(store, collection)?;
-    snapshot_model_collection_exact(store, &support)
+) -> anyhow::Result<ModelSnapshot<R>> {
+    let observed = store
+        .collection(collection)
+        .context("attach model collection")?;
+    let facts = observed
+        .view::<TribleSet>()
+        .context("read model collection")?;
+    let (store, support, _) = observed.into_parts();
+    Ok(ModelSnapshot::new(facts, support, store))
 }
 
 pub fn snapshot_model_bundle_collection_local_latest(
@@ -940,6 +950,57 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_file(&self.0);
         }
+    }
+
+    #[test]
+    fn explicit_model_collection_uses_the_resident_frozen_store_view() {
+        use triblespace::core::collection::CollectionStore;
+        use triblespace::core::repo::memoryrepo::MemoryRepo;
+
+        let mut repo = MemoryRepo::default();
+        let key = SigningKey::from_bytes(&[0x70; 32]);
+        let collection = repo
+            .collection("models", direct_model_policy(key.verifying_key()))
+            .unwrap();
+        let member = fucid();
+        let first = entity! { crate::format::attrs::member: &member };
+        let expected = first.facts().clone();
+        repo.commit(collection, &key, first).unwrap();
+
+        // Records may arrive before their data. An unreadable later member
+        // must not hide the models already available in this observation.
+        let annotation = entity! { crate::format::attrs::parent: &member };
+        let later: Blob<SimpleArchive> = annotation.into_facts().to_blob();
+        let metadata = repo.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
+        repo.insert(CollectionRecord::Commit(CollectionCommit::sign(
+            &key,
+            collection.handle(),
+            later.get_handle().transmute(),
+            metadata,
+        )))
+        .unwrap();
+
+        let before = repo.snapshot().unwrap();
+        let attached = snapshot_model_collection_for(&before, collection).unwrap();
+        assert_eq!(attached.facts(), &expected);
+        assert_eq!(attached.support().len(), 1);
+        assert_eq!(attached.support().collection(), collection);
+
+        repo.put::<SimpleArchive, _>(later).unwrap();
+        let after = repo.snapshot().unwrap();
+        assert_eq!(
+            snapshot_model_collection_for(&after, collection)
+                .unwrap()
+                .support()
+                .len(),
+            2
+        );
+        assert_eq!(
+            snapshot_model_collection_for(&before, collection)
+                .unwrap()
+                .facts(),
+            &expected
+        );
     }
 
     #[test]

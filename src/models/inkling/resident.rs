@@ -1101,13 +1101,16 @@ fn hex_32(bytes: [u8; 32]) -> String {
 pub struct Ready {
     /// The pile the weights came from, for diagnostics only.
     ///
-    /// Two ranks may name different local paths for the same content. Runtime
-    /// compatibility is decided by [`Ready::model_identity`], never by this
-    /// spelling.
+    /// Two ranks may name different local paths for the same content. Their
+    /// model reference is [`Ready::model_collection`] plus [`Ready::model_root`],
+    /// never this spelling.
     pub pile: String,
-    /// Canonical SimpleArchive handle of the projected model facts the runtime
-    /// actually indexed, rendered as 64 hexadecimal digits.
-    pub model_identity: String,
+    /// The normal model collection descriptor handle, as 64 hexadecimal digits.
+    /// Appending annotations or sibling versions does not change this handle.
+    pub model_collection: String,
+    /// The selected, opaque model root, as 32 hexadecimal digits. This remains
+    /// the training base while resident weights learn and snapshots are saved.
+    pub model_root: String,
     /// The id of the tokenizer entity in the model graph the run built its
     /// tokenizer from, rendered as 32 hexadecimal digits. Content-derived,
     /// so it is the identity of the exact tokenizer; both ranks read it from
@@ -1121,8 +1124,8 @@ pub struct Ready {
     /// facts without making that exclusion claim.
     #[serde(default)]
     pub execution_profile: String,
-    /// Canonical length-prefixed BLAKE3 digest of executable bytes, model and
-    /// tokenizer identities, effective execution settings, GPU identity, and
+    /// Canonical length-prefixed BLAKE3 digest of executable bytes, model
+    /// reference and tokenizer identity, effective execution settings, GPU identity, and
     /// observable CUDA/NVRTC/NCCL facts.
     #[serde(default)]
     pub execution_identity: String,
@@ -1719,6 +1722,8 @@ pub struct VersionRecipe {
 /// What a persisted version is, for the record that says it happened.
 #[derive(Clone, Debug)]
 pub struct Persisted {
+    /// The ordinary collection descriptor containing the persisted root.
+    pub collection: triblespace::core::collection::CollectionHandle,
     /// The version root, committed -- or equal to `parent` when nothing had
     /// moved and nothing was written.
     pub root: triblespace::prelude::Id,
@@ -1726,8 +1731,6 @@ pub struct Persisted {
     pub name: String,
     /// Experts whose bytes moved.
     pub replaced: usize,
-    /// Whether the parent was minted as the genesis root in the same commit.
-    pub genesis: bool,
 }
 
 // ── the drive seam ──────────────────────────────────────────────────────────

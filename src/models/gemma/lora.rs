@@ -88,7 +88,9 @@ impl<B: Backend> LoraAdapter<B> {
     }
 }
 
-/// All LoRA adapters for a Gemma 4 text decoder, keyed by checkpoint weight path.
+/// Homogeneous-rank/alpha LoRA adapters for a Gemma 4 text decoder, keyed by
+/// checkpoint weight path. Each adapter carries its own numerical scale;
+/// `rank` and `alpha` summarize the common parameters for training/export.
 pub struct LoraWeights<B: Backend> {
     pub adapters: HashMap<String, LoraAdapter<B>>,
     pub rank: usize,
@@ -291,12 +293,17 @@ impl<B: Backend> LoraWeights<B> {
 
     /// Save LoRA weights as structured entities into a blob store (pile or
     /// memory). Each adapter becomes a content-derived entity carrying its
-    /// projection name and A/B blob handles; the returned fragment is rooted at
-    /// the LoRA set entity (rank/alpha/model_name + adapter edges). Attribute
-    /// IDs are shared with avatar/gaze — cross-model LoRA queries work.
+    /// projection name, rank/alpha, and A/B blob handles; the returned fragment
+    /// uses the shared member-only model root. Rank/alpha interpret an adapter's
+    /// arrays and scale, so they belong to the members' content, not the root's
+    /// identity core. The family-native set fields remain root annotations.
+    /// `parent` is the actual training base when known; a model name cannot
+    /// supply it. Older stored adapter/set IDs are never reconstructed or
+    /// rewritten by this new-writer shape.
     pub fn save_to_pile(
         &self,
         name: &str,
+        parent: Option<Id>,
         blobs: &mut impl BlobStorePut,
     ) -> Result<Fragment, Box<dyn std::error::Error>> {
         let mut adapter_ids: Vec<Id> = Vec::new();
@@ -313,6 +320,8 @@ impl<B: Backend> LoraWeights<B> {
 
             let adapter_ent = entity! { _ @
                 attrs::lora_projection: key.as_str(),
+                attrs::lora_rank: self.rank as u32,
+                attrs::lora_alpha: self.alpha as f64,
                 attrs::lora_a: blobs.put::<F32Array, _>(a_data)?,
                 attrs::lora_b: blobs.put::<F32Array, _>(b_data)?,
             };
@@ -320,14 +329,16 @@ impl<B: Backend> LoraWeights<B> {
             facts += adapter_ent.into_facts();
         }
 
-        let set_ent = entity! { _ @
+        let set_ent = entity! { _ @ crate::format::attrs::member*: adapter_ids.iter() };
+        let root = set_ent.root().expect("lora set entity has root");
+        facts += set_ent.into_facts();
+        facts += entity! { ExclusiveId::force_ref(&root) @
             attrs::lora_rank: self.rank as u32,
             attrs::lora_alpha: self.alpha as f64,
             attrs::model_name: blobs.put::<blobencodings::UTF8String, _>(name.to_string())?,
             attrs::lora_adapter*: adapter_ids.iter(),
+            crate::format::attrs::parent?: parent.filter(|parent| *parent != root),
         };
-        let root = set_ent.root().expect("lora set entity has root");
-        facts += set_ent.into_facts();
 
         eprintln!(
             "Saved {} LoRA adapters to pile (rank={}, alpha={}).",
@@ -338,60 +349,105 @@ impl<B: Backend> LoraWeights<B> {
         Ok(Fragment::rooted(root, facts))
     }
 
-    /// Load LoRA weights back from pile facts + blobs. Shapes are recovered
-    /// from the stored rank (A is [rank, in], B is [out, rank]).
+    /// Load the explicitly named, opaque LoRA root from pile facts + blobs.
+    /// Shared members carry their own rank (A is [rank, in], B is [out, rank])
+    /// and alpha; root annotations never determine their shapes or scale.
+    /// Legacy native-link roots instead carry those parameters on the set.
+    /// This numerical type and its writers require homogeneous rank/alpha, so
+    /// its summary fields come from the selected adapters' common parameters.
     pub fn load_from_pile(
         tribles: &TribleSet,
         blobs: &impl BlobStoreGet,
+        root: Id,
         device: &B::Device,
     ) -> Self {
-        let (rank_v, alpha) = find!(
-            (rank: Inline<inlineencodings::U256BE>, alpha: f64),
-            pattern!(tribles, [{
-                _?set @
-                attrs::lora_rank: ?rank,
-                attrs::lora_alpha: ?alpha,
-            }])
-        )
-        .next()
-        .expect("no LoRA set entity found in tribleset");
-        // U256BE stores the u32 rank big-endian in the low (last) 8 bytes.
-        let rank = u64::from_be_bytes(rank_v.raw[24..32].try_into().unwrap()) as usize;
-        let alpha = alpha as f32;
-        let scale = alpha / rank as f32;
-
         let mut adapters = HashMap::new();
-        for (proj, a_h, b_h) in find!(
-            (proj: String,
+        let mut parameters = None;
+        let mut load_adapter =
+            |proj: String,
+             rank_v: Inline<inlineencodings::U256BE>,
+             alpha: f64,
              a_h: Inline<inlineencodings::Handle<F32Array>>,
-             b_h: Inline<inlineencodings::Handle<F32Array>>),
-            pattern!(tribles, [{
-                _?adapter @
-                attrs::lora_projection: ?proj,
-                attrs::lora_a: ?a_h,
-                attrs::lora_b: ?b_h,
-            }])
-        ) {
-            let a_bytes: anybytes::Bytes = blobs.get(a_h).expect("lora_a blob");
-            let a_data: anybytes::View<[f32]> = a_bytes.view().expect("lora_a view");
-            let b_bytes: anybytes::Bytes = blobs.get(b_h).expect("lora_b blob");
-            let b_data: anybytes::View<[f32]> = b_bytes.view().expect("lora_b view");
+             b_h: Inline<inlineencodings::Handle<F32Array>>| {
+                // U256BE stores the u32 rank big-endian in the low (last) 8 bytes.
+                let rank = u64::from_be_bytes(rank_v.raw[24..32].try_into().unwrap()) as usize;
+                let alpha = alpha as f32;
+                let scale = alpha / rank as f32;
+                if let Some(common) = parameters {
+                    assert_eq!(
+                        common,
+                        (rank, alpha),
+                        "selected root {root} cannot be represented as homogeneous LoRA weights: \
+                     adapter {proj} has different rank/alpha"
+                    );
+                } else {
+                    parameters = Some((rank, alpha));
+                }
 
-            let in_features = a_data.len() / rank;
-            let out_features = b_data.len() / rank;
-            let lora_a =
-                Tensor::<B, 1>::from_floats(&a_data[..], device).reshape([rank, in_features]);
-            let lora_b =
-                Tensor::<B, 1>::from_floats(&b_data[..], device).reshape([out_features, rank]);
-            adapters.insert(
-                proj,
-                LoraAdapter {
-                    lora_a,
-                    lora_b,
-                    scale,
-                },
-            );
+                let a_bytes: anybytes::Bytes = blobs.get(a_h).expect("lora_a blob");
+                let a_data: anybytes::View<[f32]> = a_bytes.view().expect("lora_a view");
+                let b_bytes: anybytes::Bytes = blobs.get(b_h).expect("lora_b blob");
+                let b_data: anybytes::View<[f32]> = b_bytes.view().expect("lora_b view");
+
+                let in_features = a_data.len() / rank;
+                let out_features = b_data.len() / rank;
+                let lora_a =
+                    Tensor::<B, 1>::from_floats(&a_data[..], device).reshape([rank, in_features]);
+                let lora_b =
+                    Tensor::<B, 1>::from_floats(&b_data[..], device).reshape([out_features, rank]);
+                adapters.insert(
+                    proj,
+                    LoraAdapter {
+                        lora_a,
+                        lora_b,
+                        scale,
+                    },
+                );
+            };
+
+        if exists!(pattern!(tribles, [{
+            root @ crate::format::attrs::member: _?member,
+        }])) {
+            for (proj, rank, alpha, a_h, b_h) in find!(
+                (proj: String, rank: Inline<inlineencodings::U256BE>, alpha: f64,
+                 a_h: Inline<inlineencodings::Handle<F32Array>>,
+                 b_h: Inline<inlineencodings::Handle<F32Array>>),
+                pattern!(tribles, [{ root @ crate::format::attrs::member: _?adapter }, {
+                    _?adapter @
+                    attrs::lora_projection: ?proj,
+                    attrs::lora_rank: ?rank,
+                    attrs::lora_alpha: ?alpha,
+                    attrs::lora_a: ?a_h,
+                    attrs::lora_b: ?b_h,
+                }])
+            ) {
+                load_adapter(proj, rank, alpha, a_h, b_h);
+            }
+        } else {
+            // Old stored sets use native links and set-local parameters. Keep
+            // those opaque roots readable without manufacturing shared roots.
+            for (proj, rank, alpha, a_h, b_h) in find!(
+                (proj: String, rank: Inline<inlineencodings::U256BE>, alpha: f64,
+                 a_h: Inline<inlineencodings::Handle<F32Array>>,
+                 b_h: Inline<inlineencodings::Handle<F32Array>>),
+                pattern!(tribles, [{
+                    root @
+                    attrs::lora_adapter: _?adapter,
+                    attrs::lora_rank: ?rank,
+                    attrs::lora_alpha: ?alpha,
+                }, {
+                    _?adapter @
+                    attrs::lora_projection: ?proj,
+                    attrs::lora_a: ?a_h,
+                    attrs::lora_b: ?b_h,
+                }])
+            ) {
+                load_adapter(proj, rank, alpha, a_h, b_h);
+            }
         }
+
+        let (rank, alpha) =
+            parameters.unwrap_or_else(|| panic!("LoRA root {root} has no supported adapters"));
 
         eprintln!(
             "Loaded {} LoRA adapters from pile (rank={}, alpha={}).",
@@ -439,6 +495,168 @@ mod tests {
         t.to_data().to_vec().unwrap()
     }
 
+    #[test]
+    fn lora_root_identity_keeps_scale_in_members_and_labels_outside() {
+        let device = burn::prelude::Device::<TB>::default();
+        let weights = |alpha| LoraWeights::<TB> {
+            rank: 1,
+            alpha,
+            adapters: HashMap::from([(
+                "layers.0.self_attn.q_proj".to_owned(),
+                LoraAdapter {
+                    lora_a: Tensor::from_floats([[1.0, 2.0]], &device),
+                    lora_b: Tensor::from_floats([[3.0], [4.0]], &device),
+                    scale: alpha,
+                },
+            )]),
+        };
+        let mut blobs = MemoryBlobStore::new();
+        let first = weights(2.0)
+            .save_to_pile("first", Some(fucid().id), &mut blobs)
+            .unwrap();
+        let alias = weights(2.0)
+            .save_to_pile("alias", None, &mut blobs)
+            .unwrap();
+        let rescaled = weights(4.0)
+            .save_to_pile("first", None, &mut blobs)
+            .unwrap();
+        assert_eq!(first.root(), alias.root());
+        assert_ne!(
+            first.root(),
+            rescaled.root(),
+            "adapter scale changes the model's meaning"
+        );
+    }
+
+    #[test]
+    fn lora_load_uses_only_the_named_opaque_roots_members_and_scale() {
+        let device = burn::prelude::Device::<TB>::default();
+        let mut blobs = MemoryBlobStore::new();
+        let first_adapter = entity! { _ @
+            attrs::lora_projection: "layers.0.self_attn.q_proj",
+            attrs::lora_rank: 1u32,
+            attrs::lora_alpha: 2.0f64,
+            attrs::lora_a: blobs.put::<F32Array, _>(vec![1.0, 2.0]).unwrap(),
+            attrs::lora_b: blobs.put::<F32Array, _>(vec![3.0, 4.0]).unwrap(),
+        };
+        let second_adapter = entity! { _ @
+            attrs::lora_projection: "layers.0.self_attn.q_proj",
+            attrs::lora_rank: 2u32,
+            attrs::lora_alpha: 8.0f64,
+            attrs::lora_a: blobs.put::<F32Array, _>(vec![10.0, 20.0, 30.0, 40.0]).unwrap(),
+            attrs::lora_b: blobs.put::<F32Array, _>(vec![50.0, 60.0, 70.0, 80.0]).unwrap(),
+        };
+        let unselected_adapter = entity! { _ @
+            attrs::lora_projection: "layers.0.mlp.down_proj",
+            attrs::lora_a: blobs.put::<F32Array, _>(vec![90.0, 91.0]).unwrap(),
+            attrs::lora_b: blobs.put::<F32Array, _>(vec![92.0, 93.0]).unwrap(),
+        };
+        let first_root = fucid();
+        let second_root = fucid();
+        let legacy_root = fucid();
+        let mut facts = entity! { &first_root @
+            crate::format::attrs::member: first_adapter.root().unwrap(),
+            attrs::lora_rank: 1u32,
+            attrs::lora_alpha: 2.0f64,
+        }
+        .into_facts();
+        facts += entity! { &second_root @
+            crate::format::attrs::member: second_adapter.root().unwrap(),
+        };
+        // A pre-shared-membership root remains usable at its stored ID, with
+        // its own set-local scale and no graph-wide adapter discovery.
+        facts += entity! { &legacy_root @
+            attrs::lora_adapter: first_adapter.root().unwrap(),
+            attrs::lora_rank: 1u32,
+            attrs::lora_alpha: 3.0f64,
+        };
+        facts += first_adapter.into_facts();
+        facts += second_adapter.into_facts();
+        facts += unselected_adapter.into_facts();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+
+        let first = LoraWeights::<TB>::load_from_pile(&facts, &reader, first_root.id, &device);
+        assert_eq!((first.rank, first.alpha, first.adapters.len()), (1, 2.0, 1));
+        let adapter = first.get("layers.0.self_attn.q_proj").unwrap();
+        assert_eq!(adapter.lora_a.dims(), [1, 2]);
+        assert_eq!(adapter.lora_b.dims(), [2, 1]);
+        assert_eq!(tensor_vec(&adapter.lora_a), vec![1.0, 2.0]);
+        assert_eq!(tensor_vec(&adapter.lora_b), vec![3.0, 4.0]);
+        assert_eq!(adapter.scale, 2.0);
+
+        let second = LoraWeights::<TB>::load_from_pile(&facts, &reader, second_root.id, &device);
+        assert_eq!(
+            (second.rank, second.alpha, second.adapters.len()),
+            (2, 8.0, 1)
+        );
+        let adapter = second.get("layers.0.self_attn.q_proj").unwrap();
+        assert_eq!(adapter.lora_a.dims(), [2, 2]);
+        assert_eq!(adapter.lora_b.dims(), [2, 2]);
+        assert_eq!(tensor_vec(&adapter.lora_a), vec![10.0, 20.0, 30.0, 40.0]);
+        assert_eq!(tensor_vec(&adapter.lora_b), vec![50.0, 60.0, 70.0, 80.0]);
+        assert_eq!(adapter.scale, 4.0);
+
+        let legacy = LoraWeights::<TB>::load_from_pile(&facts, &reader, legacy_root.id, &device);
+        assert_eq!(
+            (legacy.rank, legacy.alpha, legacy.adapters.len()),
+            (1, 3.0, 1)
+        );
+        let adapter = legacy.get("layers.0.self_attn.q_proj").unwrap();
+        assert_eq!(tensor_vec(&adapter.lora_a), vec![1.0, 2.0]);
+        assert_eq!(tensor_vec(&adapter.lora_b), vec![3.0, 4.0]);
+        assert_eq!(adapter.scale, 3.0);
+    }
+
+    #[test]
+    fn shared_lora_computation_ignores_conflicting_root_annotations() {
+        let device = burn::prelude::Device::<TB>::default();
+        let key = "layers.0.self_attn.q_proj";
+        let weights = LoraWeights::<TB> {
+            rank: 1,
+            alpha: 2.0,
+            adapters: HashMap::from([(
+                key.to_owned(),
+                LoraAdapter {
+                    lora_a: Tensor::from_floats([[1.0, 2.0]], &device),
+                    lora_b: Tensor::from_floats([[3.0], [4.0]], &device),
+                    scale: 2.0,
+                },
+            )]),
+        };
+        let mut blobs = MemoryBlobStore::new();
+        let fragment = weights.save_to_pile("adapter", None, &mut blobs).unwrap();
+        let root = fragment.root().unwrap();
+        let mut facts = fragment.into_facts();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+        let before = LoraWeights::<TB>::load_from_pile(&facts, &reader, root, &device);
+
+        facts += entity! { ExclusiveId::force_ref(&root) @
+            attrs::lora_rank*: [0u32, 4u32],
+            attrs::lora_alpha*: [0.0f64, 64.0f64],
+        };
+        let after = LoraWeights::<TB>::load_from_pile(&facts, &reader, root, &device);
+        assert_eq!((after.rank, after.alpha), (before.rank, before.alpha));
+        assert_eq!((after.rank, after.alpha), (1, 2.0));
+        let adapter = after.get(key).unwrap();
+        assert_eq!(adapter.lora_a.dims(), [1, 2]);
+        assert_eq!(adapter.lora_b.dims(), [2, 1]);
+        assert_eq!(adapter.scale, 2.0);
+
+        let linear = burn::nn::LinearConfig::new(2, 2)
+            .with_bias(false)
+            .init(&device);
+        let x = Tensor::<TB, 3>::from_floats([[[2.0, 1.0]]], &device);
+        let base = linear.forward(x.clone());
+        let before = maybe_lora(&linear, x.clone(), Some(&before), key);
+        let after = maybe_lora(&linear, x, Some(&after), key);
+        assert_ne!(
+            tensor_vec(&before),
+            tensor_vec(&base),
+            "the adapter contributes"
+        );
+        assert_eq!(tensor_vec(&after), tensor_vec(&before));
+    }
+
     /// Round-trip a small adapter set through a REAL temp on-disk pile
     /// (native collection commit, cold reopen, exact snapshot, load) and assert the
     /// tensors come back bit-identical with the right shapes.
@@ -482,20 +700,39 @@ mod tests {
         std::fs::File::create(&pile_path).unwrap();
 
         // Save: adapter entities plus set entity in Mary's model collection.
-        {
+        let root = {
             let mut pile = Pile::open(&pile_path).unwrap();
             pile.refresh().unwrap();
             let signing_key = SigningKey::generate(&mut rand::rngs::OsRng);
-            let fragment = lora.save_to_pile("gemma-4-E4B-it", &mut pile).unwrap();
+            let base = fucid().id;
+            let fragment = lora
+                .save_to_pile("gemma-4-E4B-it", Some(base), &mut pile)
+                .unwrap();
+            let root = fragment.root().unwrap();
+            assert!(exists!(
+                (),
+                pattern!(fragment.facts(), [{
+                    root @ crate::format::attrs::parent: base,
+                }])
+            ));
+            let members: std::collections::BTreeSet<Id> = find!(
+                member: Id,
+                pattern!(fragment.facts(), [{ root @ crate::format::attrs::member: ?member }])
+            )
+            .collect();
+            assert_eq!(members.len(), lora.adapters.len());
+            let relabelled = lora.save_to_pile("renamed", None, &mut pile).unwrap();
+            assert_eq!(fragment.root(), relabelled.root());
             crate::model_collection::publish_model_fragment(&mut pile, &signing_key, fragment)
                 .unwrap();
             pile.close().unwrap();
-        }
+            root
+        };
 
         // Load from a FRESH open of the pile file.
         let loaded = {
             let source = crate::persist::read_model_pile(&pile_path).unwrap();
-            LoraWeights::<TB>::load_from_pile(&source.facts, &source.reader, &device)
+            LoraWeights::<TB>::load_from_pile(&source.facts, &source.store, root, &device)
         };
 
         assert_eq!(loaded.rank, rank);

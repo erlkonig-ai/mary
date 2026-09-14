@@ -28,6 +28,13 @@
 //! / `--name`) or by its entity id. Re-importing with the same signer is
 //! byte-idempotent. The resulting pile is self-contained: no weight files are
 //! needed at load time.
+//!
+//! Existing imported leaves can be assembled explicitly with `mary root
+//! --members-file members.txt --pile models.pile --key model.key`. The file
+//! lists the exact member entity IDs (whitespace-separated). This publishes
+//! only the new root and its annotations; it never sweeps or rewrites the
+//! stored model graph, and the caller is responsible for choosing a complete
+//! member set for the intended model.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -36,9 +43,10 @@ use anyhow::Context;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use mary::ingest::LeafDtype;
 use mary::selection::ModelSelector;
+use triblespace::core::collection::{CollectionHandle, CollectionStoreExt};
 use triblespace::core::repo::pile::Pile;
 use triblespace::core::signing_key_file;
-use triblespace::prelude::Id;
+use triblespace::prelude::*;
 
 #[derive(Parser)]
 #[command(
@@ -60,6 +68,43 @@ enum Cmd {
     /// optional `--quantization`) or by `--root` entity id — and print its
     /// tensor count + a sample. A round-trip check of the content-addressed store.
     Keys(KeysArgs),
+    /// Publish a model root over explicitly supplied member IDs. This is an
+    /// additive assembly operation, not a migration or a completeness check.
+    Root(RootArgs),
+}
+
+#[derive(Args)]
+struct RootArgs {
+    /// Destination pile. Created if absent; existing entities are not changed.
+    #[arg(long)]
+    pile: PathBuf,
+    /// Existing private signing-key file; no author identity is generated.
+    #[arg(long)]
+    key: PathBuf,
+    /// Exact existing model collection descriptor handle (64 hex). Without
+    /// this, use the sole named model collection or create its default.
+    #[arg(long, value_parser = parse_collection_handle)]
+    collection: Option<CollectionHandle>,
+    /// A member entity ID (32 hex). Repeat for each explicitly chosen member.
+    /// Members may arrive separately; no graph-wide discovery is performed.
+    #[arg(long, value_parser = parse_entity_id, required_unless_present = "members_file")]
+    member: Vec<Id>,
+    /// Whitespace-separated member entity IDs, added to any --member values.
+    #[arg(long)]
+    members_file: Option<PathBuf>,
+    /// Actual training/derivation base root. Repeat for multiple bases; never
+    /// infer this from a name or use the previously saved snapshot by default.
+    #[arg(long, value_parser = parse_entity_id)]
+    parent: Vec<Id>,
+    /// Optional model-name annotation. Repeat to retain several names.
+    #[arg(long)]
+    name: Vec<String>,
+    /// Optional source label, separate from identity and ancestry.
+    #[arg(long)]
+    source: Option<String>,
+    /// Optional weight-format annotation.
+    #[arg(long)]
+    quantization: Option<String>,
 }
 
 #[derive(Args)]
@@ -131,7 +176,109 @@ fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Import(a) => import(a),
         Cmd::Keys(a) => keys(a),
+        Cmd::Root(a) => publish_root(a),
     }
+}
+
+fn parse_entity_id(value: &str) -> Result<Id, String> {
+    Id::from_hex(value).ok_or_else(|| "expected a non-nil 32-hex entity ID".to_owned())
+}
+
+fn parse_collection_handle(value: &str) -> Result<CollectionHandle, String> {
+    inlineencodings::Hash::<inlineencodings::Blake3>::from_hex(
+        value.trim().strip_prefix("blake3:").unwrap_or(value.trim()),
+    )
+    .map(|hash| hash.transmute())
+    .map_err(|error| format!("expected a 64-hex collection handle: {error}"))
+}
+
+fn publish_root(mut a: RootArgs) -> anyhow::Result<()> {
+    use mary::format::attrs;
+
+    if let Some(path) = &a.members_file {
+        let input = std::fs::read_to_string(path)
+            .with_context(|| format!("read explicit member IDs from {}", path.display()))?;
+        for value in input.split_whitespace() {
+            a.member
+                .push(parse_entity_id(value).map_err(anyhow::Error::msg)?);
+        }
+    }
+    anyhow::ensure!(
+        !a.member.is_empty(),
+        "mary root needs at least one explicit member ID"
+    );
+    let mut fragment = entity! { _ @ attrs::member*: a.member.iter() };
+    let root = fragment.root().expect("model root");
+    let names: Vec<_> = a
+        .name
+        .into_iter()
+        .map(|name| fragment.put::<blobencodings::UTF8String, _>(name))
+        .collect();
+    let source = a
+        .source
+        .map(|source| fragment.put::<blobencodings::UTF8String, _>(source));
+    fragment += entity! { ExclusiveId::force_ref(&root) @
+        attrs::parent*: a.parent.iter().filter(|parent| **parent != root),
+        attrs::model_name*: names,
+        attrs::source?: source,
+        attrs::quantization?: a.quantization.as_deref(),
+    };
+
+    let signing_key = signing_key_file::load_existing(&a.key)
+        .with_context(|| format!("load existing signing key {:?}", a.key))?;
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&a.pile)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error).with_context(|| format!("create model pile {:?}", a.pile)),
+    }
+    let mut pile = Pile::open(&a.pile).with_context(|| format!("open model pile {:?}", a.pile))?;
+    let published = (|| -> anyhow::Result<_> {
+        pile.refresh()
+            .context("refresh before model root publication")?;
+        let collection = match a.collection {
+            Some(handle) => {
+                let snapshot = pile
+                    .snapshot()
+                    .context("freeze model collection authority")?;
+                let collection = mary::model_collection::ModelCollection::open(&snapshot, handle)
+                    .context("open the explicitly named model collection")?;
+                anyhow::ensure!(
+                    collection.writer_is_admitted(&snapshot, signing_key.verifying_key())?,
+                    "the signing key is not admitted by this collection's WRITE policy",
+                );
+                collection
+            }
+            None => {
+                mary::model_collection::model_graph_collection_or_create(&mut pile, &signing_key)?
+            }
+        };
+        let commit = pile
+            .commit(collection, &signing_key, fragment)
+            .context("publish explicit member-only model root")?;
+        Ok((collection.handle(), commit))
+    })();
+    let close = pile.close();
+    let (collection, commit) = match (published, close) {
+        (Ok(value), Ok(())) => value,
+        (Err(error), Ok(())) => return Err(error),
+        (Ok(_), Err(error)) => return Err(anyhow::anyhow!("close model pile: {error}")),
+        (Err(error), Err(close_error)) => {
+            return Err(error.context(format!(
+                "publication also failed to close the pile: {close_error}"
+            )));
+        }
+    };
+    eprintln!(
+        "mary root: root {root:X}, collection {}, commit {}",
+        lowercase_hex(&collection.raw),
+        triblespace::core::collection::CollectionRecord::Commit(commit).fingerprint(),
+    );
+    println!("{root:X}");
+    Ok(())
 }
 
 fn keys(a: KeysArgs) -> anyhow::Result<()> {
@@ -259,6 +406,101 @@ mod tests {
         );
         assert_eq!(&encoded[..8], "00010203");
         assert_eq!(&encoded[encoded.len() - 8..], "bcbdbebf");
+    }
+
+    #[test]
+    fn root_requires_explicit_members_and_parses_opaque_ids() {
+        assert!(
+            Cli::try_parse_from([
+                "mary",
+                "root",
+                "--pile",
+                "models.pile",
+                "--key",
+                "model.key"
+            ])
+            .is_err()
+        );
+        let member = fucid().id;
+        let base = fucid().id;
+        let member_hex = format!("{member:X}");
+        let base_hex = format!("{base:X}");
+        let parsed = Cli::try_parse_from([
+            "mary",
+            "root",
+            "--pile",
+            "models.pile",
+            "--key",
+            "model.key",
+            "--member",
+            &member_hex,
+            "--parent",
+            &base_hex,
+        ])
+        .unwrap();
+        let Cmd::Root(args) = parsed.cmd else {
+            panic!("wrong command");
+        };
+        assert_eq!(args.member, vec![member]);
+        assert_eq!(args.parent, vec![base]);
+    }
+
+    #[test]
+    fn explicit_root_publication_is_additive_and_does_not_sweep_members() {
+        use mary::format::attrs;
+
+        let dir = std::env::temp_dir().join(format!("mary-root-cli-{}", fucid().id));
+        std::fs::create_dir(&dir).unwrap();
+        let pile_path = dir.join("models.pile");
+        let key_path = dir.join("writer.key");
+        let key = signing_key_file::init(&key_path).unwrap();
+        std::fs::File::create(&pile_path).unwrap();
+        let mut pile = Pile::open(&pile_path).unwrap();
+        let base = fucid();
+        let selected = fucid();
+        let unselected = fucid();
+        let mut old = entity! { &base @ attrs::member: &unselected };
+        old += entity! { &selected @ attrs::kind: "matrix" };
+        old += entity! { &unselected @ attrs::kind: "matrix" };
+        let old_facts = old.facts().clone();
+        mary::model_collection::publish_model_fragment(&mut pile, &key, old).unwrap();
+        let snapshot =
+            mary::model_collection::snapshot_model_collection_local_latest(&mut pile).unwrap();
+        let collection = snapshot.support().collection().handle();
+        drop(snapshot);
+        pile.close().unwrap();
+
+        publish_root(RootArgs {
+            pile: pile_path.clone(),
+            key: key_path,
+            collection: Some(collection),
+            member: vec![selected.id, selected.id],
+            members_file: None,
+            parent: vec![base.id],
+            name: vec!["assembled".into()],
+            source: None,
+            quantization: None,
+        })
+        .unwrap();
+        let snapshot =
+            mary::model_collection::load_model_collection_local_latest(&pile_path).unwrap();
+        let facts = snapshot.facts();
+        assert!(old_facts.iter().all(|fact| facts.contains(fact)));
+        let roots: Vec<Id> = find!(
+            root: Id,
+            pattern!(facts, [{ ?root @ attrs::member: &selected, attrs::parent: &base }])
+        )
+        .collect();
+        assert_eq!(roots.len(), 1);
+        let root = roots[0];
+        assert!(!exists!(
+            (),
+            pattern!(facts, [{ root @ attrs::member: &unselected }])
+        ));
+        assert_ne!(root, base.id);
+        assert_eq!(snapshot.support().collection().handle(), collection);
+        drop(snapshot);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
 

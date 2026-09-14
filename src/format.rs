@@ -17,6 +17,18 @@
 //! Loading is config-free: a tensor carries its own shape. The franken-stitch is
 //! rewiring role-edges between module subgraphs.
 //!
+//! Every model family uses the same root and lineage vocabulary: a root has
+//! `member` links to its parameters/modules, and `parent` links to the roots
+//! used as its training or derivation base. New writers derive a root from its
+//! member links alone, then attach names, format labels, and ancestry as
+//! annotations. Readers follow the stored entity IDs in the selected model
+//! collection; they never reconstruct or validate a root's derivation. An old
+//! imported root or an explicitly minted root is just as addressable.
+//!
+//! `parent` is not a checkpoint-predecessor or "latest" register: snapshots
+//! trained against the same base are siblings, including successive saves from
+//! one running learner. Several base roots may be recorded for a composition.
+//!
 //! Named for Mary — Mary Wollstonecraft Shelley, who wrote the creature into
 //! being, and her mother Mary Wollstonecraft. She gives the assembled parts life.
 
@@ -101,18 +113,30 @@ pub mod attrs {
         "33CE12B1B940B13E48D8E5B0ADFD2421" as index: U256BE;
 
         // ── model root ──
+        /// The model collection handle that gives a referenced root its graph
+        /// context. A collection is named by this handle, not by a pile path.
+        /// Paired with `model_root` on consumer references; not part of a
+        /// model root's member-only identity core. Minted 2026-09-14 with
+        /// `trible genid` → CC07F0AFB3DCFD254A54A883E86E2617.
+        "CC07F0AFB3DCFD254A54A883E86E2617" as model_collection: Handle<blobencodings::SimpleArchive>;
         /// Reference to a model's root entity.
         "3F46CDE630964D78D62DA32F4A8558C1" as model_root: GenId;
         /// A model's module (repeated edge model → module entities).
         "B4B6EC08A0CD70DE63A690168EE78F0F" as member: GenId;
+        /// A training/derivation BASE root, not the previously saved snapshot.
+        /// Repeated for multiple contributing roots; absent for an import whose
+        /// base is not represented. NON-core annotation on the resulting root.
+        /// Promoted from `models::inkling::version::attrs::parent` unchanged:
+        /// anchor minted 2026-09-03, same GenId encoding and attribute identity.
+        "914320431BD23350DEE18D3D54FA84F1" as parent: GenId;
         /// Model name / HuggingFace id (shared id with avatar/gaze).
         "4C1CD1611863E7854C59C7DC706DF77A" as model_name: Handle<blobencodings::UTF8String>;
         /// SOURCE of a content-addressed model-root entity — the model's canonical
         /// name: the HuggingFace id it was imported from (e.g.
         /// "openai/clip-vit-base-patch32"), or a `--name` for a local-dir import.
         /// NON-core: a queryable LABEL attached to the (content-derived) root id,
-        /// NOT part of the identity — the id is the content-address of
-        /// `(quantization, weights)` alone. A `Handle<UTF8String>` because HF ids
+        /// NOT part of the identity — new root ids derive from their `member*`
+        /// links alone. Existing root ids remain opaque. A `Handle<UTF8String>` because HF ids
         /// routinely exceed 32 bytes. Minted 2026-07-24.
         /// (`trible genid` → D20B8E3556C35FF6D18D104C3443D6CF)
         "D20B8E3556C35FF6D18D104C3443D6CF" as source: Handle<blobencodings::UTF8String>;

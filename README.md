@@ -24,12 +24,46 @@ A model is a graph of three primitives:
 
 | primitive | is | 
 |---|---|
-| **tensor** | a self-describing leaf: a content-addressed `Array<F32>` data blob + an `Array<U64>` shape blob — identical tensors dedup |
+| **tensor** | a self-describing `Tensor<Elem, RANK>` blob with dimensions in its header — identical tensors dedup; historical two-blob leaves remain readable |
 | **module** | an entity whose parameters are tensor leaves reached by role-edges; `weight` and `bias` are the universal ones. A Linear is `{weight, bias?}`; a LayerNorm, Conv, Embedding are the same shape of thing — bias is just a parameter a module may or may not have |
 | **composition** | role-edges (`q_proj`, `ff_in`, …) from a module to its children, ordered where it matters by an `index` |
 
 Loading is config-free — a tensor carries its own shape. The **franken-stitch** is
 rewiring role-edges between two models' module subgraphs.
+
+### Model roots and lineage
+
+Every family shares `format::attrs::{member, parent, model_root,
+model_collection}`. A model reference names a collection by its descriptor
+handle and a root by its opaque entity ID. The members' internal tensor or
+adapter layout remains family-specific. New roots derive their identity from
+the set of `member` links alone; names, source labels, weight-format tags, and
+ancestry are annotations. Previously stored roots keep their original IDs, and
+readers never reconstruct a root's hash to find or validate it.
+
+`parent` means the actual **training or derivation base**, not the preceding
+checkpoint save. Successive learned snapshots from the same base are siblings.
+Imports with no known base omit the edge; compositions can name several bases.
+Nomic packing retains the roots selected for its input weights, as does the
+shared f16 derivation path. Gemma LoRA uses the same root/member/parent
+vocabulary for its adapter graph.
+
+Legacy partial imports are assembled with an explicit additive write:
+
+```sh
+# members.txt contains the exact member entity IDs, separated by whitespace.
+mary root --pile models.pile --key model.key --members-file members.txt \
+    --name assembled-model
+# Optional: --collection COLLECTION_HANDLE, --parent BASE_ROOT,
+#           --source SOURCE_LABEL, --quantization FORMAT_LABEL
+```
+
+`--member ENTITY_ID` can be repeated instead of (or alongside) the file. This
+command publishes only a root over the supplied members and its annotations;
+it does not discover all leaves, rewrite old entities, or claim that the
+selected members form a complete runnable model. Choosing that complete set
+is the explicit authoring operation. A runtime names the resulting stored
+root, never a synthesized union of whatever happened to be in a pile.
 
 ## Layout
 

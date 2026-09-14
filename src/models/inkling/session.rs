@@ -223,6 +223,8 @@ pub struct SessionConfig {
     /// The pile holding the weights AND the config — one source, so a pile that
     /// cannot answer `config.json` is not authoritative, only large.
     pub pile: std::path::PathBuf,
+    /// Explicit existing root in that collection; absent, require one candidate.
+    pub model_root: Option<triblespace::prelude::Id>,
     /// `config.json` from a file instead of from the pile's facts. For a pile
     /// written before the sidecars were ingested; an override you have to type,
     /// never a fallback you never see.
@@ -342,6 +344,7 @@ impl SessionConfig {
             .unwrap_or(0..0);
         Self {
             pile: pile.into(),
+            model_root: None,
             config_override: std::env::var("INK_CONFIG").ok().map(Into::into),
             layers,
             warm_experts: true,
@@ -958,7 +961,7 @@ impl Session {
              `layers` range and carry the hidden state between them yourself."
         );
 
-        let mut src = Weights::open(&cfg.pile)
+        let mut src = Weights::open_root(&cfg.pile, cfg.model_root)
             .with_context(|| format!("opening model collection in {}", cfg.pile.display()))?;
 
         // The config comes from the SAME source as the weights. In a pile it is
@@ -1415,9 +1418,9 @@ impl Session {
         &self.cfg
     }
 
-    /// Canonical identity of the projected model facts backing this session.
-    pub fn model_identity(&self) -> [u8; 32] {
-        self.src.model_identity()
+    /// The model collection descriptor, independent of its current annotations.
+    pub fn model_collection(&self) -> triblespace::core::collection::CollectionHandle {
+        self.src.model_collection()
     }
 
     /// How many positions the KV cache holds. The next token's position, and the
@@ -1485,8 +1488,8 @@ impl Session {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(CacheGeometry {
-            model_identity: self.model_identity(),
-            model_root: self.model_root().map(|id| id.raw()),
+            model_collection: self.model_collection().raw,
+            model_root: self.model_root().raw(),
             config_identity: self.config_identity,
             rank: tp.map_or(0, |tp| tp.rank()),
             world: tp.map_or(1, |tp| tp.world()),
@@ -1802,9 +1805,9 @@ impl Session {
         }
     }
 
-    /// The model root the weights were loaded from, if one was named or
-    /// chosen (see `pile::PileSource::model_root`).
-    pub fn model_root(&self) -> Option<triblespace::prelude::Id> {
+    /// The opaque root these weights were loaded from. Learning and persistence
+    /// do not change this training base (see `pile::PileSource::model_root`).
+    pub fn model_root(&self) -> triblespace::prelude::Id {
         self.src.model_root()
     }
 

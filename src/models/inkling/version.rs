@@ -3,6 +3,7 @@
 //! Backend-free, so a Mac or a Pi build reads the graph a Spark wrote.
 
 use anyhow::{Context, Result};
+use triblespace::core::collection::CollectionHandle;
 use triblespace::prelude::Id;
 
 use super::load::PackedExpert;
@@ -26,13 +27,11 @@ pub struct LearnedExpert {
 // that did not move are the same entities, so a version costs only the
 // experts it moved. Two versions with one parent are a branch. The versions no
 // other version names as `parent` are the heads, and the loader takes the
-// one head as the model when nothing names a root. A root's id is its member
-// set, so a version that learned nothing IS its parent.
-//
-// The checkpoint was imported in pieces (41 partial roots; experts that belong
-// to no root), so the first version's parent is minted here once: the GENESIS
-// root, whose members are every leaf the loader takes from the whole
-// collection. It is intrinsic, so a second run mints the same id.
+// one head as the model when nothing names a root. New roots derive their ids
+// from their member sets for idempotence; existing root ids are opaque. An
+// unchanged member set keeps the existing parent without deriving its id again.
+// A parent is the training BASE, not the previous save: repeated snapshots
+// from one resident training run are siblings, not a chronological chain.
 //
 // JP, 2026-09-03 17:35Z: not a collection per snapshot -- a DAG in one graph,
 // so a model can branch off a model, and the experiment's metadata and its
@@ -40,12 +39,12 @@ pub struct LearnedExpert {
 
 pub mod attrs {
     use triblespace::prelude::blobencodings::UTF8String;
-    use triblespace::prelude::inlineencodings::{F64, GenId, Handle, ShortString, U256BE};
+    use triblespace::prelude::inlineencodings::{F64, Handle, ShortString, U256BE};
     use triblespace::prelude::*;
 
+    pub use crate::format::attrs::parent;
+
     attributes! {
-        /// The root this version was learned from. Minted 2026-09-03.
-        "914320431BD23350DEE18D3D54FA84F1" as parent: GenId;
         /// The learner's step size on the routed experts' codes.
         "EA48C51D05FC180A5855106F0C0CCCAE" as learn_lr: F64;
         /// How hard her own rows were held to the distribution that said
@@ -67,16 +66,16 @@ pub mod attrs {
 
 /// A version assembled from learned experts, before or after it is committed.
 pub struct LearnedVersion {
+    /// The ordinary collection descriptor in which this version is published.
+    pub collection: CollectionHandle,
     /// The version root.
     pub root: Id,
     /// The root it was learned from.
     pub parent: Id,
-    /// Whether `parent` is the genesis root, minted by this assembly.
-    pub genesis: bool,
     /// A label: the model's name and the moment.
     pub name: String,
-    /// The facts to ADD: new leaves, the version root (and the genesis root
-    /// when minted), their annotations. Never the parent's facts, which the
+    /// The facts to ADD: new leaves, the version root and its annotations.
+    /// Never the parent's facts, which the
     /// collection already holds.
     pub facts: triblespace::core::trible::TribleSet,
     /// Leaves whose bytes moved and were replaced by new leaf entities.
@@ -85,56 +84,64 @@ pub struct LearnedVersion {
     pub members: usize,
 }
 
-/// The heads of the version DAG in `facts`: every root that carries `parent`
-/// or is named as one, minus those some version names as its parent. Empty
-/// when no version exists yet.
+/// Native Inkling roots not named as a parent by another native Inkling root.
+/// Eligibility is the typed member shape consumed by `PileSource`, not a
+/// model label or the shared `member`/`parent` vocabulary alone. An unrelated
+/// model's lineage cannot select or suppress an Inkling candidate.
 pub fn version_heads(facts: &triblespace::core::trible::TribleSet) -> Vec<Id> {
-    use std::collections::BTreeSet;
-    use triblespace::macros::{find, pattern};
-    let mut nodes: BTreeSet<Id> = BTreeSet::new();
-    let mut parents: BTreeSet<Id> = BTreeSet::new();
-    for (v, p) in find!((v: Id, p: Id), pattern!(facts, [{ ?v @ attrs::parent: ?p }])) {
-        nodes.insert(v);
-        nodes.insert(p);
-        parents.insert(p);
-    }
-    nodes.difference(&parents).copied().collect()
-}
-
-/// Every leaf the loader takes from the whole collection: the packed experts,
-/// and the dense tensors of every element type and rank it sweeps.
-fn all_leaves(facts: &triblespace::core::trible::TribleSet) -> std::collections::BTreeSet<Id> {
-    use super::pile::attrs as ink;
+    use super::pile;
+    use std::collections::HashSet;
     use triblespace::core::blob::encodings::tensor::elements::{BF16, F32};
     use triblespace::core::metadata;
-    use triblespace::macros::{find, pattern};
-    let mut out = std::collections::BTreeSet::new();
-    for (e,) in find!(
-        (e: Id),
-        pattern!(facts, [{ ?e @ metadata::name: _?n, ink::expert_index: _?i, ink::weight_nvfp4_2: _?h }])
-    ) {
-        out.insert(e);
-    }
-    macro_rules! dense {
+    use triblespace::prelude::*;
+
+    let mut nodes: HashSet<Id> = find!(
+        (root: Id, expert: i64, layer: i64),
+        pattern!(facts, [
+            { ?root @ crate::format::attrs::member: _?member },
+            { _?member @ metadata::name: _?name,
+              pile::attrs::expert_index: ?expert, pile::attrs::layer: ?layer,
+              pile::attrs::weight_nvfp4_2: _?weight },
+        ])
+    )
+    .map(|(root, _, _)| root)
+    .collect();
+    // These are exactly the native dense types/ranks the loader sweeps.
+    // BF16 experts are also covered by the BF16 matrix shape.
+    macro_rules! native_dense_roots {
         ($ty:ty, $rank:literal) => {
-            for (e,) in find!(
-                (e: Id),
-                pattern!(facts, [{ ?e @ metadata::name: _?n, ink::weight::<$ty, $rank>(): _?h }])
-            ) {
-                out.insert(e);
-            }
+            nodes.extend(find!(
+                (root: Id),
+                pattern!(facts, [
+                    { ?root @ crate::format::attrs::member: _?member },
+                    { _?member @ metadata::name: _?name,
+                      pile::attrs::weight::<$ty, $rank>(): _?weight },
+                ])
+            ).map(|(root,)| root));
         };
     }
-    dense!(BF16, 0);
-    dense!(BF16, 1);
-    dense!(BF16, 2);
-    dense!(BF16, 3);
-    dense!(BF16, 4);
-    dense!(F32, 0);
-    dense!(F32, 1);
-    dense!(F32, 2);
-    dense!(F32, 3);
-    out
+    native_dense_roots!(BF16, 0);
+    native_dense_roots!(BF16, 1);
+    native_dense_roots!(BF16, 2);
+    native_dense_roots!(BF16, 3);
+    native_dense_roots!(BF16, 4);
+    native_dense_roots!(F32, 0);
+    native_dense_roots!(F32, 1);
+    native_dense_roots!(F32, 2);
+    native_dense_roots!(F32, 3);
+    native_dense_roots!(F32, 4);
+    let parents: HashSet<Id> = find!(
+        (version: Id, parent: Id),
+        and!(
+            (&nodes).has(version),
+            pattern!(facts, [{ ?version @ attrs::parent: ?parent }])
+        )
+    )
+    .map(|(_, parent)| parent)
+    .collect();
+    let mut heads: Vec<Id> = nodes.difference(&parents).copied().collect();
+    heads.sort();
+    heads
 }
 
 /// The moment, as `YYYYMMDDTHHMMSSZ`, from the system clock with no crate.
@@ -158,15 +165,13 @@ pub fn utc_stamp() -> String {
     format!("{y:04}{mo:02}{d:02}T{h:02}{m:02}{s:02}Z")
 }
 
-/// Assemble a version from the learned experts, as a child of `parent` -- or
-/// of the graph's one head when `parent` is `None`, or of the genesis root
-/// minted here when the graph has no version yet. Writes the new leaves'
-/// blobs into the pile (content addressed, so a repeat is a no-op) and
-/// nothing else: no record is committed here.
+/// Assemble a version from the learned experts and the explicitly selected
+/// collection and training base. Writes new blobs, but commits no record.
 pub fn learned_version(
     pile: &mut triblespace::prelude::Pile,
+    collection: CollectionHandle,
     learned: &[LearnedExpert],
-    parent: Option<Id>,
+    parent: Id,
     recipe: &VersionRecipe,
 ) -> Result<LearnedVersion> {
     use super::pile::attrs as ink;
@@ -178,19 +183,21 @@ pub fn learned_version(
     use triblespace::macros::{entity, find, pattern};
     use triblespace::prelude::*;
 
-    let graph = crate::model_collection::mary_model_graph_name();
+    let store = pile.snapshot().context("freeze the model collection")?;
+    let selected_collection = crate::model_collection::ModelCollection::open(&store, collection)
+        .context("open the selected model collection")?;
     let snapshot =
-        crate::model_collection::snapshot_model_collection_named_local_latest(pile, graph)
-            .with_context(|| format!("the model collection '{graph}'"))?;
+        crate::model_collection::snapshot_model_collection_for(&store, selected_collection)
+            .context("read the selected model collection")?;
     let facts = crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
     let (_, _, reader) = snapshot.into_parts();
     let mut added = TribleSet::new();
 
-    // The model's name, functional per root: the one name the checkpoint's
-    // roots agree on, carried onto every version.
+    // Labels come from the selected base, not from unrelated roots in the
+    // collection. Labels do not participate in the version's identity.
     let names: BTreeSet<Inline<Handle<blobencodings::UTF8String>>> = find!(
         (mn: Inline<Handle<blobencodings::UTF8String>>),
-        pattern!(&facts, [{ _?r @ model::model_name: ?mn }])
+        pattern!(&facts, [{ (parent) @ model::model_name: ?mn }])
     )
     .map(|(mn,)| mn)
     .collect();
@@ -210,41 +217,10 @@ pub fn learned_version(
     };
 
     // 1. The parent, and its members.
-    let heads = version_heads(&facts);
-    let (parent, genesis, parent_members): (Id, bool, Vec<Id>) = match parent {
-        Some(p) => (p, false, Vec::new()),
-        None if heads.len() == 1 => (heads[0], false, Vec::new()),
-        None if heads.len() > 1 => anyhow::bail!(
-            "the model graph has {} heads ({}); name the parent",
-            heads.len(),
-            heads
-                .iter()
-                .map(|i| format!("{i:X}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        None => {
-            let leaves = all_leaves(&facts);
-            anyhow::ensure!(!leaves.is_empty(), "'{graph}' holds no tensor leaves");
-            let root = entity! { _ @ model::member*: leaves.iter() };
-            let id = root.root().expect("a root has a root");
-            added += root;
-            let name_h = pile
-                .put::<blobencodings::UTF8String, _>(label_of("checkpoint"))
-                .map_err(|e| anyhow::anyhow!("store the genesis label: {e:?}"))?;
-            added += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name_h };
-            if let Some(mn) = model_name {
-                added += entity! { ExclusiveId::force_ref(&id) @ model::model_name: mn };
-            }
-            (id, true, leaves.into_iter().collect())
-        }
-    };
-    let parent_members: Vec<Id> = match parent_members.is_empty() {
-        false => parent_members,
-        true => find!((m: Id), pattern!(&facts, [{ (parent) @ model::member: ?m }]))
+    let parent_members: Vec<Id> =
+        find!((m: Id), pattern!(&facts, [{ (parent) @ model::member: ?m }]))
             .map(|(m,)| m)
-            .collect(),
-    };
+            .collect();
     anyhow::ensure!(
         !parent_members.is_empty(),
         "parent {parent:X} has no members"
@@ -289,14 +265,20 @@ pub fn learned_version(
     }
 
     // 3. The version root: the parent's members with the moved leaves
-    //    replaced. Its id is that set, so a version that moved nothing is
-    //    its parent and is not annotated as a child of itself.
+    //    replaced. Compare members, not the parent's minting history: an
+    //    unchanged model keeps its existing opaque root.
     let members: Vec<Id> = parent_members
         .iter()
         .map(|m| subst.get(m).copied().unwrap_or(*m))
         .collect();
-    let root_e = entity! { _ @ model::member*: members.iter() };
-    let root = root_e.root().expect("a root has a root");
+    let unchanged = members.iter().copied().collect::<BTreeSet<_>>() == parent_set;
+    let root_e = if unchanged {
+        Fragment::empty()
+    } else {
+        entity! { _ @ model::member*: members.iter() }
+    };
+    let root = root_e.root().unwrap_or(parent);
+    let replaced = subst.iter().filter(|(old, new)| old != new).count();
     let name = label_of(&format!("learned {}", utc_stamp()));
     if root != parent {
         added += root_e;
@@ -327,12 +309,12 @@ pub fn learned_version(
         }
     }
     Ok(LearnedVersion {
+        collection,
         root,
         parent,
-        genesis,
         name,
         facts: added,
-        replaced: subst.len(),
+        replaced,
         members: members.len(),
     })
 }
@@ -347,10 +329,269 @@ pub fn publish_version(
     use triblespace::prelude::*;
     pile.refresh()
         .map_err(|e| anyhow::anyhow!("refresh before publishing '{}': {e:?}", version.name))?;
-    let graph = crate::model_collection::mary_model_graph_name();
-    let collection = crate::model_collection::collection_or_create(pile, key, graph)?;
+    let snapshot = pile
+        .snapshot()
+        .context("freeze version publication authority")?;
+    let collection = crate::model_collection::ModelCollection::open(&snapshot, version.collection)
+        .context("open the selected version publication collection")?;
+    anyhow::ensure!(
+        collection.writer_is_admitted(&snapshot, key.verifying_key())?,
+        "signing key is not admitted by the selected model collection's WRITE policy"
+    );
     let fragment: Fragment = version.facts.into();
     pile.commit(collection, key, fragment)
         .map_err(|e| anyhow::anyhow!("publish '{}': {e}", version.name))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::pile::{self, PileSource};
+    use super::*;
+    use crate::format::attrs as model;
+    use triblespace::core::blob::encodings::tensor::{elements::F32, tensor_blob};
+    use triblespace::core::metadata;
+    use triblespace::prelude::*;
+
+    fn fixture(
+        rooted: bool,
+    ) -> Result<(
+        std::path::PathBuf,
+        Pile,
+        ed25519_dalek::SigningKey,
+        crate::model_collection::ModelCollection,
+        Id,
+        LearnedExpert,
+    )> {
+        let path = std::env::temp_dir().join(format!("inkling-model-reference-{}.pile", genid()));
+        std::fs::File::create(&path)?;
+        let mut store = Pile::open(&path)?;
+        store.refresh()?;
+        let key = ed25519_dalek::SigningKey::from_bytes(&[17; 32]);
+        let collection =
+            crate::model_collection::model_graph_collection_or_create(&mut store, &key)?;
+        let expert = LearnedExpert {
+            name: "model.llm.layers.41.mlp.experts.w2_weight".to_string(),
+            layer: 41,
+            expert: 7,
+            packed: PackedExpert {
+                codes: vec![0; 8],
+                scales: vec![0x30],
+                scale2: 1.0,
+                rows: 1,
+                cols: 8,
+            },
+        };
+        let weight = store.put(pile::expert_blob(&expert.packed)?)?;
+        let name = store.put::<blobencodings::UTF8String, _>(expert.name.clone())?;
+        let mut fragment = entity! { _ @
+            pile::attrs::weight_nvfp4_2: weight,
+            pile::attrs::expert_index: expert.expert,
+            metadata::name: name,
+            pile::attrs::layer: expert.layer,
+        };
+        let expert_member = fragment.root().unwrap();
+        let dense_weight = store.put(
+            tensor_blob::<F32, 1>([1], anybytes::Bytes::from_source(vec![1.0f32]))
+                .map_err(|e| anyhow::anyhow!("fixture dense tensor: {e}"))?,
+        )?;
+        let dense_name =
+            store.put::<blobencodings::UTF8String, _>("model.llm.norm.weight".to_string())?;
+        let dense = entity! { _ @
+            pile::attrs::weight::<F32, 1>(): dense_weight,
+            metadata::name: dense_name,
+        };
+        let dense_member = dense.root().unwrap();
+        fragment += dense;
+        let base = fucid();
+        if rooted {
+            fragment += entity! { &base @ model::member*: [expert_member, dense_member] };
+        }
+        store.commit(collection, &key, fragment)?;
+        store.flush()?;
+        Ok((path, store, key, collection, base.id, expert))
+    }
+
+    #[test]
+    fn unchanged_snapshot_keeps_the_existing_opaque_root() -> Result<()> {
+        let (path, mut store, _key, collection, base, _) = fixture(true)?;
+        let source = PileSource::open(&path)?;
+        assert_eq!(source.model_collection(), collection.handle());
+        assert_eq!(source.model_root(), base);
+        assert_eq!(source.leaf("model.llm.norm.weight")?.dims, vec![1]);
+        let version = learned_version(
+            &mut store,
+            collection.handle(),
+            &[],
+            base,
+            &VersionRecipe::default(),
+        )?;
+        assert_eq!(version.root, base);
+        assert_eq!(version.parent, base);
+        assert!(version.facts.is_empty());
+        drop(source);
+        store.close()?;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn snapshots_keep_the_training_base_and_reference_survives_annotation_growth() -> Result<()> {
+        let (path, mut store, key, collection, base, mut expert) = fixture(true)?;
+        expert.packed.codes[0] = 1;
+        let first = learned_version(
+            &mut store,
+            collection.handle(),
+            &[expert.clone()],
+            base,
+            &VersionRecipe::default(),
+        )?;
+        let first_root = first.root;
+        assert_eq!(first.parent, base);
+        publish_version(&mut store, &key, first)?;
+        expert.packed.codes[0] = 2;
+        let second = learned_version(
+            &mut store,
+            collection.handle(),
+            &[expert.clone()],
+            base,
+            &VersionRecipe::default(),
+        )?;
+        let second_root = second.root;
+        assert_eq!(second.parent, base);
+        assert_ne!(first_root, second_root);
+        publish_version(&mut store, &key, second)?;
+        let extra =
+            entity! { ExclusiveId::force_ref(&base) @ metadata::description: "later annotation" };
+        store.commit(collection, &key, extra)?;
+        store.flush()?;
+
+        let base_source = PileSource::open_root(&path, Some(base))?;
+        let child_source = PileSource::open_root(&path, Some(second_root))?;
+        assert_eq!(base_source.model_collection(), collection.handle());
+        assert_eq!(child_source.model_collection(), collection.handle());
+        assert_eq!(base_source.model_root(), base);
+        assert_eq!(child_source.model_root(), second_root);
+        assert_eq!(
+            base_source.expert_packed_stored(&expert.name, 7)?.codes[0],
+            0
+        );
+        assert_eq!(
+            child_source.expert_packed_stored(&expert.name, 7)?.codes[0],
+            2
+        );
+        assert!(
+            PileSource::open(&path).is_err(),
+            "siblings require explicit selection"
+        );
+        let snapshot =
+            crate::model_collection::snapshot_model_collection_for(&store.snapshot()?, collection)?;
+        assert_eq!(
+            version_heads(snapshot.facts())
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            [first_root, second_root].into_iter().collect()
+        );
+        let unchanged = learned_version(
+            &mut store,
+            collection.handle(),
+            &[],
+            base,
+            &VersionRecipe::default(),
+        )?;
+        assert_eq!(unchanged.root, base);
+        drop((base_source, child_source, snapshot));
+        store.close()?;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unrelated_model_lineage_and_tokenizer_sequence_do_not_select_an_inkling_head() -> Result<()>
+    {
+        let (path, mut store, key, collection, base, mut expert) = fixture(true)?;
+        let mut additions = crate::format::put_raw(&mut store, &[1.0], &[1, 1])
+            .map_err(|e| anyhow::anyhow!("generic model leaf: {e}"))?;
+        let generic_leaf = additions.root().unwrap();
+        let name = store.put::<blobencodings::UTF8String, _>("unrelated tensor".to_string())?;
+        additions += entity! { ExclusiveId::force_ref(&generic_leaf) @ metadata::name: name };
+        let unrelated_base = fucid();
+        let unrelated_child = fucid();
+        additions += entity! { &unrelated_base @ model::member: generic_leaf };
+        additions += entity! { &unrelated_child @
+            model::member: generic_leaf,
+            model::parent: unrelated_base.id,
+        };
+        // Even a cross-family derivation edge must not suppress the native
+        // candidate when its child is not an Inkling member shape.
+        additions += entity! { &unrelated_child @ model::parent: base };
+        additions += crate::tokenizer::save_tokenizer_json(
+            br#"{"model":{"type":"BPE","vocab":{},"merges":[]},
+                 "normalizer":{"type":"Sequence","normalizers":[{"type":"NFC"}]}}"#,
+            "coexisting tokenizer",
+            &mut store,
+        )
+        .map_err(|e| anyhow::anyhow!("tokenizer Sequence: {e}"))?;
+        store.commit(collection, &key, additions)?;
+        store.flush()?;
+
+        // The Inkling root is opaque and unlabelled, yet is the only native
+        // candidate. Neither the Sequence nor the unrelated graph is a head.
+        let source = PileSource::open(&path)?;
+        assert_eq!(source.model_root(), base);
+        assert_eq!(source.model_collection(), collection.handle());
+        drop(source);
+        expert.packed.codes[0] = 1;
+        let learned = learned_version(
+            &mut store,
+            collection.handle(),
+            &[expert],
+            base,
+            &VersionRecipe::default(),
+        )?;
+        let head = learned.root;
+        publish_version(&mut store, &key, learned)?;
+        store.flush()?;
+        let source = PileSource::open(&path)?;
+        assert_eq!(source.model_root(), head);
+        let snapshot =
+            crate::model_collection::snapshot_model_collection_for(&store.snapshot()?, collection)?;
+        assert_eq!(version_heads(snapshot.facts()), vec![head]);
+        drop((source, snapshot));
+        store.close()?;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    fn unrooted_or_ambiguous_partial_imports_are_not_synthesized_on_read() -> Result<()> {
+        let (path, mut store, key, collection, absent, _) = fixture(false)?;
+        let length = std::fs::metadata(&path)?.len();
+        assert!(PileSource::open(&path).is_err());
+        assert!(PileSource::open_root(&path, Some(absent)).is_err());
+        assert_eq!(std::fs::metadata(&path)?.len(), length);
+        let a = fucid();
+        let b = fucid();
+        let snapshot =
+            crate::model_collection::snapshot_model_collection_for(&store.snapshot()?, collection)?;
+        let member = find!(
+            (member: Id),
+            pattern!(snapshot.facts(), [{ ?member @ pile::attrs::weight::<F32, 1>(): _?weight }])
+        )
+        .next()
+        .context("fixture dense leaf")?
+        .0;
+        drop(snapshot);
+        let mut partials = entity! { &a @ model::member: member };
+        partials += entity! { &b @ model::member: member };
+        store.commit(collection, &key, partials)?;
+        store.flush()?;
+        assert!(PileSource::open(&path).is_err());
+        let source = PileSource::open_root(&path, Some(a.id))?;
+        assert_eq!(source.model_root(), a.id);
+        drop(source);
+        store.close()?;
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
 }

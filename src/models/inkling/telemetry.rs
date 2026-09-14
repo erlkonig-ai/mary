@@ -14,7 +14,7 @@
 
 use anyhow::{Context as _, Result};
 use triblespace::core::metadata;
-use triblespace::prelude::blobencodings::UTF8String;
+use triblespace::prelude::blobencodings::{SimpleArchive, UTF8String};
 use triblespace::prelude::inlineencodings::{Blake3, Boolean, F64, GenId, Handle, Hash, U256BE};
 use triblespace::prelude::*;
 
@@ -23,20 +23,18 @@ use super::resident::{ContextPlacement, ContextPreflighted, Ready, Reinitialized
 /// Query vocabulary for Inkling's native runtime evidence.
 pub mod schema {
     use super::*;
+    pub use crate::format::attrs::{model_collection, model_root};
 
     attributes! {
-        /// Canonical identity of the projected model facts actually loaded.
-        /// Minted 2026-08-28: E65EDFF32D71BAB66F6B1BA69C11ABE3.
-        "E65EDFF32D71BAB66F6B1BA69C11ABE3" as pub model_identity: Hash<Blake3>;
         /// Content identity of the exact tokenizer bytes of a `tokenizer.json`
         /// beside the pile. Minted 2026-08-28: 01C84FAC727F47AF438951439ED3B657.
         /// No longer written: the tokenizer comes out of the model graph and
         /// READY names its entity (`tokenizer` below). Declared so the READY
         /// rows written before 2026-09-05 stay readable.
         "01C84FAC727F47AF438951439ED3B657" as pub tokenizer_identity: Hash<Blake3>;
-        /// The tokenizer entity in the model graph the run built its views
-        /// from. Its id is content-derived, so this IS the identity of the
-        /// exact tokenizer. Minted 2026-09-05: 9692481AC9DA5388A755F2280B8F391D.
+        /// The stored tokenizer entity in the selected model collection.
+        /// Its ID is opaque, whether minted or derived by its writer.
+        /// Minted 2026-09-05: 9692481AC9DA5388A755F2280B8F391D.
         "9692481AC9DA5388A755F2280B8F391D" as pub tokenizer: GenId;
         /// Identity of the sealed/observed executable configuration.
         /// Minted 2026-08-28: 45514D5DD40BA7A83A84A6F9C829D66A.
@@ -178,12 +176,16 @@ pub mod schema {
 
 /// Turn one validated READY announcement into a self-contained native fragment.
 ///
-/// Identities are deliberately parsed as BLAKE3 values rather than retained as
-/// strings. A malformed wire announcement therefore fails construction at the
-/// mind boundary instead of becoming an unqueryable or silently missing fact.
+/// The collection handle, opaque model root and execution digest are parsed as
+/// their respective types rather than retained as strings. A malformed
+/// announcement fails at the mind boundary instead of becoming an unqueryable
+/// or silently missing fact.
 pub fn ready_fragment(ready: &Ready) -> Result<Fragment> {
-    let model_identity = Hash::<Blake3>::from_hex(&ready.model_identity)
-        .context("READY model identity is not a 32-byte hexadecimal BLAKE3 digest")?;
+    let model_collection = Hash::<Blake3>::from_hex(&ready.model_collection)
+        .context("READY model collection is not a 32-byte hexadecimal descriptor handle")?
+        .transmute::<Handle<SimpleArchive>>();
+    let model_root =
+        Id::from_hex(&ready.model_root).context("READY model root is not a 32-hex entity id")?;
     let tokenizer = Id::from_hex(&ready.tokenizer_identity)
         .context("READY tokenizer identity is not the 32-hex id of a tokenizer entity")?;
     let execution_identity = Hash::<Blake3>::from_hex(&ready.execution_identity)
@@ -199,7 +201,8 @@ pub fn ready_fragment(ready: &Ready) -> Result<Fragment> {
 
     fragment += entity! { _ @
         metadata::tag: schema::kind_ready,
-        schema::model_identity: model_identity,
+        schema::model_collection: model_collection,
+        schema::model_root: model_root,
         schema::tokenizer: tokenizer,
         schema::execution_identity: execution_identity,
         schema::execution_profile: execution_profile,
@@ -282,6 +285,7 @@ pub fn context_preflight_fragment(evidence: &ContextPreflighted) -> Fragment {
 pub fn persisted_fragment(epoch: u64, persisted: &super::resident::Persisted) -> Fragment {
     entity! { _ @
         metadata::tag: schema::kind_persisted,
+        schema::model_collection: persisted.collection,
         schema::context_epoch: epoch as u128,
         schema::persisted_version: persisted.root,
         schema::persisted_experts: persisted.replaced as u128,
@@ -307,7 +311,8 @@ mod tests {
     fn ready() -> Ready {
         Ready {
             pile: "fixture.pile".to_string(),
-            model_identity: "11".repeat(32),
+            model_collection: "11".repeat(32),
+            model_root: "33".repeat(16),
             tokenizer_identity: "22".repeat(16),
             special_ids: InklingSpecialIds {
                 message_model: 1,
@@ -353,6 +358,14 @@ mod tests {
         )
         .collect();
         assert_eq!(worlds, [2]);
+        let references: Vec<(Inline<Handle<SimpleArchive>>, Id)> = find!(
+            (collection: Inline<Handle<SimpleArchive>>, model: Id),
+            pattern!(&fragment, [{ root @ schema::model_collection: ?collection, schema::model_root: ?model }])
+        ).collect();
+        assert_eq!(
+            references,
+            [(Inline::new([0x11; 32]), Id::new([0x33; 16]).unwrap())]
+        );
         assert!(
             !fragment.blobs().is_empty(),
             "text values travel with facts"
@@ -360,11 +373,30 @@ mod tests {
     }
 
     #[test]
-    fn malformed_ready_identity_is_rejected_without_a_panic() {
+    fn malformed_ready_model_reference_is_rejected_without_a_panic() {
         let mut malformed = ready();
-        malformed.model_identity = "not-a-digest".to_string();
+        malformed.model_collection = "not-a-handle".to_string();
         let error = ready_fragment(&malformed).expect_err("malformed identity must fail");
-        assert!(format!("{error:#}").contains("model identity"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("model collection"),
+            "{error:#}"
+        );
+        let mut malformed = ready();
+        malformed.model_root = "not-a-root".to_string();
+        let error = ready_fragment(&malformed).expect_err("malformed root must fail");
+        assert!(format!("{error:#}").contains("model root"), "{error:#}");
+    }
+
+    #[test]
+    fn ready_distinguishes_roots_in_the_same_collection() {
+        let original = ready();
+        let mut different = ready();
+        different.model_root = format!("{:X}", genid().id);
+        assert_eq!(original.model_collection, different.model_collection);
+        assert_ne!(
+            ready_fragment(&original).unwrap().root(),
+            ready_fragment(&different).unwrap().root()
+        );
     }
 
     #[test]

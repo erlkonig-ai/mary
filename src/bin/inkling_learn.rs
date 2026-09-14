@@ -36,7 +36,7 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         args.len() >= 3,
         "usage: inkling_learn <pile> <turns.txt> [--from LINE] [--turns N] \
-         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--export] \
+         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--model-root ID] [--export] \
          [--save | --save-commit --signing-key <path>]"
     );
     let (pile, corpus) = (&args[1], &args[2]);
@@ -45,6 +45,7 @@ fn main() -> Result<()> {
     let mut want = 1usize;
     let mut rendezvous: Option<String> = None;
     let mut layers: Option<std::ops::Range<usize>> = None;
+    let mut model_root = None;
     let mut export = false;
     let mut save = Save::No;
     let mut signing_key: Option<String> = None;
@@ -52,6 +53,16 @@ fn main() -> Result<()> {
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
+            "--model-root" => {
+                model_root = Some(
+                    triblespace::prelude::Id::from_hex(
+                        args.get(i + 1)
+                            .context("--model-root wants a 32-hex model root id")?,
+                    )
+                    .context("--model-root wants a 32-hex model root id")?,
+                );
+                i += 2;
+            }
             // After the last turn, pull every learned expert out of both
             // ranks' arenas, joined whole, and say what came back. Nothing is
             // written to a pile yet (see `inkling::learned`).
@@ -141,6 +152,7 @@ fn main() -> Result<()> {
         cache: None,
         distillation: None,
         pile: pile.into(),
+        model_root,
         layers,
         prefill_budget: None,
         // The engine's default is the million-position window the resident is
@@ -268,6 +280,7 @@ fn main() -> Result<()> {
             use mary::models::inkling::resident::VersionRecipe;
             use mary::models::inkling::version::{learned_version, publish_version};
             use triblespace::prelude::Pile;
+            use triblespace::prelude::inlineencodings::{Blake3, Hash};
             let t = std::time::Instant::now();
             let mut store = Pile::open(std::path::Path::new(pile))
                 .map_err(|e| anyhow::anyhow!("open {pile} to write: {e:?}"))?;
@@ -291,17 +304,17 @@ fn main() -> Result<()> {
                 explanation: explain.clone().unwrap_or_default(),
                 code_revision: std::env::var("INK_CODE_REVISION").unwrap_or_default(),
             };
-            let version = learned_version(&mut store, &learned, None, &recipe)?;
+            let parent = triblespace::prelude::Id::from_hex(&engine.ready().model_root)
+                .context("loaded engine has no valid model root")?;
+            let collection = Hash::<Blake3>::from_hex(&engine.ready().model_collection)
+                .context("loaded engine has no valid model collection")?
+                .transmute();
+            let version = learned_version(&mut store, collection, &learned, parent, &recipe)?;
             println!(
-                "=== version {:X} '{}': parent {:X}{}, {} leaves replaced, {} members, {} facts to add, assembled in {:.1}s ===",
+                "=== version {:X} '{}': parent {:X}, {} leaves replaced, {} members, {} facts to add, assembled in {:.1}s ===",
                 version.root,
                 version.name,
                 version.parent,
-                if version.genesis {
-                    " (the genesis root, minted now)"
-                } else {
-                    ""
-                },
                 version.replaced,
                 version.members,
                 version.facts.len(),

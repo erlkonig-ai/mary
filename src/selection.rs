@@ -4,8 +4,9 @@
 //! old pile wrappers predated that: they selected the first matching root or
 //! extended a `HashMap`, making iteration order decide ambiguous data. This
 //! module keeps storage out of the decision. Callers pass a materialized
-//! [`TribleSet`], its blob reader, and an explicit selector; every selector and
-//! every functional model field has exact-cardinality semantics.
+//! [`TribleSet`], its blob reader, and an explicit selector. Names and source
+//! labels are annotations: adding an alias does not invalidate a model. A
+//! caller choosing one model must still disambiguate distinct matching roots.
 
 use crate::format::attrs;
 use crate::leaf::Leaf;
@@ -24,7 +25,7 @@ use triblespace::prelude::*;
 pub enum ModelSelector<'a> {
     /// Succeed only when the graph contains exactly one model root.
     Only,
-    /// Select the exact content-addressed root.
+    /// Select an existing root by its opaque entity ID.
     Root(Id),
     /// Select the one legacy/root entity carrying this exact `model_name`.
     Name(&'a str),
@@ -40,7 +41,7 @@ pub enum ModelSelector<'a> {
 pub enum TokenizerSelector<'a> {
     /// Succeed only when the graph contains exactly one tokenizer root.
     Only,
-    /// Select the exact content-addressed root.
+    /// Select an existing tokenizer by its opaque entity ID.
     Root(Id),
     /// Select the one tokenizer carrying this exact `model_name`.
     Name(&'a str),
@@ -123,68 +124,15 @@ fn exactly_one<T>(
 }
 
 fn model_roots(tribles: &TribleSet) -> BTreeSet<Id> {
-    let named = find!(
+    find!(
         (model: Id),
-        pattern!(tribles, [{ ?model @ attrs::model_name: _?name, attrs::member: _?member }])
-    );
-    let sourced = find!(
-        (model: Id),
-        pattern!(tribles, [{ ?model @ attrs::source: _?source, attrs::member: _?member }])
-    );
-    named.chain(sourced).map(|(model,)| model).collect()
-}
-
-pub(crate) fn validate_model_source_coordinates(
-    tribles: &TribleSet,
-    blobs: &impl BlobStoreGet,
-    root: Id,
-    wanted_source: &str,
-    wanted_quantization: &str,
-) -> anyhow::Result<()> {
-    let source_handle = exactly_one(
-        find!(
-            (source: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-            pattern!(tribles, [{ root @ attrs::source: ?source }])
-        )
-        .map(|(source,)| source),
-        format_args!("source field on model root {root}"),
-    )?;
-    let source = read_long_string(blobs, source_handle, "source")?;
-    let quantization = exactly_one(
-        find!(
-            (quantization: String),
-            pattern!(tribles, [{ root @ attrs::quantization: ?quantization }])
-        )
-        .map(|(quantization,)| quantization),
-        format_args!("quantization field on model root {root}"),
-    )?;
-    if source != wanted_source || quantization != wanted_quantization {
-        bail!(
-            "model root {root} coordinates changed while selecting: ({source:?}, {quantization:?})"
-        );
-    }
-    Ok(())
-}
-
-fn validate_model_name(
-    tribles: &TribleSet,
-    blobs: &impl BlobStoreGet,
-    root: Id,
-    wanted: &str,
-) -> anyhow::Result<()> {
-    let handle = exactly_one(
-        find!(
-            (name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-            pattern!(tribles, [{ root @ attrs::model_name: ?name }])
-        )
-        .map(|(name,)| name),
-        format_args!("model_name field on model root {root}"),
-    )?;
-    let name = read_long_string(blobs, handle, "model_name")?;
-    if name != wanted {
-        bail!("model root {root} name changed while selecting");
-    }
-    Ok(())
+        pattern!(tribles, [
+            { ?model @ attrs::member: _?member },
+            { _?member @ attrs::safetensor_path: _?path, attrs::weight: _?weight },
+        ])
+    )
+    .map(|(model,)| model)
+    .collect()
 }
 
 /// Resolve exactly one model root according to `selector`.
@@ -196,7 +144,7 @@ pub fn select_model_root(
     match selector {
         ModelSelector::Only => exactly_one(model_roots(tribles), "model root in graph"),
         ModelSelector::Root(root) => {
-            if model_roots(tribles).contains(&root) {
+            if exists!(pattern!(tribles, [{ root @ attrs::member: _?member }])) {
                 Ok(root)
             } else {
                 bail!("model root {root} is absent or has no members")
@@ -207,17 +155,12 @@ pub fn select_model_root(
                 (model: Id, name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
                 pattern!(tribles, [{ ?model @ attrs::model_name: ?name, attrs::member: _?member }])
             )
-            .filter_map(
-                |(model, name)| match read_long_string(blobs, name, "model_name") {
-                    Ok(name) if name == wanted => Some(Ok(model)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect::<anyhow::Result<BTreeSet<_>>>()?;
-            let root = exactly_one(matches, format_args!("model root named {wanted:?}"))?;
-            validate_model_name(tribles, blobs, root, wanted)?;
-            Ok(root)
+            .filter_map(|(model, name)| {
+                (read_long_string(blobs, name, "model_name").ok()?.as_str() == wanted)
+                    .then_some(model)
+            })
+            .collect::<BTreeSet<_>>();
+            exactly_one(matches, format_args!("model root named {wanted:?}"))
         }
         ModelSelector::Source {
             source: wanted_source,
@@ -231,22 +174,17 @@ pub fn select_model_root(
                     attrs::member: _?member,
                 }])
             )
-            .filter_map(
-                |(model, source)| match read_long_string(blobs, source, "source") {
-                    Ok(source) if source == wanted_source => Some(Ok(model)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect::<anyhow::Result<BTreeSet<_>>>()?;
-            let root = exactly_one(
+            .filter_map(|(model, source)| {
+                (read_long_string(blobs, source, "source").ok()?.as_str() == wanted_source)
+                    .then_some(model)
+            })
+            .collect::<BTreeSet<_>>();
+            exactly_one(
                 matches,
                 format_args!(
                     "model root with source {wanted_source:?} and quantization {quantization:?}"
                 ),
-            )?;
-            validate_model_source_coordinates(tribles, blobs, root, wanted_source, quantization)?;
-            Ok(root)
+            )
         }
     }
 }
@@ -297,23 +235,11 @@ pub fn select_model_roots(
                     attrs::member: _?member,
                 }])
             )
-            .filter_map(
-                |(model, source)| match read_long_string(blobs, source, "source") {
-                    Ok(source) if source == wanted_source => Some(Ok(model)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                },
-            )
-            .collect::<anyhow::Result<BTreeSet<_>>>()?;
-            for &root in &matches {
-                validate_model_source_coordinates(
-                    tribles,
-                    blobs,
-                    root,
-                    wanted_source,
-                    quantization,
-                )?;
-            }
+            .filter_map(|(model, source)| {
+                (read_long_string(blobs, source, "source").ok()?.as_str() == wanted_source)
+                    .then_some(model)
+            })
+            .collect();
             matches
         }
     };
@@ -571,22 +497,6 @@ fn tokenizer_roots(tribles: &TribleSet) -> BTreeSet<Id> {
     crate::tokenizer::find_tokenizers(tribles).collect()
 }
 
-fn tokenizer_name(
-    tribles: &TribleSet,
-    blobs: &impl BlobStoreGet,
-    root: Id,
-) -> anyhow::Result<String> {
-    let handle = exactly_one(
-        find!(
-            (name: Inline<inlineencodings::Handle<blobencodings::UTF8String>>),
-            pattern!(tribles, [{ root @ crate::tokenizer::attrs::model_name: ?name }])
-        )
-        .map(|(name,)| name),
-        format_args!("model_name field on tokenizer root {root}"),
-    )?;
-    read_long_string(blobs, handle, "tokenizer model_name")
-}
-
 /// Resolve exactly one tokenizer root according to `selector`.
 pub fn select_tokenizer_root(
     tribles: &TribleSet,
@@ -594,17 +504,12 @@ pub fn select_tokenizer_root(
     selector: TokenizerSelector<'_>,
 ) -> anyhow::Result<Id> {
     match selector {
-        TokenizerSelector::Only => {
-            let root = exactly_one(tokenizer_roots(tribles), "tokenizer root in graph")?;
-            tokenizer_name(tribles, blobs, root)?;
-            Ok(root)
-        }
+        TokenizerSelector::Only => exactly_one(tokenizer_roots(tribles), "tokenizer root in graph"),
         TokenizerSelector::Root(root) => {
             if tokenizer_roots(tribles).contains(&root) {
-                tokenizer_name(tribles, blobs, root)?;
                 Ok(root)
             } else {
-                bail!("tokenizer root {root} is absent or lacks a tokenizer kind/name")
+                bail!("tokenizer root {root} is absent or lacks a tokenizer kind/vocabulary")
             }
         }
         TokenizerSelector::Name(wanted) => {
@@ -615,19 +520,14 @@ pub fn select_tokenizer_root(
             )
             .filter(|(tokenizer, _)| roots.contains(tokenizer))
             .filter_map(|(tokenizer, name)| {
-                match read_long_string(blobs, name, "tokenizer model_name") {
-                    Ok(name) if name == wanted => Some(Ok(tokenizer)),
-                    Ok(_) => None,
-                    Err(error) => Some(Err(error)),
-                }
+                (read_long_string(blobs, name, "tokenizer model_name")
+                    .ok()?
+                    .as_str()
+                    == wanted)
+                    .then_some(tokenizer)
             })
-            .collect::<anyhow::Result<BTreeSet<_>>>()?;
-            let root = exactly_one(matches, format_args!("tokenizer root named {wanted:?}"))?;
-            let name = tokenizer_name(tribles, blobs, root)?;
-            if name != wanted {
-                bail!("tokenizer root {root} name changed while selecting");
-            }
-            Ok(root)
+            .collect::<BTreeSet<_>>();
+            exactly_one(matches, format_args!("tokenizer root named {wanted:?}"))
         }
     }
 }
@@ -1149,7 +1049,7 @@ mod tests {
     }
 
     #[test]
-    fn name_selector_rejects_a_root_with_multiple_names() {
+    fn model_aliases_select_the_same_root() {
         let mut facts = TribleSet::new();
         let mut blobs = MemoryBlobStore::new();
         let model = add_model(
@@ -1167,10 +1067,48 @@ mod tests {
             entity! { ExclusiveId::force_ref(&model.root) @ attrs::model_name: alias }.into_facts();
         let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
 
-        let error = select_model_root(&facts, &reader, ModelSelector::Name("primary"))
-            .unwrap_err()
-            .to_string();
-        assert!(error.contains("ambiguous model_name field"), "{error}");
+        for name in ["primary", "alias"] {
+            assert_eq!(
+                select_model_root(&facts, &reader, ModelSelector::Name(name)).unwrap(),
+                model.root
+            );
+        }
+    }
+
+    #[test]
+    fn model_selection_ignores_unreadable_labels_and_non_model_members() {
+        let mut facts = TribleSet::new();
+        let mut blobs = MemoryBlobStore::new();
+        let model = add_model(
+            &mut facts,
+            &mut blobs,
+            "model",
+            "org/model",
+            "native",
+            &[("weight", 1.0)],
+        );
+        let absent: Blob<blobencodings::UTF8String> = "unavailable label".to_owned().to_blob();
+        facts += entity! { ExclusiveId::force_ref(&model.root) @
+            attrs::model_name: absent.get_handle(), attrs::source: absent.get_handle(),
+        }
+        .into_facts();
+        // Config sequences also use member, but do not contain model weights.
+        let child = fucid();
+        facts += entity! { attrs::member: &child }.into_facts();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+        for selector in [
+            ModelSelector::Only,
+            ModelSelector::Name("model"),
+            ModelSelector::Source {
+                source: "org/model",
+                quantization: "native",
+            },
+        ] {
+            assert_eq!(
+                select_model_root(&facts, &reader, selector).unwrap(),
+                model.root
+            );
+        }
     }
 
     /// The model piles that exist today hold the two-blob form, and selection
@@ -1232,14 +1170,54 @@ mod tests {
 
     #[cfg(feature = "tokenizer")]
     #[test]
+    fn tokenizer_labels_are_annotations_and_explicit_roots_need_no_name() {
+        let mut blobs = MemoryBlobStore::new();
+        let first =
+            crate::tokenizer::save_tokenizer_json(WORDPIECE.as_bytes(), "first-label", &mut blobs)
+                .unwrap();
+        let alias = crate::tokenizer::save_tokenizer_json(
+            WORDPIECE.as_bytes(),
+            "another-label",
+            &mut blobs,
+        )
+        .unwrap();
+        let root = first.root().unwrap();
+        assert_eq!(Some(root), alias.root());
+        let facts = first.into_facts() + alias.into_facts();
+        let reader = SnapshotSource::snapshot(&mut blobs).unwrap();
+        for label in ["first-label", "another-label"] {
+            assert_eq!(
+                select_tokenizer_root(&facts, &reader, TokenizerSelector::Name(label)).unwrap(),
+                root
+            );
+        }
+
+        let names: TribleSet = facts
+            .iter()
+            .filter(|fact| fact.a() == &attrs::model_name.id())
+            .copied()
+            .collect();
+        let unnamed = facts.difference(&names);
+        assert_eq!(
+            select_tokenizer_root(&unnamed, &reader, TokenizerSelector::Root(root)).unwrap(),
+            root
+        );
+        let tokenizer =
+            load_tokenizer_from_graph(&unnamed, &reader, TokenizerSelector::Only).unwrap();
+        assert_eq!(tokenizer.token_to_id("hello"), Some(1));
+    }
+
+    #[cfg(feature = "tokenizer")]
+    #[test]
     fn tokenizer_name_selection_disambiguates_consolidated_graphs() {
         let mut blobs = MemoryBlobStore::new();
         let alpha =
             crate::tokenizer::save_tokenizer_json(WORDPIECE.as_bytes(), "org/alpha", &mut blobs)
                 .unwrap();
         let alpha_root = alpha.root().unwrap();
+        let beta_json = WORDPIECE.replace("\"hello\": 1", "\"hello\": 1, \"world\": 2");
         let beta =
-            crate::tokenizer::save_tokenizer_json(WORDPIECE.as_bytes(), "org/beta", &mut blobs)
+            crate::tokenizer::save_tokenizer_json(beta_json.as_bytes(), "org/beta", &mut blobs)
                 .unwrap();
         let beta_root = beta.root().unwrap();
         let mut facts = alpha.into_facts();

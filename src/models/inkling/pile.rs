@@ -30,7 +30,6 @@
 
 use anybytes::Bytes;
 use anyhow::{Context, Result};
-use triblespace::core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace::core::blob::encodings::tensor::{
     Tensor, TensorElement, TensorView,
     elements::{BF16, F32, NVFP4, NVFP4_BLOCK},
@@ -1259,10 +1258,8 @@ pub struct PileSource {
     /// them would pay the 18-second index build twice to answer a question the
     /// first open already had in hand.
     facts: triblespace::prelude::TribleSet,
-    /// Canonical content identity of the exact projected facts this runtime
-    /// indexes. It binds every weight handle and sidecar/config fact without
-    /// depending on pile path, commit authorship, or construction history.
-    model_identity: [u8; 32],
+    /// The ordinary model collection descriptor, not a digest of its contents.
+    model_collection: triblespace::core::collection::CollectionHandle,
     /// Dense tensors, read as their type at index time. `Leaf` is a view, so
     /// holding all 968 of them costs kilobytes.
     dense: std::collections::HashMap<String, Leaf>,
@@ -1292,10 +1289,9 @@ pub struct PileSource {
     /// own aligned allocation. See [`PileSource::freeze_experts`].
     frozen: Option<anybytes::Bytes>,
     frozen_experts: std::collections::HashMap<(String, i64), CopiedExpert>,
-    /// The model root this source resolved: `INK_MODEL_ROOT`, or the version
-    /// graph's head, or `None` for the whole collection. A learned version
-    /// written back is this root's child.
-    model_root: Option<Id>,
+    /// The existing, opaque model root selected at open. It remains the
+    /// training base when learned snapshots are written as its children.
+    model_root: Id,
 }
 
 #[derive(Clone)]
@@ -1307,11 +1303,17 @@ struct CopiedExpert {
 }
 
 impl PileSource {
-    /// Open a pile and resolve every tensor in its sole model collection.
+    /// Open a pile and resolve the unique native Inkling head in its model collection.
     ///
     /// Reads the dense leaves (their headers and their content hashes; the
     /// payloads stay in the mapping) and takes the experts as handles.
     pub fn open(path: &std::path::Path) -> Result<Self> {
+        Self::open_root(path, None)
+    }
+
+    /// Read an actual model root. A legacy collection-wide import must be
+    /// explicitly finalized by its writer; opening never invents its root.
+    pub fn open_root(path: &std::path::Path, requested_root: Option<Id>) -> Result<Self> {
         use triblespace::core::inline::encodings::hash::Handle;
         use triblespace::core::metadata;
         use triblespace::macros::{find, pattern};
@@ -1329,7 +1331,7 @@ impl PileSource {
         .map_err(|e| anyhow::anyhow!("{path:?}: model collection '{collection_name}': {e}"))?;
         let facts =
             crate::model_collection::project_legacy_model_attributes(snapshot.facts()).facts;
-        let model_identity = IntoBlob::<SimpleArchive>::to_blob(&facts).get_handle().raw;
+        let model_collection = snapshot.support().collection().handle();
         let (_, _, reader) = snapshot.into_parts();
         pile.close()
             .map_err(|e| anyhow::anyhow!("close {path:?}: {e:?}"))?;
@@ -1337,64 +1339,48 @@ impl PileSource {
         let t_experts = std::time::Instant::now();
 
         // ── which model ─────────────────────────────────────────────────────
-        // THE MODEL IS THE COLLECTION. The 42-layer checkpoint was imported in
-        // pieces and its policy pile holds 41 model roots, none of which is
-        // "the model": every leaf in the collection is. So the default is the
-        // whole collection, as it always was.
-        //
-        // `INK_MODEL_ROOT=<hex>` restricts the sweeps to ONE root's members
-        // instead. That is what a learned model needs (`super::learned`): its
-        // leaves carry the same names and indices as the checkpoint's, and the
-        // sweeps below key by name and index, so read over both they would
-        // return one model with whichever leaf the query yielded last. A root
-        // names exactly which. How a learned model is named and chosen by
-        // default is still an open decision; this is the mechanism under any
-        // answer to it.
-        let mut roots: Vec<Id> = find!(
-            (r: Id),
-            pattern!(&facts, [{ ?r @ crate::format::attrs::member: _?m }])
-        )
-        .map(|(r,)| r)
-        .collect();
-        roots.sort();
-        roots.dedup();
+        // A root names the exact members to index. Unrelated models,
+        // annotations and sibling versions may coexist in this collection;
+        // none of them becomes part of the selected checkpoint by union.
         let hex_list = |ids: &[Id]| {
             ids.iter()
                 .map(|i| format!("{i:X}"))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        let root: Option<Id> = match std::env::var("INK_MODEL_ROOT") {
-            Ok(hex) => {
-                let id = Id::from_hex(hex.trim())
-                    .with_context(|| format!("INK_MODEL_ROOT={hex:?} is not a 32-hex id"))?;
+        let root = match requested_root {
+            Some(id) => {
                 anyhow::ensure!(
-                    roots.contains(&id),
-                    "INK_MODEL_ROOT={hex}: {path:?} holds no model root with that id ({} root(s): {})",
-                    roots.len(),
-                    hex_list(&roots)
+                    exists!(pattern!(&facts, [{ (id) @ crate::format::attrs::member: _?m }])),
+                    "model root {id:X} has no members in {path:?}"
                 );
-                Some(id)
+                id
             }
-            // No root named: the version DAG's one head, when a learned
-            // version exists (`super::learned`); the whole collection when
-            // none does, which is the checkpoint as imported.
-            Err(_) => {
+            None => {
+                // The shared `member`/`parent` vocabulary also describes
+                // other model families and tokenizer Sequence config nodes.
+                // Automatic heads are only native Inkling member shapes.
                 let heads = super::version::version_heads(&facts);
                 match heads.len() {
-                    0 => None,
+                    0 => anyhow::bail!(
+                        "{path:?} has no selectable native Inkling root. \
+                         Name an existing root with --model-root; legacy partial imports need \
+                         explicit writer-side publication with `mary root --members-file <ids>` before serving"
+                    ),
                     1 => {
-                        println!("    model root: the version graph's head {:X}", heads[0]);
-                        Some(heads[0])
+                        println!(
+                            "    model root: the native Inkling graph's head {:X}",
+                            heads[0]
+                        );
+                        heads[0]
                     }
                     n => anyhow::bail!(
-                        "{path:?}: the model graph has {n} version heads ({}); INK_MODEL_ROOT names one",
+                        "{path:?}: the native Inkling graph has {n} version heads ({}); --model-root names one",
                         hex_list(&heads)
                     ),
                 }
             }
         };
-
         // ── the experts, as handles ─────────────────────────────────────────
         // First, because what it produces is also what tells the dense sweep
         // which entities are NOT dense. An expert entity carries an
@@ -1415,33 +1401,19 @@ impl PileSource {
                     i64,
                     Inline<Handle<Tensor<T, 2>>>,
                 );
-                let hits: Vec<Hit<$ty>> = match root {
-                    Some(root) => find!(
-                        (e: Id,
-                         n: Inline<Handle<blobencodings::UTF8String>>,
-                         i: i64,
-                         l: i64,
-                         h: Inline<Handle<Tensor<$ty, 2>>>),
-                        pattern!(&facts, [
-                            { (root) @ crate::format::attrs::member: ?e },
-                            { ?e @ metadata::name: ?n, attrs::expert_index: ?i,
-                              attrs::layer: ?l, $attr: ?h },
-                        ])
-                    )
-                    .collect(),
-                    None => find!(
-                        (e: Id,
-                         n: Inline<Handle<blobencodings::UTF8String>>,
-                         i: i64,
-                         l: i64,
-                         h: Inline<Handle<Tensor<$ty, 2>>>),
-                        pattern!(&facts, [
-                            { ?e @ metadata::name: ?n, attrs::expert_index: ?i,
-                              attrs::layer: ?l, $attr: ?h },
-                        ])
-                    )
-                    .collect(),
-                };
+                let hits: Vec<Hit<$ty>> = find!(
+                    (e: Id,
+                     n: Inline<Handle<blobencodings::UTF8String>>,
+                     i: i64,
+                     l: i64,
+                     h: Inline<Handle<Tensor<$ty, 2>>>),
+                    pattern!(&facts, [
+                        { (root) @ crate::format::attrs::member: ?e },
+                        { ?e @ metadata::name: ?n, attrs::expert_index: ?i,
+                          attrs::layer: ?l, $attr: ?h },
+                    ])
+                )
+                .collect();
                 for (e, n, i, l, h) in hits {
                     let name: anybytes::View<str> = reader
                         .get(n)
@@ -1493,29 +1465,17 @@ impl PileSource {
                     Inline<Handle<blobencodings::UTF8String>>,
                     Inline<Handle<Tensor<T, $rank>>>,
                 );
-                let hits: Vec<Hit<$ty>> = match root {
-                    Some(root) => find!(
-                        (e: Id,
-                         n: Inline<Handle<blobencodings::UTF8String>>,
-                         h: Inline<Handle<Tensor<$ty, $rank>>>),
-                        pattern!(&facts, [
-                            { (root) @ crate::format::attrs::member: ?e },
-                            { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
-                        ])
-                    )
-                    .filter(|(e, _, _)| !expert_ids.contains(e))
-                    .collect(),
-                    None => find!(
-                        (e: Id,
-                         n: Inline<Handle<blobencodings::UTF8String>>,
-                         h: Inline<Handle<Tensor<$ty, $rank>>>),
-                        pattern!(&facts, [
-                            { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
-                        ])
-                    )
-                    .filter(|(e, _, _)| !expert_ids.contains(e))
-                    .collect(),
-                };
+                let hits: Vec<Hit<$ty>> = find!(
+                    (e: Id,
+                     n: Inline<Handle<blobencodings::UTF8String>>,
+                     h: Inline<Handle<Tensor<$ty, $rank>>>),
+                    pattern!(&facts, [
+                        { (root) @ crate::format::attrs::member: ?e },
+                        { ?e @ metadata::name: ?n, attrs::weight::<$ty, $rank>(): ?h },
+                    ])
+                )
+                .filter(|(e, _, _)| !expert_ids.contains(e))
+                .collect();
                 if !hits.is_empty() {
                     let chunk = hits.len().div_ceil(index_threads).max(1);
                     let reader = &reader;
@@ -1597,7 +1557,7 @@ impl PileSource {
             path: path.to_path_buf(),
             reader,
             facts,
-            model_identity,
+            model_collection,
             dense,
             experts,
             stacked,
@@ -1610,8 +1570,8 @@ impl PileSource {
         })
     }
 
-    /// The model root this source loaded from, if one was named or chosen.
-    pub fn model_root(&self) -> Option<Id> {
+    /// The existing opaque root this source loaded from.
+    pub fn model_root(&self) -> Id {
         self.model_root
     }
 
@@ -1939,9 +1899,9 @@ impl PileSource {
         &self.facts
     }
 
-    /// Canonical handle bytes of the projected model facts this source uses.
-    pub fn model_identity(&self) -> [u8; 32] {
-        self.model_identity
+    /// The ordinary collection descriptor containing the selected root.
+    pub fn model_collection(&self) -> triblespace::core::collection::CollectionHandle {
+        self.model_collection
     }
 
     /// The blob reader, so a caller can resolve handles the facts name.
