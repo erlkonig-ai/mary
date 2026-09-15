@@ -907,6 +907,10 @@ burn-ndarray = "0.21.0"
 
 [patch.crates-io]
 
+# Section freezes are immutable views, not durability barriers. Keep the same
+# AnyBytes lineage at every build root; dependency patch tables are ignored.
+anybytes = { git = "https://github.com/triblespace/anybytes.git", rev = "066c32a7cfcc470a6750c849499c1e88a0e0c50a" }
+
 # Keep the current TribleSpace transport's tested multi-sender wakeup fix when
 # Mary owns the build; Cargo ignores patches from dependency manifests.
 netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }

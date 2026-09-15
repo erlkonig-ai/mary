@@ -154,8 +154,7 @@ dependencies = [
 [[package]]
 name = "anybytes"
 version = "0.20.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cada9ef8ee94f698de87e120c8574581f3bba30310c50f408744575d3af4dfe9"
+source = "git+https://github.com/triblespace/anybytes.git?rev=066c32a7cfcc470a6750c849499c1e88a0e0c50a#066c32a7cfcc470a6750c849499c1e88a0e0c50a"
 dependencies = [
  "bytes",
  "memmap2",
