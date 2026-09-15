@@ -146,6 +146,7 @@ fn main() -> Result<()> {
         .filter(|l| !l.trim().is_empty())
         .collect();
     anyhow::ensure!(!lines.is_empty(), "no turns from line {from} in {corpus}");
+    let corpus_fingerprint = fingerprint_lines(&lines);
 
     let tensor_parallel = match &rendezvous {
         Some(addr) => Some(TensorParallel {
@@ -165,6 +166,10 @@ fn main() -> Result<()> {
             Some(a) => format!("tensor-parallel pair via {a}"),
             None => "one rank".to_string(),
         }
+    );
+    println!(
+        "=== selected corpus: BLAKE3 {corpus_fingerprint}; {} UTF-8 bytes ===",
+        lines.iter().map(String::len).sum::<usize>()
     );
 
     let t0 = std::time::Instant::now();
@@ -200,13 +205,21 @@ fn main() -> Result<()> {
         }
         Loaded::Engine(engine) => engine,
     };
+    let ready = engine.ready();
     println!(
-        "  ready in {:.1}s: {}",
+        "  ready in {:.1}s: model collection {}, root {}; tokenizer {}; execution {} {}; \
+         layers {}..{} of {}, TP rank {}/{}",
         t0.elapsed().as_secs_f64(),
-        format!("{:?}", engine.ready())
-            .chars()
-            .take(200)
-            .collect::<String>()
+        ready.model_collection,
+        ready.model_root,
+        ready.tokenizer_identity,
+        ready.execution_profile,
+        ready.execution_identity,
+        ready.layers[0],
+        ready.layers[1],
+        ready.stack,
+        ready.tp_rank.unwrap_or(0),
+        ready.tp_world,
     );
 
     let mut means = Vec::with_capacity(lines.len());
@@ -366,7 +379,7 @@ fn main() -> Result<()> {
                     .unwrap_or(0),
                 steps: lines.len() as u64,
                 span: format!(
-                    "{corpus} lines {from}..{}, input {}, source {:?}, {want} generated token(s) a turn",
+                    "{corpus} lines {from}..{}, BLAKE3 {corpus_fingerprint}, input {}, source {:?}, {want} generated token(s) a turn",
                     from + lines.len(),
                     input_role.as_str(),
                     source_label
@@ -458,6 +471,18 @@ impl InputRole {
             },
         }
     }
+}
+
+/// Identity of the selected examples, independent of their path and with an
+/// unambiguous boundary between adjacent lines. Newlines are not part of the
+/// model input, so they are not part of this digest either.
+fn fingerprint_lines(lines: &[String]) -> blake3::Hash {
+    let mut fingerprint = blake3::Hasher::new();
+    for line in lines {
+        fingerprint.update(&(line.len() as u64).to_le_bytes());
+        fingerprint.update(line.as_bytes());
+    }
+    fingerprint.finalize()
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -592,6 +617,14 @@ mod tests {
     fn locates_the_literal_text_between_structural_markers() {
         let ids = [10, 20, 30, 31, 40, 50];
         assert_eq!(text_content_span(&ids, 20, 40).unwrap(), 2..4);
+    }
+
+    #[test]
+    fn corpus_fingerprint_is_path_free_and_line_delimited() {
+        let lines = ["ab".to_string(), "c".to_string()];
+        let regrouped = ["a".to_string(), "bc".to_string()];
+        assert_eq!(fingerprint_lines(&lines), fingerprint_lines(&lines));
+        assert_ne!(fingerprint_lines(&lines), fingerprint_lines(&regrouped));
     }
 
     #[test]
