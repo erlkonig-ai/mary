@@ -447,7 +447,9 @@ pub fn snapshot_model_collection_for<R: StoreRead>(
     let facts = observed
         .view::<TribleSet>()
         .context("read model collection")?;
-    let (store, support, _) = observed.into_parts();
+    let (store, support, _) = observed
+        .into_parts()
+        .context("resolve model collection support for snapshot")?;
     Ok(ModelSnapshot::new(facts, support, store))
 }
 
