@@ -10,11 +10,13 @@
 //! cut of every expert learns too. Without `--tp-rendezvous` it is one rank on
 //! a partial stack (`INK_LAYERS`), whose numbers are diagnostic.
 //!
-//! Each corpus line is one of JP's turns. The resident never sees a bare user
-//! message; his words reach it as the content of a tool result, so that is how
-//! they are rendered here: a `ToolResult` whose command names the faculty that
-//! would have carried them and whose content is the line. The score is over
-//! every appended id (the wrapper and the words), in nats per delta token.
+//! Each corpus line is one of JP's turns. By default it arrives through the
+//! shipped command-result path, which renders its text in the user role.
+//! `--input-role tool` instead renders the SAME text as a sensed text record,
+//! in the tool role after a content-tokenized source label. The report splits
+//! the prequential score into literal content tokens and everything framing
+//! them (role, source, structural markers and the next-response prompt), while
+//! retaining the whole-delta score for continuity with earlier runs.
 //!
 //! `INK_LEARN_LR=<lr>` on BOTH ranks arms the learner (the last layer's routed
 //! experts); unset, this is the no-learning baseline over the same turns.
@@ -22,12 +24,13 @@
 //!
 //! ```text
 //! INK_LEARN_LR=1.0 inkling_learn <pile> <turns.txt> \
-//!     [--from LINE] [--turns N] [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b]
+//!     [--from LINE] [--turns N] [--gen G] [--input-role user|tool] \
+//!     [--source-label TEXT] [--tp-rendezvous HOST:PORT] [--layers a:b]
 //! ```
 use anyhow::{Context, Result};
 use mary::models::inkling::engine::{self, EngineConfig, Loaded, TensorParallel};
 use mary::models::inkling::resident::{
-    Consult, ExecResultContext, InklingContext, InklingInput, Model,
+    Consult, ExecResultContext, InklingContext, InklingInput, Model, SenseMedia, SenseRecord,
 };
 use mary::models::inkling::tpcomm::elect_rank;
 
@@ -36,7 +39,8 @@ fn main() -> Result<()> {
     anyhow::ensure!(
         args.len() >= 3,
         "usage: inkling_learn <pile> <turns.txt> [--from LINE] [--turns N] \
-         [--gen G] [--tp-rendezvous HOST:PORT] [--layers a:b] [--model-root ID] [--export] \
+         [--gen G] [--input-role user|tool] [--source-label TEXT] \
+         [--tp-rendezvous HOST:PORT] [--layers a:b] [--model-root ID] [--export] \
          [--save | --save-commit --signing-key <path>]"
     );
     let (pile, corpus) = (&args[1], &args[2]);
@@ -50,6 +54,8 @@ fn main() -> Result<()> {
     let mut save = Save::No;
     let mut signing_key: Option<String> = None;
     let mut explain: Option<String> = None;
+    let mut input_role = InputRole::User;
+    let mut source_label = "message poll".to_string();
     let mut i = 3;
     while i < args.len() {
         match args[i].as_str() {
@@ -106,6 +112,18 @@ fn main() -> Result<()> {
                 want = args[i + 1].parse().context("--gen wants a count")?;
                 i += 2;
             }
+            "--input-role" => {
+                input_role =
+                    InputRole::parse(args.get(i + 1).context("--input-role wants user or tool")?)?;
+                i += 2;
+            }
+            "--source-label" => {
+                source_label = args
+                    .get(i + 1)
+                    .context("--source-label wants text")?
+                    .clone();
+                i += 2;
+            }
             "--tp-rendezvous" => {
                 rendezvous = Some(args[i + 1].clone());
                 i += 2;
@@ -138,8 +156,10 @@ fn main() -> Result<()> {
     };
     let lr = std::env::var("INK_LEARN_LR").ok();
     println!(
-        "=== inkling_learn: {} turns from line {from}, gen {want}, learning {}, {} ===",
+        "=== inkling_learn: {} turns from line {from}, gen {want}, input {}, source {:?}, learning {}, {} ===",
         lines.len(),
+        input_role.as_str(),
+        source_label,
         lr.as_deref().unwrap_or("OFF (baseline)"),
         match &rendezvous {
             Some(a) => format!("tensor-parallel pair via {a}"),
@@ -191,15 +211,26 @@ fn main() -> Result<()> {
 
     let mut means = Vec::with_capacity(lines.len());
     let mut frozen_means = Vec::with_capacity(lines.len());
+    let mut attributed = AttributedLoss::default();
+    let mut attributed_frozen = AttributedLoss::default();
+    let mut content_fingerprint = blake3::Hasher::new();
     for (k, line) in lines.iter().enumerate() {
-        // His words, the way the resident meets them: as what the message
-        // faculty printed.
-        engine.context(&InklingContext::Observation {
-            inputs: vec![InklingInput::text_result(ExecResultContext {
-                command: "message poll".to_string(),
-                content: line.clone(),
-            })],
-        })?;
+        let context = InklingContext::Observation {
+            inputs: vec![input_role.input(&source_label, line)],
+        };
+        let delta_ids = engine.encode_context_ids(&context)?;
+        let special = &engine.ready().special_ids;
+        let content_span = text_content_span(
+            &delta_ids,
+            special.content_text as usize,
+            special.end_message as usize,
+        )?;
+        let content_ids = &delta_ids[content_span.clone()];
+        content_fingerprint.update(&(content_ids.len() as u64).to_le_bytes());
+        for &id in content_ids {
+            content_fingerprint.update(&(id as u64).to_le_bytes());
+        }
+        engine.context(&context)?;
         let mut said = String::new();
         let end = engine.consult(&Consult::new(want), &mut |text| {
             said.push_str(text);
@@ -207,23 +238,46 @@ fn main() -> Result<()> {
         })?;
         let mean = end.delta_mean_nll().unwrap_or(f64::NAN);
         means.push(mean);
+        anyhow::ensure!(
+            end.delta_tokens == delta_ids.len(),
+            "turn {k} encoded {} ids but scored a {}-token delta",
+            delta_ids.len(),
+            end.delta_tokens
+        );
+        let turn_attributed = attribute_scores(&delta_ids, content_span.clone(), &end.delta_nll)?;
+        attributed += turn_attributed;
         // The control, when a layer is frozen: the checkpoint's experts over
         // the same rows of the same pass. Its column is the null hypothesis
         // of every turn.
         let frozen = match end.delta_mean_nll_frozen() {
             Some(f) => {
+                anyhow::ensure!(
+                    end.delta_nll_frozen.len() == end.delta_nll.len(),
+                    "turn {k} has {} learned scores but {} frozen scores",
+                    end.delta_nll.len(),
+                    end.delta_nll_frozen.len()
+                );
+                let turn_frozen =
+                    attribute_scores(&delta_ids, content_span, &end.delta_nll_frozen)?;
+                attributed_frozen += turn_frozen;
                 frozen_means.push(f);
-                format!("  frozen {f:.4}")
+                format!(
+                    "  frozen {f:.4} [content {}, frame {}]",
+                    turn_frozen.content.describe(),
+                    turn_frozen.frame.describe()
+                )
             }
             None => String::new(),
         };
         println!(
-            "turn {k:3} ({:3} scored of {:3} delta): {mean:.4} nats/token{frozen}  first {:.2}s  turn {:.2}s  said {:?}",
+            "turn {k:3} ({:3} scored of {:3} delta): {mean:.4} nats/token [content {}, frame {}]{frozen}  first {:.2}s  turn {:.2}s  said {:?}",
             end.delta_nll.len(),
             end.delta_tokens,
+            turn_attributed.content.describe(),
+            turn_attributed.frame.describe(),
             end.first_token_secs,
             end.turn_secs,
-            said.chars().take(40).collect::<String>()
+            said
         );
     }
     let n = means.len();
@@ -236,6 +290,13 @@ fn main() -> Result<()> {
             .map(|m| format!("{m:.3}"))
             .collect::<Vec<_>>()
             .join(" ")
+    );
+    println!(
+        "=== attributed {}: content {}; frame+source {}; content-token fingerprint {} ===",
+        input_role.as_str(),
+        attributed.content.describe(),
+        attributed.frame.describe(),
+        content_fingerprint.finalize()
     );
     if frozen_means.len() == n {
         let f_all = frozen_means.iter().sum::<f64>() / n as f64;
@@ -251,6 +312,13 @@ fn main() -> Result<()> {
                 .map(|m| format!("{m:.3}"))
                 .collect::<Vec<_>>()
                 .join(" ")
+        );
+        println!(
+            "=== attributed frozen: content {}; frame+source {}; learned-minus-frozen: content {}, frame+source {} ===",
+            attributed_frozen.content.describe(),
+            attributed_frozen.frame.describe(),
+            attributed.content.delta_from(attributed_frozen.content),
+            attributed.frame.delta_from(attributed_frozen.frame)
         );
     }
     if export {
@@ -298,8 +366,10 @@ fn main() -> Result<()> {
                     .unwrap_or(0),
                 steps: lines.len() as u64,
                 span: format!(
-                    "{corpus} lines {from}..{}, {want} generated token(s) a turn",
-                    from + lines.len()
+                    "{corpus} lines {from}..{}, input {}, source {:?}, {want} generated token(s) a turn",
+                    from + lines.len(),
+                    input_role.as_str(),
+                    source_label
                 ),
                 explanation: explain.clone().unwrap_or_default(),
                 code_revision: std::env::var("INK_CODE_REVISION").unwrap_or_default(),
@@ -348,4 +418,219 @@ enum Save {
     No,
     Dry,
     Commit,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InputRole {
+    User,
+    Tool,
+}
+
+impl InputRole {
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "user" => Ok(Self::User),
+            "tool" => Ok(Self::Tool),
+            other => anyhow::bail!("--input-role wants user or tool, got {other:?}"),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Tool => "tool",
+        }
+    }
+
+    fn input(self, source: &str, content: &str) -> InklingInput {
+        match self {
+            Self::User => InklingInput::text_result(ExecResultContext {
+                command: source.to_string(),
+                content: content.to_string(),
+            }),
+            Self::Tool => InklingInput::Sensed {
+                record: SenseRecord {
+                    source: source.to_string(),
+                    media: SenseMedia::Text {
+                        text: content.to_string(),
+                    },
+                },
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct LossSlice {
+    sum: f64,
+    scored: usize,
+}
+
+impl LossSlice {
+    fn push(&mut self, score: f32) {
+        if score.is_finite() {
+            self.sum += score as f64;
+            self.scored += 1;
+        }
+    }
+
+    fn mean(self) -> Option<f64> {
+        (self.scored > 0).then(|| self.sum / self.scored as f64)
+    }
+
+    fn describe(self) -> String {
+        match self.mean() {
+            Some(mean) => format!("{mean:.4} nats/token over {}", self.scored),
+            None => "not scored".to_string(),
+        }
+    }
+
+    fn delta_from(self, control: Self) -> String {
+        match (self.mean(), control.mean()) {
+            (Some(live), Some(frozen)) => format!("{:+.4} nats/token", live - frozen),
+            _ => "not scored".to_string(),
+        }
+    }
+}
+
+impl std::ops::AddAssign for LossSlice {
+    fn add_assign(&mut self, rhs: Self) {
+        self.sum += rhs.sum;
+        self.scored += rhs.scored;
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct AttributedLoss {
+    content: LossSlice,
+    frame: LossSlice,
+}
+
+impl std::ops::AddAssign for AttributedLoss {
+    fn add_assign(&mut self, rhs: Self) {
+        self.content += rhs.content;
+        self.frame += rhs.frame;
+    }
+}
+
+fn text_content_span(
+    delta_ids: &[usize],
+    content_text: usize,
+    end_message: usize,
+) -> Result<std::ops::Range<usize>> {
+    let content_markers = delta_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| (*id == content_text).then_some(index))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        content_markers.len() == 1,
+        "text observation has {} content-text markers, expected one",
+        content_markers.len()
+    );
+    let ends = delta_ids
+        .iter()
+        .enumerate()
+        .filter_map(|(index, id)| (*id == end_message).then_some(index))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        ends.len() == 1,
+        "text observation has {} end-message markers, expected one",
+        ends.len()
+    );
+    let start = content_markers[0] + 1;
+    let end = ends[0];
+    anyhow::ensure!(
+        start <= end,
+        "the content-text marker at {} follows the end-message marker at {end}",
+        start - 1
+    );
+    Ok(start..end)
+}
+
+fn attribute_scores(
+    delta_ids: &[usize],
+    content: std::ops::Range<usize>,
+    scores: &[f32],
+) -> Result<AttributedLoss> {
+    anyhow::ensure!(
+        content.start <= content.end && content.end <= delta_ids.len(),
+        "content span {:?} is outside a {}-token delta",
+        content,
+        delta_ids.len()
+    );
+    anyhow::ensure!(
+        scores.len() <= delta_ids.len(),
+        "{} scores cannot describe a {}-token delta",
+        scores.len(),
+        delta_ids.len()
+    );
+    let first_scored = delta_ids.len() - scores.len();
+    if !scores.is_empty() {
+        anyhow::ensure!(
+            first_scored <= 1,
+            "scored delta omitted {first_scored} leading tokens, expected at most one"
+        );
+    }
+    let mut attributed = AttributedLoss::default();
+    for (offset, &score) in scores.iter().enumerate() {
+        let delta_index = first_scored + offset;
+        if content.contains(&delta_index) {
+            attributed.content.push(score);
+        } else {
+            attributed.frame.push(score);
+        }
+    }
+    Ok(attributed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locates_the_literal_text_between_structural_markers() {
+        let ids = [10, 20, 30, 31, 40, 50];
+        assert_eq!(text_content_span(&ids, 20, 40).unwrap(), 2..4);
+    }
+
+    #[test]
+    fn attributes_a_first_turn_after_its_unscored_role_token() {
+        let ids = [10, 20, 30, 31, 40, 50];
+        let loss = attribute_scores(&ids, 2..4, &[1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        assert_eq!(
+            loss.content,
+            LossSlice {
+                sum: 5.0,
+                scored: 2
+            }
+        );
+        assert_eq!(
+            loss.frame,
+            LossSlice {
+                sum: 10.0,
+                scored: 3
+            }
+        );
+    }
+
+    #[test]
+    fn attributes_a_primed_turn_from_its_first_delta_token() {
+        let ids = [10, 20, 30, 31, 40, 50];
+        let loss = attribute_scores(&ids, 2..4, &[1.0, 2.0, 3.0, 4.0, 5.0, f32::NAN]).unwrap();
+        assert_eq!(
+            loss.content,
+            LossSlice {
+                sum: 7.0,
+                scored: 2
+            }
+        );
+        assert_eq!(
+            loss.frame,
+            LossSlice {
+                sum: 8.0,
+                scored: 3
+            }
+        );
+    }
 }
