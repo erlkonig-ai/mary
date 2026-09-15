@@ -1091,6 +1091,18 @@ impl Engine {
         &self.ready
     }
 
+    /// Encode one typed context exactly as [`Model::context`] will, without
+    /// changing the pending delta or the resident sequence.
+    ///
+    /// This is a diagnostic seam for experiments that need to attribute the
+    /// scored delta back to typed framing versus content. Callers must still
+    /// submit the original context through [`Model::context`].
+    pub fn encode_context_ids(&self, context: &InklingContext) -> Result<Vec<usize>> {
+        self.codec
+            .encode(context)
+            .context("encode typed Inkling context")
+    }
+
     /// Admit an explicitly supplied training example without changing the
     /// foreground context. Preparation runs only at a background-work boundary.
     pub fn enqueue_distillation(&mut self, example: super::sdft::Example) -> Result<()> {
@@ -1682,10 +1694,7 @@ impl Model for Engine {
     }
 
     fn context(&mut self, context: &InklingContext) -> Result<()> {
-        let ids = self
-            .codec
-            .encode(context)
-            .context("encode typed Inkling context")?;
+        let ids = self.encode_context_ids(context)?;
         // The closing of a message her shell cut is attended to NOW, in a
         // plain pass of its own. It is neither her word nor the world's, so it
         // is never scored -- and it cannot wait in the delta: the next
