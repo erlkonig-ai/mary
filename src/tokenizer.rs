@@ -763,15 +763,15 @@ pub fn load_pre_tokenizer_pattern(
     .map(|(ph,)| read_piece(blobs, ph))
 }
 
-/// Tokenizer roots carry a supported model-kind tag and a vocabulary.
+/// Distinct tokenizer roots carry a supported model-kind tag and a vocabulary.
 /// A decoder may share the same kind tag, but has no vocabulary. Names are
 /// optional annotations, so adding aliases or omitting a label cannot change
 /// whether the tokenizer is readable. Select a root explicitly when several
 /// tokenizers coexist.
 pub fn find_tokenizers(tribles: &TribleSet) -> impl Iterator<Item = Id> + '_ {
-    find!(
+    let roots: std::collections::BTreeSet<Id> = find!(
         (e: Id, t: Id),
-        pattern!(tribles, [{ ?e @ metadata::tag: ?t, attrs::vocab: _?entry }])
+        pattern!(tribles, [{ ?e @ metadata::tag: ?t }])
     )
     // The model-type tags, and ONLY those: a tokenizer node also carries flag
     // tags (ADD_PREFIX_SPACE, ...), and `find!` yields one row per tag, so this
@@ -781,8 +781,13 @@ pub fn find_tokenizers(tribles: &TribleSet) -> impl Iterator<Item = Id> + '_ {
     // no merges list; UNIGRAM because omitting it made
     // `load_spm_tokenizer_from_pile` report "no tokenizer graph" on a pile that
     // had just been written.
-    .filter(|&(_, t)| t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN || t == ty::UNIGRAM)
+    .filter(|&(e, t)| {
+        (t == ty::WORD_PIECE || t == ty::BPE || t == ty::TIKTOKEN || t == ty::UNIGRAM)
+            && exists!(pattern!(tribles, [{ e @ attrs::vocab: _?entry }]))
+    })
     .map(|(e, _)| e)
+    .collect();
+    roots.into_iter()
 }
 
 /// The first tokenizer root in a fact set, retained for legacy callers.
@@ -1559,6 +1564,21 @@ mod tests {
         );
         assert_eq!(find_tokenizer(&tribles), Some(root));
         assert_ne!(root, dec);
+    }
+
+    // Regression (real bug, 2026-09-15): putting `attrs::vocab` in the
+    // discovery join emitted the tokenizer root once per vocabulary member.
+    // Inkling's exact-one check consequently reported 199,998 copies of its
+    // sole tokenizer as "more than one tokenizer" after loading 88 GiB of
+    // weights on each tensor-parallel rank.
+    #[test]
+    fn find_tokenizers_yields_each_root_once() {
+        let mut blobs = MemoryBlobStore::new();
+        let frag = save_tokenizer_json(BPE.as_bytes(), "test/bpe", &mut blobs).unwrap();
+        let root = frag.root().expect("root");
+        let tribles: TribleSet = frag.into();
+
+        assert_eq!(find_tokenizers(&tribles).collect::<Vec<_>>(), vec![root]);
     }
 
     /// The tiktoken save/load pair on a three-token toy vocab: raw bytes (NOT
